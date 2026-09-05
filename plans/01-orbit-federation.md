@@ -9,22 +9,41 @@ or defaults.
 ## Sanctioned dispatcher touches (the only ones)
 
 1. **`min_pilots` floor** in `task_dispatcher_strategy_conservative.py`
-   `on_tick`: while `live_count < pool.min_pilots`, call `submit_pilot`
-   even with an empty backlog, still subject to the in-flight / backoff /
-   dwell guards. Unit test in
-   `test_task_dispatcher_strategy_conservative.py` (empty queue,
-   `min_pilots=1` → exactly one submit; `min_pilots=0` → none).
-   Rationale: "the allocation's pilot starts at join" is demo step 2.
+   `on_tick` — exact guard structure (verified against lines 134-163):
+   compute `live_count` first (move the computation now at ~:158 above
+   both early returns); `need_floor = live_count < pool.min_pilots`;
+   replace `if not pending: return` (:134) with `if not pending and not
+   need_floor: return`; replace `if len(pending) <= free_capacity:
+   return` (:149) with `if not need_floor and len(pending) <=
+   free_capacity: return`. Backoff (:139), in-flight (:153),
+   `max_pilots` (:158) and dwell (:163) guards stay as they are.
+   `_submit_pilot`/`_do_pilot_submit` have no backlog check, so nothing
+   else refuses. Tests in `test_task_dispatcher_strategy_conservative.py`:
+   empty queue + `min_pilots=1` → exactly one submit; `min_pilots=0` →
+   none; `min_pilots=1, max_pilots=1` with one live PENDING pilot → no
+   second submit. Rationale: "the allocation's pilot starts at join" is
+   demo step 2.
 2. **Pilot history**: add `finished_at: float | None = None` to
-   `PilotRecord` (`task_dispatcher_state.py`), set it in
-   `_finalize_pilot`, and add `pilot_history` (all pilots incl. terminal:
-   `pilot_id, state, size{nodes,…}, submitted_at, active_at, finished_at,
-   child_endpoint_name`) to the verbose pool summary next to the existing
-   live `pilots`. Persisted like the rest of `PoolState`. Tests: state
+   `PilotRecord` (`task_dispatcher_state.py:74-90`; `record_from_dict`
+   drops unknown keys, so old state files load fine); set it in
+   `_finalize_pilot` (the single terminal path — verified). In the
+   verbose pool summary add `summary['pilot_history'] =
+   [self._pilot_dict(p) for p in ps.pilots.values()]` (all `asdict`
+   fields incl. `size_key`, `active_at`, `finished_at`,
+   `child_endpoint_name`); the federation resolves nodes via
+   `summary['pilot_sizes'][size_key]['nodes']`. Two lines. Tests: state
    round-trip with `finished_at`; summary includes a FAILED pilot after
    `_finalize_pilot`.
+3. **Orphan-pool guard** (one line): in `_housekeeping`, skip `on_tick`
+   for pools whose `owning_sid not in self._sessions` — `_replay_state`
+   re-materialises every state dir at broker start with no session, and
+   with touch 1 an orphan `min_pilots=1` pool whose endpoint is gone would
+   otherwise submit a pilot per backoff window forever. Test: replayed
+   pool without session gets no tick.
 
 Nothing else in the dispatcher changes. Existing tests must stay green.
+`DEFAULT_PLUGINS_BY_ROLE` lives in `plugin_host_base.py:23`; the
+`__init__.py` edit is only the import line.
 
 ## Files
 
@@ -52,16 +71,23 @@ Nothing else in the dispatcher changes. Existing tests must stay green.
 
 ## Behaviour
 
-- **Sessions**: all routes use sid `default`; handlers call
+- **Sessions**: define `session_class = FederationSession` (a trivial
+  `PluginSession` subclass, ctor `(sid)`) — `_ensure_default_session`
+  raises without one. All routes use sid `default`; handlers call
   `self._ensure_default_session()` first. Dispatcher sessions created by
   the federation are registered with `{"sid": "fed-<name>", "pools":
-  [pool], "lifetime": "persistent"}` (deterministic sid → trivial
-  restart re-attach) and unregistered explicitly on leave. Test: after a
-  join, run the base class's expired-session sweep
-  (`_cleanup_expired_sessions()`) and assert the pool still exists.
+  [pool], "lifetime": "persistent"}` (verified: `Plugin.register_session`
+  reads `sid`/`lifetime` from the body and returns `{"sid": ...}`;
+  re-sending the identical body reconnects, 409 only if lifetime differs)
+  and unregistered explicitly on leave. Test: after a join, monkeypatch
+  `time.time` forward by > 3600 s, run `_cleanup_expired_sessions()`,
+  assert session and pool survive (a plain call would pass vacuously).
 - **Calling the dispatcher**: `host = self._app.state.endpoint_service`;
-  `await host.handle_request(method, '/task_dispatcher/<route>', {},
-  body_bytes)`; parse the JSON response; map `HTTPException` codes through.
+  `resp = await host.handle_request(method, '/task_dispatcher/<route>',
+  {}, body_bytes)` — signature `(method, path, headers, body_bytes,
+  query_string='')`, path is endpoint-relative (no `/broker`), returns a
+  starlette `JSONResponse` (decode `resp.body`), raises `HTTPException`
+  on errors (404 unknown route) — map codes through.
   Resolve lazily per call; if `task_dispatcher` is not hosted → 503
   `dispatcher plugin not available`. Wrap in a small `_DispatcherAPI`
   helper (register_session, submit, task, pool_detail, cancel_all,
@@ -106,14 +132,19 @@ Nothing else in the dispatcher changes. Existing tests must stay green.
   returns the task dict plus `"resource"` and, while the pilot is live,
   `"child_endpoint"` (from the verbose pool summary via `pilot_id`) — the
   campaign plugin needs it for pilot-side output collection.
-- **leave**: dispatcher `cancel_all`, `unregister_session`, remove
-  record + ledger, persist.
+- **leave**: first `POST cancel/{dsid}/{task_id}` for every non-terminal
+  task in the ledger (session teardown would otherwise re-queue RUNNING
+  tasks and persist them, and a later `join` of the same name would
+  dispatch those stale tasks to the new pilot), then `cancel_all`,
+  `unregister_session`, remove record + ledger, persist.
 - **liveness**: from topology; a resource inherits its endpoint's
   liveness; `lost` excluded by the policy.
-- **restart**: load state; for each record whose endpoint is connected,
-  re-register `{"sid": stored, "pools": [identical], "lifetime":
-  "persistent"}` (the dispatcher already replayed that pool state);
-  others → `lost`. Test it with the dispatcher's own replay path.
+- **restart**: load state; re-register **every** stored resource's
+  dispatcher session first (`{"sid": stored, "pools": [identical],
+  "lifetime": "persistent"}` — the dispatcher already replayed the pool
+  state), then `unregister_session` those whose endpoint is not connected
+  (teardown drops the pool from `_pool_states`, so no ticks) and mark
+  them `lost`. Test it with the dispatcher's own replay path.
 - **state root**: `~/.radical/orbit/federation/<instance>/`, overridable
   by `RADICAL_ORBIT_FEDERATION_STATE` (tests + demo isolation).
 

@@ -7,21 +7,24 @@ It is the thing on screen during the demo, so it must be calm, legible at
 
 ## Constraints
 
-- Plain ES module, no external libraries, no build step. File name is
-  fixed: `atomic_wm/ui/atomic_campaign.js` (served at
-  `/plugins/atomic_campaign.js`; the gateway caches it until a miss →
-  restart the broker after edits). Module API (verified in
-  `orbit_explorer.html:1244-1259, 2551-2607`): `export const name =
-  'atomic_campaign'`, `template()`, `css()`, `init(page, api)`, `onShow()`,
-  `onNotification(evt)`. Study `task_dispatcher.js` / `sysinfo.js` and
-  `session_util.js`.
+- Plain ES module, no external libraries, no build step. File:
+  `atomic_wm/ui/atomic_campaign.js` (any path works — the gateway serves
+  it as `/plugins/atomic_campaign.js` because the plugin's registry name
+  is `atomic_campaign`; it caches until a miss → restart the broker after
+  edits). Module API (verified in `orbit_explorer.html:1244-1290,
+  2551-2651`): `export const name = 'atomic_campaign'`, `template()`,
+  `css()`, `init(page, api)`, `onShow(page, api)`, `onNotification(data,
+  page, api)` with `data = {endpoint, plugin, topic, data}` (broker-hosted
+  notifications carry `endpoint: 'broker'`). Study `task_dispatcher.js` /
+  `sysinfo.js` and `session_util.js`.
 - Data via the gateway. `api.fetch` is namespaced to this plugin
   (campaign routes: `campaigns/default`, `campaign/default/{cid}`,
   `results/default/{cid}`, `POST campaigns/default`); federation calls go
-  through `api.fetchRaw('/broker/federation/resources/default')` with
-  `api.getSession('federation', {sid: 'default'})`. Poll every 2 s while
-  a campaign is running, 5 s otherwise; degrade gracefully when the
-  federation plugin is absent ("no federation").
+  through `api.fetchRaw('/broker/federation/resources/default')` — no
+  session registration needed (do **not** call `api.getSession(
+  'federation', …)`: it throws when the plugin is absent). Poll every
+  2 s while a campaign is running, 5 s otherwise; degrade gracefully when
+  the federation plugin is absent ("no federation").
 - Language on screen matches the slides: *resources, campaigns,
   workflows, stages*; never "pilot", "broker", "endpoint" (endpoint name
   may appear in a tooltip).

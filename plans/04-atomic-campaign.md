@@ -52,11 +52,20 @@ tests; integrate for real in P6.
 ## Talking to the federation
 
 In-process only: `host = self._app.state.endpoint_service`;
-`await host.handle_request('POST', '/federation/submit/default', {},
-body)` etc. (see 00 Facts). Wrap in `_FederationAPI` (submit, task,
-resources) so tests can substitute a fake. 503 if the federation plugin is
-not hosted. All campaign routes use sid `default`
-(`self._ensure_default_session()` first).
+`resp = await host.handle_request('POST', '/federation/submit/default',
+{}, body_bytes)` — signature `(method, path, headers, body_bytes,
+query_string='')`, endpoint-relative path, returns a starlette
+`JSONResponse` (decode `resp.body`), raises `HTTPException` on error.
+Wrap in `_FederationAPI` (submit, task, resources) so tests can
+substitute a fake. 503 if the federation plugin is not hosted. All
+campaign routes use sid `default` (`self._ensure_default_session()`
+first) — define `session_class = AtomicCampaignSession` (trivial
+`PluginSession` subclass) or `_ensure_default_session` raises.
+`ui_module` is read off the **class** (`broker_plugin_host.py:191`): set
+it as a class attribute computed at import time, not in `__init__`.
+Dispatcher `stage_in/{dispatcher_sid}/{task_id}` body is `{"pool",
+"filename", "content_b64", "overwrite"?}` (400 otherwise); `pool` and
+`dispatcher_sid` come from the federation submit response.
 
 ## Output collection (important for Tuesday)
 

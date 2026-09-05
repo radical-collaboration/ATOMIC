@@ -17,10 +17,13 @@ rehearsal harness — the real run differs only in join arguments.
   findings in 00-overview.)
 - `up.sh` — (1) `ve3/bin/pip install $ORBIT_SRC` then `ve3/bin/pip install
   /home/merzky/projects/atomic` (quiet, non-editable) so pilots, wrapper,
-  entry points and console scripts are current; (2) isolate dispatcher /
-  federation / campaign state dirs under `/tmp/atomic-demo` (config or
-  env if the plugins support it; else back up `~/.radical/orbit/
-  task_dispatcher/state/` to `demo/local/run/state.bak-<ts>` and clear);
+  entry points and console scripts are current; (2) state isolation:
+  federation and campaign honour `RADICAL_ORBIT_FEDERATION_STATE` /
+  `ATOMIC_CAMPAIGN_STATE` / `ATOMIC_STORE_ROOT` → point them under
+  `/tmp/atomic-demo`; the dispatcher has **no** override (module constant
+  `_DEFAULT_STATE_ROOT`, plugins constructed with no kwargs) → back up
+  `~/.radical/orbit/task_dispatcher/state/` to
+  `demo/local/run/state.bak-<ts>` and clear it (restore in `down.sh`);
   (3) start broker `--host 127.0.0.1 --port 8010 --no-auth --plugins
   task_dispatcher,federation,atomic_campaign` (background, log, pidfile,
   wait for `GET /endpoints` 200); (4) three joins, detached:
