@@ -19,19 +19,69 @@ Conventions:
 from __future__ import annotations
 
 import os
+import ssl
+
 from typing import Any, Dict, List, Optional
+
+try:
+    import requests
+    import requests.adapters
+except ImportError as _e:                                # pragma: no cover
+    # the base install is deliberately stdlib-only (a pilot python must be
+    # able to run the workload tools without reaching the network); the
+    # HTTP client lives in the `cli` extra
+    raise ImportError("the ATOMIC CLI needs 'requests' -- install it with "
+                      "`pip install 'atomic-wm[cli]'`") from _e
 
 DEFAULT_SID = 'default'
 
+# the broker's own hosted plugins live under this pseudo endpoint name
+BROKER_EP = 'broker'
+
 
 class ClientError(RuntimeError):
-    """Raised for non-2xx responses; carries ``status`` and ``detail``."""
+    """Raised for non-2xx responses; carries ``status`` and ``detail``.
+
+    ``status`` is 0 for transport level failures (broker unreachable, TLS
+    problem, timeout) — those never reached an HTTP status code.
+    """
 
     def __init__(self, status: int, detail: str, url: str = ''):
         super().__init__(f'HTTP {status} — {detail}' + (f' ({url})' if url else ''))
         self.status = status
         self.detail = detail
         self.url = url
+
+
+class PinnedCertAdapter(requests.adapters.HTTPAdapter):
+    """Verify the broker against one pinned certificate, no hostname match.
+
+    This mirrors what ``radical.orbit`` itself does for endpoints
+    (``runtime.py``: ``create_default_context(cafile=cert)`` with
+    ``check_hostname = False``): a broker certificate handed to us
+    explicitly is the **only** trust root, and the name in it is not
+    checked -- ORBIT's self-signed broker certs carry no SAN for the
+    address a client actually dials (``127.0.0.1``, an FQDN, a tunnel).
+    Without this every CLI call fails with ``CERTIFICATE_VERIFY_FAILED``
+    while the endpoint next to it connects happily.
+    """
+
+    def __init__(self, cafile: str, **kw: Any):
+
+        self._cafile = cafile
+
+        super().__init__(**kw)
+
+    def init_poolmanager(self, *args: Any, **kw: Any) -> Any:
+
+        ctx = ssl.create_default_context(cafile=self._cafile)
+        ctx.verify_mode    = ssl.CERT_REQUIRED
+        ctx.check_hostname = False
+
+        kw['ssl_context']     = ctx
+        kw['assert_hostname'] = False        # urllib3 matches it itself
+
+        return super().init_poolmanager(*args, **kw)
 
 
 class Client:
@@ -45,78 +95,247 @@ class Client:
         self.broker = (broker or os.environ.get('RADICAL_ORBIT_BROKER_URL')
                        or '').rstrip('/')
         self.token = token if token is not None else os.environ.get(
-            'RADICAL_ORBIT_TOKEN', '')
+            'RADICAL_ORBIT_TOKEN',
+            os.environ.get('RADICAL_ORBIT_BROKER_TOKEN', ''))
         self.cert = cert or os.environ.get('RADICAL_ORBIT_BROKER_CERT')
         self.timeout = timeout
         if not self.broker:
             raise ValueError('broker URL required (--broker or '
                              '$RADICAL_ORBIT_BROKER_URL)')
 
+        self.session = requests.Session()
+
+        if self.cert:
+            self.cert = os.path.expanduser(self.cert)
+            if not os.path.exists(self.cert):
+                raise ValueError('broker cert not found: %s' % self.cert)
+            try:
+                self.session.mount('https://', PinnedCertAdapter(self.cert))
+            except (ssl.SSLError, OSError) as e:
+                raise ValueError('broker cert is not usable: %s (%s)'
+                                 % (self.cert, e)) from e
+
     # ---------------------------------------------------------------- core
+    def url(self, path: str) -> str:
+        """Absolute URL for a gateway `path` (leading slash optional)."""
+
+        return '%s/%s' % (self.broker, path.lstrip('/'))
+
+    def headers(self) -> Dict[str, str]:
+        """Auth headers — empty for a ``--no-auth`` broker (token empty)."""
+
+        if not self.token:
+            return {}
+
+        return {'Authorization': 'Bearer %s' % self.token}
+
     def request(self, method: str, path: str,
                 json: Any = None) -> Any:
         """Issue one request; return parsed JSON; raise ClientError on error."""
-        raise NotImplementedError('P2 implements this')
+
+        url = self.url(path)
+
+        # TLS is always on: verify against the broker cert when we have
+        # one, else fall back to the system trust store.
+        verify: Any = self.cert if self.cert else True
+
+        try:
+            resp = self.session.request(method, url, json=json,
+                                        headers=self.headers(),
+                                        timeout=self.timeout,
+                                        verify=verify)
+        except requests.RequestException as e:
+            raise ClientError(0, 'cannot reach broker: %s' % e, url) from e
+
+        if resp.status_code >= 400:
+            raise ClientError(resp.status_code, _detail(resp), url)
+
+        return _body(resp)
 
     # ------------------------------------------------------------- gateway
     def endpoints(self) -> List[Dict[str, Any]]:
         """``GET /endpoints`` → list of participants (name, plugins, connected…)."""
-        raise NotImplementedError('P2 implements this')
+
+        data = self.request('GET', '/endpoints')
+
+        return list((data or {}).get('endpoints') or [])
 
     def endpoint_connected(self, name: str) -> bool:
-        raise NotImplementedError('P2 implements this')
+
+        for ep in self.endpoints():
+            if ep.get('name') == name:
+                return bool(ep.get('connected'))
+
+        return False
+
+    def endpoint_plugins(self, name: str) -> List[str]:
+        """Plugin instance names hosted by a connected endpoint (or ``[]``)."""
+
+        for ep in self.endpoints():
+            if ep.get('name') == name:
+                return list(ep.get('plugins') or [])
+
+        return []
 
     # ---------------------------------------------------- endpoint plugins
     def sysinfo_metrics(self, endpoint: str) -> Dict[str, Any]:
         """Register a sysinfo session on ``endpoint``, fetch metrics, unregister."""
-        raise NotImplementedError('P2 implements this')
+
+        reg = self.request('POST', '/%s/sysinfo/register_session' % endpoint,
+                           json={})
+        sid = (reg or {}).get('sid')
+        if not sid:
+            raise ClientError(0, 'sysinfo did not return a session id',
+                              self.url('/%s/sysinfo/register_session'
+                                       % endpoint))
+        try:
+            metrics = self.request('GET', '/%s/sysinfo/metrics/%s'
+                                         % (endpoint, sid))
+        finally:
+            # best effort: the session expires on its own anyway
+            try:
+                self.request('POST', '/%s/sysinfo/unregister_session/%s'
+                                    % (endpoint, sid))
+            except ClientError:
+                pass
+
+        return metrics or {}
 
     def job_allocation(self, endpoint: str) -> Optional[Dict[str, Any]]:
-        """``GET /<endpoint>/queue_info/job_allocation`` or None if not in one."""
-        raise NotImplementedError('P2 implements this')
+        """``GET /<endpoint>/queue_info/job_allocation`` or None if not in one.
+
+        Also None when the endpoint does not host ``queue_info`` at all —
+        capability detection is best effort by design.
+        """
+
+        try:
+            data = self.request('GET', '/%s/queue_info/job_allocation'
+                                      % endpoint)
+        except ClientError:
+            return None
+
+        alloc = (data or {}).get('allocation')
+
+        return alloc if isinstance(alloc, dict) else None
 
     # ---------------------------------------------------------- federation
     def fed_join(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """``POST /broker/federation/join/default`` → full resource record."""
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._fed('join/%s' % DEFAULT_SID),
+                            json=record)
 
     def fed_leave(self, name: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._fed('leave/%s/%s'
+                                             % (DEFAULT_SID, name)))
 
     def fed_resources(self) -> List[Dict[str, Any]]:
         """``GET /broker/federation/resources/default`` → resources list."""
-        raise NotImplementedError('P2 implements this')
+
+        data = self.request('GET', self._fed('resources/%s' % DEFAULT_SID))
+
+        return list((data or {}).get('resources') or [])
 
     def fed_resource(self, name: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('GET', self._fed('resource/%s/%s'
+                                            % (DEFAULT_SID, name)))
 
     def fed_pick(self, requirements: Dict[str, Any]) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._fed('pick/%s' % DEFAULT_SID),
+                            json={'requirements': requirements})
 
     def fed_submit(self, task: Dict[str, Any],
                    requirements: Dict[str, Any]) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._fed('submit/%s' % DEFAULT_SID),
+                            json={'task': task, 'requirements': requirements})
 
     def fed_task(self, task_id: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('GET', self._fed('task/%s/%s'
+                                            % (DEFAULT_SID, task_id)))
 
     # ------------------------------------------------------------ campaign
     def campaign_submit(self, workflow: Dict[str, Any],
                         sweep: Dict[str, List[Any]]) -> Dict[str, Any]:
         """``POST /broker/atomic_campaign/campaigns/default``."""
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._cmp('campaigns/%s' % DEFAULT_SID),
+                            json={'workflow': workflow, 'sweep': sweep})
 
     def campaigns(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError('P2 implements this')
+
+        data = self.request('GET', self._cmp('campaigns/%s' % DEFAULT_SID))
+
+        if isinstance(data, list):
+            return data
+
+        return list((data or {}).get('campaigns') or [])
 
     def campaign(self, cid: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('GET', self._cmp('campaign/%s/%s'
+                                            % (DEFAULT_SID, cid)))
 
     def campaign_results(self, cid: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('GET', self._cmp('results/%s/%s'
+                                            % (DEFAULT_SID, cid)))
 
     def campaign_cancel(self, cid: str) -> Dict[str, Any]:
-        raise NotImplementedError('P2 implements this')
+
+        return self.request('POST', self._cmp('cancel/%s/%s'
+                                             % (DEFAULT_SID, cid)))
+
+    # --------------------------------------------------------------- paths
+    @staticmethod
+    def _fed(route: str) -> str:
+        return '/%s/federation/%s' % (BROKER_EP, route)
+
+    @staticmethod
+    def _cmp(route: str) -> str:
+        return '/%s/atomic_campaign/%s' % (BROKER_EP, route)
+
+
+# ---------------------------------------------------------------------------
+# response helpers
+# ---------------------------------------------------------------------------
+
+def _detail(resp: Any) -> str:
+    """Best available error message from a failed response.
+
+    FastAPI reports ``{"detail": …}``; the gateway proxy may pass a plugin
+    error through verbatim, so fall back to the raw body.
+    """
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+
+    if isinstance(body, dict):
+        detail = body.get('detail', body.get('error'))
+        if detail:
+            return detail if isinstance(detail, str) else repr(detail)
+
+    text = (resp.text or '').strip()
+
+    return text[:400] if text else resp.reason or 'request failed'
+
+
+def _body(resp: Any) -> Any:
+    """Parsed JSON body; ``None`` for an empty body, raw text if not JSON."""
+
+    if not resp.content:
+        return None
+
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text
 
 
 def add_connection_args(parser) -> None:

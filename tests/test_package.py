@@ -29,7 +29,18 @@ def test_plugins_package_imports_without_orbit():
 
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize('mod', [join, leave, resources, campaign])
-def test_cli_placeholders_exit_2(mod, capsys):
+def test_cli_modules_expose_a_working_parser(mod, capsys):
 
-    assert mod.main([]) == 2
-    assert 'not implemented yet' in capsys.readouterr().err
+    # the placeholders these modules started out as are gone (P2/P4); what
+    # stays contractual is that every console script has a `main` and a
+    # parser whose --help works
+    parser = mod.build_parser()
+
+    assert parser.prog.startswith('atomic-')
+    assert callable(mod.main)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main(['--help'])
+
+    assert exc.value.code == 0
+    assert parser.prog in capsys.readouterr().out
