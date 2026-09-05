@@ -107,7 +107,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     common.check_std_args(TOOL, args)
 
     doc = run(args.temperature, args.steps, args.seed, args.duration_sec)
-    common.write_json_atomic(args.out, doc)
+    common.write_output(TOOL, args.out, doc)
 
     elapsed = common.pace(started, args.duration_sec)
 

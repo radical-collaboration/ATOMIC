@@ -42,7 +42,7 @@ def input_temperature(doc: Dict[str, Any]) -> Optional[float]:
     for src in (doc.get('params'), doc, doc.get('summary')):
         if isinstance(src, dict):
             val = src.get('temperature')
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if common.is_number(val):
                 return float(val)
 
     series = doc.get('series')
@@ -100,7 +100,7 @@ def train(temperature: float, epochs: int, seed: int
     rate       = 4.0 / epochs                    # ~98% converged at the end
     loss_floor = 0.05 + (PLATEAU_MAX - plateau) * 1.5
     loss_start = 2.50
-    acc_sigma  = 0.004
+    acc_sigma  = 0.001
     loss_sigma = 0.020
 
     epoch, loss, accuracy = [], [], []
@@ -133,8 +133,9 @@ def run(temperature: float, epochs: int, seed: Optional[int],
 
     series = train(temperature, epochs, seed)
 
-    # average the tail so a single noisy epoch cannot flip the ordering
-    tail    = max(1, epochs // 10)
+    # average a decent tail so no single noisy epoch can flip the
+    # temperature ordering of `final_accuracy`
+    tail    = max(3, epochs // 5)
     final   = common.mean(series['accuracy'][-tail:])
     summary = {'final_accuracy'   : final,
                'final_loss'       : series['loss'][-1],
@@ -177,9 +178,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     temp = input_temperature(doc)
 
     if temp is None:
-        common.die(TOOL, 'no temperature found in %s -- expected `params.'
-                         'temperature`, `temperature` or `series.'
-                         'temperature`' % args.inp)
+        common.die(TOOL, 'no temperature found in %s -- expected '
+                         '`params.temperature`, `temperature`, '
+                         '`summary.temperature` or `series.temperature`'
+                         % args.inp)
 
     if temp <= 0:
         common.die(TOOL, 'input temperature must be > 0, found %r in %s'
@@ -187,7 +189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     out = run(temp, args.epochs, args.seed, args.duration_sec,
               source=args.inp)
-    common.write_json_atomic(args.out, out)
+    common.write_output(TOOL, args.out, out)
 
     elapsed = common.pace(started, args.duration_sec)
 

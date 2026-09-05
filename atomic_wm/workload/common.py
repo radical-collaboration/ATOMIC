@@ -24,7 +24,7 @@ import sys
 import time
 
 from typing import Any, Dict, Iterable, List, Mapping, NoReturn
-from typing import Optional, Sequence
+from typing import Optional, Sequence, TypeGuard, Union
 
 from .. import __version__
 
@@ -38,8 +38,19 @@ PRECISION = 6
 
 
 # ---------------------------------------------------------------------------
-# errors
+# predicates and errors
 # ---------------------------------------------------------------------------
+
+def is_number(value: Any) -> TypeGuard[Union[int, float]]:
+    """True for an int or float -- but not for a bool.
+
+    ``isinstance(True, int)`` is True in python, and a JSON ``true``
+    where a temperature is expected is bad input, not the number 1.
+    A ``TypeGuard`` so that callers narrow like a plain ``isinstance``.
+    """
+
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
 
 def die(tool: str, msg: str, code: int = 2) -> NoReturn:
     """Report a fatal input error and exit with `code` (default: 2).
@@ -71,9 +82,14 @@ def default_seed(*parts: Any) -> int:
     identical output (on any machine, any python -- unlike ``hash()``,
     blake2b does not depend on PYTHONHASHSEED), while *different*
     parameters yield visibly different noise.
+
+    Numbers are normalised to float first, so a python caller passing
+    ``300`` derives the same seed as the CLI, which parses ``300`` to
+    ``300.0``.
     """
 
-    blob = json.dumps(list(parts), sort_keys=True,
+    norm = [float(p) if is_number(p) else p for p in parts]
+    blob = json.dumps(norm, sort_keys=True,
                       separators=(',', ':')).encode('utf-8')
 
     return int.from_bytes(hashlib.blake2b(blob, digest_size=4).digest(),
@@ -132,8 +148,10 @@ def read_input_json(tool: str, path: str) -> Dict[str, Any]:
     try:
         with open(path, 'r', encoding='utf-8') as fin:
             doc = json.load(fin)
-    except json.JSONDecodeError as e:
-        die(tool, 'input file is not valid JSON: %s (%s)' % (path, e))
+    except ValueError as e:
+        # JSONDecodeError *and* UnicodeDecodeError (a binary file handed
+        # to a stage is an input error, not a crash)
+        die(tool, 'input file is not valid UTF-8 JSON: %s (%s)' % (path, e))
     except OSError as e:
         die(tool, 'cannot read input file: %s (%s)' % (path, e))
 
@@ -172,6 +190,19 @@ def write_json_atomic(path: str, doc: Mapping[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def write_output(tool: str, path: str, doc: Mapping[str, Any]) -> None:
+    """:func:`write_json_atomic`, but a filesystem problem is a clean error.
+
+    An unwritable (or unreachable) ``--out`` is bad input, not a bug --
+    a traceback in a task log helps nobody.
+    """
+
+    try:
+        write_json_atomic(path, doc)
+    except OSError as e:
+        die(tool, 'cannot write output %s (%s)' % (path, e))
 
 
 # ---------------------------------------------------------------------------

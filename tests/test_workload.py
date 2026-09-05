@@ -278,6 +278,17 @@ def test_train_ordering_robust_over_many_seeds(tmp_path):
         assert finals[0] > finals[1] > finals[2], (seed, finals)
 
 
+def test_train_ordering_on_a_100k_grid():
+
+    # a denser sweep than the demo's: the plateau gap over 100 K (0.02)
+    # still dwarfs the noise of the averaged tail (sigma ~ 0.0005)
+    for seed in range(10):
+        finals = [fake_train.run(float(t), 20, seed, 0.0)
+                  ['summary']['final_accuracy']
+                  for t in range(300, 901, 100)]
+        assert all(a > b for a, b in zip(finals, finals[1:])), (seed, finals)
+
+
 def test_train_accepts_alternative_temperature_locations():
 
     plain  = {'temperature': 600.0}
@@ -463,6 +474,54 @@ def test_descriptors_input_without_energy_exits_2(tmp_path):
                                '--out', str(tmp_path / 'd.json')])
 
     assert exc.value.code == 2
+
+
+def test_binary_input_exits_2(tmp_path):
+
+    # invalid UTF-8 must be an input error, not a UnicodeDecodeError
+    bad = tmp_path / 'binary.json'
+    bad.write_bytes(b'\xff\xfe\x00\x01 not text')
+
+    with pytest.raises(SystemExit) as exc:
+        fake_train.main(['--in', str(bad), '--epochs', '5',
+                         '--out', str(tmp_path / 'm.json')])
+
+    assert exc.value.code == 2
+
+
+def test_unwritable_output_exits_2(tmp_path, capsys):
+
+    # --out below a *file* -> OSError from makedirs/open, must be a clean
+    # 'cannot write output' error rather than a traceback
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory', encoding='utf-8')
+
+    with pytest.raises(SystemExit) as exc:
+        fake_md.main(['--temperature', '300', '--steps', '5',
+                      '--out', str(blocker / 'sub' / 'md.json'),
+                      '--duration-sec', '0'])
+
+    assert exc.value.code == 2
+    assert 'cannot write output' in capsys.readouterr().err
+
+
+def test_bool_is_not_a_number():
+
+    assert not common.is_number(True)
+    assert not common.is_number('300')
+    assert common.is_number(300)
+    assert common.is_number(300.0)
+
+    assert fake_train.input_temperature({'temperature': True}) is None
+    assert fake_descriptors.input_stats(
+        {'summary': {'mean_energy': True, 'std_energy': 1.0}}) is None
+
+
+def test_default_seed_normalises_numbers():
+
+    # a python caller passing ints must match the CLI, which parses floats
+    assert common.default_seed('t', 300, 200) \
+        == common.default_seed('t', 300.0, 200.0)
 
 
 def test_input_json_must_be_object(tmp_path):

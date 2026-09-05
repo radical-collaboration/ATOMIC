@@ -31,10 +31,13 @@ atomic-leave            = "atomic_wm.cli.leave:main"
 atomic-resources        = "atomic_wm.cli.resources:main"
 atomic-campaign         = "atomic_wm.cli.campaign:main"
 
-# The broker-hosted campaign plugin (P4).  The entry point targets the
-# `atomic_wm.plugins` *package*, whose __init__ imports the plugin class
-# defensively -- so the entry point resolves (and the install stays
-# usable) both before P4 lands and in environments without orbit.
+# The broker-hosted campaign plugin (P4).  plans/03 writes the target as
+# `atomic_wm.plugins.campaign`; we deliberately point at the
+# `atomic_wm.plugins` *package* instead, whose __init__ imports the
+# plugin class defensively (see its docstring).  Same effect for orbit --
+# `ep.load()` imports the target and the Plugin subclass registers itself
+# -- but the entry point also resolves before P4 lands and in
+# environments without radical.orbit, so an install never breaks.
 [project.entry-points."radical.orbit.plugins"]
 atomic_campaign = "atomic_wm.plugins"
 

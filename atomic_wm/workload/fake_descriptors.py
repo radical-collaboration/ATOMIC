@@ -34,7 +34,7 @@ def input_stats(doc: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     if isinstance(summary, dict):
         mean = summary.get('mean_energy')
         std  = summary.get('std_energy')
-        if isinstance(mean, (int, float)) and isinstance(std, (int, float)):
+        if common.is_number(mean) and common.is_number(std):
             return float(mean), float(std)
 
     series = doc.get('series')
@@ -147,7 +147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     out = run(stats[0], stats[1], args.n_atoms, args.bins, args.seed,
               args.duration_sec, source=args.inp)
-    common.write_json_atomic(args.out, out)
+    common.write_output(TOOL, args.out, out)
 
     elapsed = common.pace(started, args.duration_sec)
 

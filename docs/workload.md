@@ -31,9 +31,11 @@ Design rules (they are the contract, not an accident):
 - **atomic output.** Every output is written to a temp file in the target
   directory and `os.replace()`d into place, so result collection never
   reads a half-written file and a crash leaves no partial output.
-- **clear failure.** Bad arguments or unusable input exit with code `2`
-  and a one-line `tool: error: …` message on stderr (2 is what argparse
-  uses for usage errors, so callers see one 'bad input' code).
+- **clear failure.** Bad arguments, unusable input (missing file, not
+  UTF-8, not JSON, no temperature/energy in it) and an unwritable `--out`
+  all exit with code `2` and a one-line `tool: error: …` message on
+  stderr — never a traceback (2 is what argparse uses for usage errors,
+  so callers see one 'bad input' code).
 - **one summary line on stdout**, which ends up in the task's log.
 
 ## The JSON envelope
@@ -114,12 +116,26 @@ slope, clamped to `[0.50, 0.99]`). That is the whole point of the sweep:
 the three workflows of `examples/campaign_sweep.json` produce visibly
 different, correctly ordered curves in the UI.
 
-`final_accuracy` is **strictly decreasing** in temperature by
-construction: the plateau gaps are 0.06 while the accuracy noise is
-σ = 0.004, and `final_accuracy` is the mean of the last 10 % of epochs,
-so no single noisy epoch can flip the ordering. Tests assert the
-ordering both with an explicit seed, with the derived default seeds, and
-across 25 seeds. Summary: `final_accuracy`,
+`final_accuracy` is the mean of the last `max(3, epochs/5)` epochs and
+the per-epoch accuracy noise is σ = 0.001 (σ ≈ 0.0005 after averaging
+that tail), so the ordering is decided by the plateau, not by the noise —
+**for sweep points that are far enough apart**. The plateau moves by
+about 0.0002 per K, so:
+
+| sweep spacing | plateau gap | margin over the tail noise |
+|---|---|---|
+| 300 K (the demo) | 0.06 | > 100 σ |
+| 100 K | 0.02 | ~ 40 σ |
+| 10 K | 0.002 | ~ 4 σ — inversions become possible |
+
+So: `final_accuracy` is strictly decreasing in temperature for sweep
+points ≳ 100 K apart, and the demo's 300 K spacing has an overwhelming
+margin. A sweep with a much finer temperature spacing should not rely on
+the ordering of individual points (raise `--epochs`, or lower
+`acc_sigma`, if it must).
+
+Tests assert the ordering with an explicit seed, with the derived default
+seeds, across 25 seeds at the demo's spacing, and on a 100 K grid. Summary: `final_accuracy`,
 `final_loss`, `accuracy_plateau`, `input_temperature`, `epochs`.
 
 ## `atomic-fake-descriptors`
