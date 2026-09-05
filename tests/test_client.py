@@ -34,10 +34,38 @@ NqIp93rWFhh474E7N/lXoBR5Jw==
 
 
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch, tmp_path):
+    """No stray broker config from the developer's own environment.
+
+    ``$HOME`` moves too: the client falls back to the operator-placed
+    ``~/.radical/orbit/{broker_cert.pem,broker.token}``, which exist on a
+    machine that runs ORBIT.
+    """
+
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+
+    for var in ['RADICAL_ORBIT_BROKER_URL', 'RADICAL_ORBIT_TOKEN',
+                'RADICAL_ORBIT_BROKER_TOKEN', 'RADICAL_ORBIT_BROKER_CERT']:
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def broker(monkeypatch):
 
     return FakeBroker().install(monkeypatch)
+
+
+@pytest.fixture
+def orbit_home(tmp_path):
+    """``~/.radical/orbit`` with an operator-placed cert and token."""
+
+    path = tmp_path / 'home' / '.radical' / 'orbit'
+    path.mkdir(parents=True)
+    (path / 'broker_cert.pem').write_text(TEST_CERT)
+    (path / 'broker.token').write_text('file-token\n')
+
+    return path
 
 
 @pytest.fixture
@@ -62,9 +90,7 @@ def make_client(**kw):
 # construction
 # ---------------------------------------------------------------------------
 
-def test_broker_url_required(monkeypatch):
-
-    monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL', raising=False)
+def test_broker_url_required():
 
     with pytest.raises(ValueError):
         Client(broker=None, token='')
@@ -131,6 +157,28 @@ def test_tls_verify_uses_cert(broker, cert_file):
 
     make_client(cert=None).endpoints()
     assert broker.calls[-1]['verify'] is True
+
+
+def test_orbit_files_are_the_last_default(orbit_home):
+
+    # a machine set up for ORBIT needs neither --cert nor --token
+    c = Client(broker='https://127.0.0.1:8013')
+
+    assert c.cert  == str(orbit_home / 'broker_cert.pem')
+    assert c.token == 'file-token'
+    assert c.headers() == {'Authorization': 'Bearer file-token'}
+
+
+def test_explicit_empty_token_beats_the_token_file(orbit_home):
+
+    assert Client(broker='https://x', token='').token == ''
+
+
+def test_env_token_beats_the_token_file(orbit_home, monkeypatch):
+
+    monkeypatch.setenv('RADICAL_ORBIT_BROKER_TOKEN', 'env-token')
+
+    assert Client(broker='https://x').token == 'env-token'
 
 
 def test_missing_cert_is_reported(tmp_path):
@@ -295,6 +343,25 @@ def test_transport_error_maps_to_status_zero(monkeypatch):
 
     assert exc.value.status == 0
     assert 'cannot reach broker' in str(exc.value)
+
+
+def test_tls_error_is_one_actionable_line(monkeypatch):
+
+    import requests
+
+    def _boom(session, method, url, **kw):
+        raise requests.exceptions.SSLError(
+            'HTTPSConnectionPool(host=…): Max retries exceeded … '
+            'CERTIFICATE_VERIFY_FAILED … ' + 'x' * 300)
+
+    monkeypatch.setattr(requests.Session, 'request', _boom)
+
+    with pytest.raises(ClientError) as exc:
+        make_client().endpoints()
+
+    assert exc.value.status == 0
+    assert 'pass --cert' in exc.value.detail
+    assert len(exc.value.detail) < 200
 
 
 def test_detail_falls_back_to_body_text():

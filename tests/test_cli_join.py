@@ -10,6 +10,8 @@ process.
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -92,6 +94,12 @@ def isolate(monkeypatch, tmp_path):
     """State under tmp_path, no /proc scans, short poll intervals."""
 
     monkeypatch.setenv(endpoint_proc.ENV_STATE_ROOT, str(tmp_path / 'state'))
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+
+    for var in ['RADICAL_ORBIT_BROKER_URL', 'RADICAL_ORBIT_TOKEN',
+                'RADICAL_ORBIT_BROKER_TOKEN', 'RADICAL_ORBIT_BROKER_CERT']:
+        monkeypatch.delenv(var, raising=False)
+
     monkeypatch.setattr(endpoint_proc, 'iter_processes', lambda: [])
     monkeypatch.setattr(join, 'POLL_INTERVAL', 0.01)
     monkeypatch.setattr(join, 'LOOP_INTERVAL', 0.01)
@@ -266,21 +274,19 @@ def test_declared_beats_detected():
                                       'software': ['lammps']}
 
 
-def test_budget_defaults_from_the_allocation():
+def test_allocation_mode_leaves_the_budget_to_the_federation():
 
     args = parsed(['--broker', 'https://x', '--name', 'a', '--mode',
                    'allocation'])
 
+    # no --node-hours: the federation derives nodes x walltime from the
+    # allocation itself, so we must not send a budget at all
     rec = join.assemble_record(args, {'cores': 8},
                                {'n_nodes': 2, 'runtime': 1800})
-    assert rec['budget'] == {'node_hours': 1.0}
-
-    # no allocation information at all -> the federation's own default
-    rec = join.assemble_record(args, {'cores': 8}, None)
-    assert rec['budget'] == {'node_hours': join.DEFAULT_NODE_HOURS}
+    assert 'budget' not in rec
 
 
-def test_declared_budget_wins():
+def test_declared_budget_is_sent():
 
     args = parsed(['--broker', 'https://x', '--name', 'a', '--mode',
                    'allocation', '--node-hours', '12.5'])
@@ -303,7 +309,6 @@ def test_allocation_record_shape():
                    'kind'        : 'workstation',
                    'capabilities': {'cores': 4, 'gpus': 0, 'mem_gb': 8.0,
                                     'software': ['lammps']},
-                   'budget'      : {'node_hours': 1.0},
                    'scratch_base': '/tmp/atomic-demo/local_a'}
 
 
@@ -311,32 +316,60 @@ def test_login_record_carries_the_pool():
 
     args = parsed(['--broker', 'https://x', '--name', 'b', '--mode', 'login',
                    '--queue', 'RM', '--account', 'abc123', '--nodes', '2',
-                   '--cpus', '128', '--walltime', '3600',
-                   '--node-hours', '20'])
-    rec  = join.assemble_record(args, {'cores': 8})
+                   '--cpus', '128', '--gpus-per-node', '4',
+                   '--walltime', '3600', '--node-hours', '20'])
+    rec  = join.assemble_record(args)
 
     assert rec['pool'] == {'queue'           : 'RM',
                            'account'         : 'abc123',
                            'nodes'           : 2,
                            'cpus_per_node'   : 128,
-                           'gpus_per_node'   : 0,
+                           'gpus_per_node'   : 4,
                            'walltime_sec'    : 3600,
                            'max_pilots'      : 2,
                            'rhapsody_backend': 'concurrent'}
     assert rec['budget'] == {'node_hours': 20.0}
 
+    # login-mode capabilities describe one pilot, not the login node
+    assert rec['capabilities'] == {'cores': 256, 'gpus': 8,
+                                   'software': []}
+
+
+def test_login_declaration_beats_the_derived_pilot_size():
+
+    args = parsed(['--broker', 'https://x', '--name', 'b', '--mode', 'login',
+                   '--queue', 'RM', '--nodes', '2', '--cpus', '128',
+                   '--walltime', '3600', '--node-hours', '20',
+                   '--declare', 'cores=64,mem_gb=512'])
+    rec  = join.assemble_record(args)
+
+    assert rec['capabilities'] == {'cores': 64, 'gpus': 0, 'mem_gb': 512.0,
+                                   'software': []}
+
+
+def test_login_mode_does_not_probe_the_login_node(broker):
+
+    broker.connect('ep_a')
+
+    detected, alloc = join.detect(_client(broker), 'ep_a', 'login', {})
+
+    assert detected == {}
+    assert alloc is None
+    assert broker.calls == []                   # no sysinfo, no queue_info
+
 
 def test_detection_is_skipped_when_everything_is_declared(broker):
 
     broker.connect('ep_a')
-    client = _client(broker)
 
-    detected, alloc = join.detect(client, 'ep_a', 'login',
+    detected, alloc = join.detect(_client(broker), 'ep_a', 'allocation',
                                   {'cores': 1, 'gpus': 0, 'mem_gb': 2})
 
     assert detected == {}
     assert alloc is None
-    assert broker.calls == []
+    # the allocation is still asked for (the federation sizes the pool
+    # from it), but sysinfo is not
+    assert broker.paths() == ['/ep_a/queue_info/job_allocation']
 
 
 def test_detection_failure_is_a_warning(broker, capsys):
@@ -386,7 +419,6 @@ def test_join_flow_detached(broker, proc, capsys):
         'kind'        : 'workstation',
         'capabilities': {'cores': 4, 'gpus': 2, 'mem_gb': 32.0,
                          'software': ['lammps']},
-        'budget'      : {'node_hours': join.DEFAULT_NODE_HOURS},
         'scratch_base': '/tmp/atomic-demo/local_a'}]
 
     # ... and a pidfile was written for atomic-leave
@@ -399,7 +431,8 @@ def test_join_flow_detached(broker, proc, capsys):
     assert 'atomic-leave local_a' in out
 
 
-def test_join_uses_the_allocation_for_size_and_budget(broker, proc):
+def test_join_reports_the_allocation_and_the_returned_budget(broker, proc,
+                                                             capsys):
 
     broker.allocation = {'n_nodes': 2, 'runtime': 7200}
 
@@ -408,8 +441,13 @@ def test_join_uses_the_allocation_for_size_and_budget(broker, proc):
                     '--connect-timeout', '2'])
 
     assert rc == 0
-    assert broker.joined[0]['budget'] == {'node_hours': 4.0}
+    assert 'budget' not in broker.joined[0]                  # server derives
     assert broker.joined[0]['capabilities']['cores'] == 16   # detected
+
+    out = capsys.readouterr().out
+    assert '2 node(s), 7200 s remaining' in out
+    # ... and the budget printed is the one the federation came back with
+    assert 'node-hours   : 2.0 (derived from the allocation)' in out
 
 
 def test_endpoint_never_connects(broker, proc, monkeypatch, capsys):
@@ -441,15 +479,50 @@ def test_endpoint_dies_while_connecting(broker, proc, capsys):
     assert 'died while connecting' in capsys.readouterr().err
 
 
-def test_join_without_a_federation_plugin(broker, proc, capsys):
+@pytest.mark.parametrize('status,detail', [
+    (503, 'plugin not hosted'),
+    (404, 'No route: POST /federation/join/default')])
+def test_join_without_a_federation_plugin(broker, proc, capsys,
+                                          status, detail):
 
-    broker.errors['/federation/join/'] = (503, 'plugin not hosted')
+    broker.errors['/federation/join/'] = (status, detail)
 
     rc = join.main(ARGS_LOCAL)
 
     assert rc == 1
     assert proc.instances[0].stopped
     assert "does not host the 'federation' plugin" in capsys.readouterr().err
+
+
+def test_join_without_a_task_dispatcher(broker, proc, capsys):
+
+    # the federation answered -- it is the dispatcher that is missing
+    broker.errors['/federation/join/'] = (503, 'dispatcher plugin not '
+                                               'available')
+
+    rc = join.main(ARGS_LOCAL)
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert 'no task dispatcher' in err
+    assert '--plugins task_dispatcher,federation' in err
+
+
+def test_join_404_from_the_plugin_points_at_the_endpoint(broker, proc,
+                                                         capsys):
+
+    # the plugin answered -- it is the endpoint it cannot see
+    broker.errors['/federation/join/'] = (404, "endpoint 'ep_local_a' "
+                                               "is not connected")
+
+    rc = join.main(ARGS_LOCAL)
+
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "does not host the 'federation' plugin" not in err
+    assert 'does not see the endpoint as connected' in err
+    assert 'endpoint log' in err
 
 
 def test_duplicate_name_is_explained(broker, proc, capsys):
@@ -503,6 +576,64 @@ def test_sigint_leaves_the_federation(broker, proc, monkeypatch):
     assert endpoint_proc.read_pidfile('local_a') is None
 
 
+def test_sigint_during_the_connect_wait_stops_the_endpoint(broker, proc,
+                                                           monkeypatch,
+                                                           capsys):
+
+    handlers = {}
+    monkeypatch.setattr(signal, 'signal',
+                        lambda sig, handler: handlers.setdefault(sig,
+                                                                 handler))
+    FakeProc.hook = None                        # never connects
+
+    def fire():
+        deadline = time.time() + 10
+        while signal.SIGINT not in handlers and time.time() < deadline:
+            time.sleep(0.01)
+        handlers[signal.SIGINT](int(signal.SIGINT), None)
+
+    thread = threading.Thread(target=fire)
+    thread.start()
+    try:
+        # the connect timeout is long: only the signal can end this
+        rc = join.main(ARGS_LOCAL + ['--connect-timeout', '30'])
+    finally:
+        thread.join(15)
+
+    assert rc == 1
+    assert proc.instances[0].stopped            # no orphaned endpoint
+    assert broker.joined == []
+    assert endpoint_proc.read_pidfile('local_a') is None
+    assert 'nothing was joined' in capsys.readouterr().out
+
+
+def test_pidfile_exists_before_the_join_completes(broker, proc, monkeypatch):
+
+    # the orphan window: the pidfile must be there before the (up to
+    # 60 s) connect wait, or a SIGKILL during it leaves behind an
+    # endpoint nobody can find
+    seen     = {}
+    original = join.wait_connected
+
+    def _spy(*args, **kw):
+        seen['pidfile'] = endpoint_proc.read_pidfile('local_a')
+        return original(*args, **kw)
+
+    monkeypatch.setattr(join, 'wait_connected', _spy)
+
+    assert join.main(ARGS_LOCAL + ['--detach']) == 0
+    assert seen['pidfile']['pid'] == 4242
+
+
+def test_http_broker_url_is_flagged(broker, proc, capsys):
+
+    args = [a if a != 'https://127.0.0.1:8013' else 'http://127.0.0.1:8013'
+            for a in ARGS_LOCAL]
+
+    assert join.main(args + ['--detach']) == 0
+    assert 'plain http' in capsys.readouterr().err
+
+
 def test_foreground_notices_a_dead_endpoint(broker, proc, monkeypatch):
 
     def die_later(p):
@@ -551,6 +682,10 @@ class FakeProcTable:
 
         return sorted(self.procs.items())
 
+    def cmdline(self, pid):
+
+        return self.procs.get(pid, '')
+
 
 @pytest.fixture
 def table(monkeypatch):
@@ -559,20 +694,44 @@ def table(monkeypatch):
         tbl = FakeProcTable(procs)
         monkeypatch.setattr(endpoint_proc, 'iter_processes', tbl.listing)
         monkeypatch.setattr(endpoint_proc, 'pid_alive', tbl.alive)
+        monkeypatch.setattr(endpoint_proc, 'cmdline_of', tbl.cmdline)
         monkeypatch.setattr(os, 'kill', tbl.kill)
         return tbl
 
     return _make
 
 
+# a pilot's child endpoint is `<pool>_<pilot id>` = `fed-<name>_p.<hex>`
+PILOT_A = ('/ve/bin/python /ve/bin/radical-orbit-endpoint.py '
+           '-n fed-local_a_p.a1b2c3d4e5 --plugins default')
+PILOT_L = ('/ve/bin/python /ve/bin/radical-orbit-endpoint.py '
+           '-n fed-local_p.0f0f0f0f0f --plugins default')
+EP_A    = ('/ve/bin/python /ve/bin/radical-orbit-endpoint.py '
+           '--name ep_local_a --url https://b:1 --plugins default')
+
+
 def test_pilot_pids_matches_only_this_resources_pilots():
 
-    procs = [(10, 'python radical-orbit-endpoint.py --name fed-local_a_1'),
-             (11, 'python radical-orbit-endpoint.py --name fed-other_b_1'),
-             (12, 'python radical-orbit-endpoint.py --name ep_local_a'),
-             (13, 'vim fed-local_a_1.log')]
+    procs = [(10, PILOT_A),
+             (11, PILOT_L),
+             (12, EP_A),
+             (13, 'vim fed-local_a_p.a1b2c3d4e5.log')]
 
+    # `local` must not claim `local_a`'s pilots (and vice versa) -- the
+    # name is matched as a whole argument, not as a prefix
     assert endpoint_proc.pilot_pids('local_a', procs) == [10]
+    assert endpoint_proc.pilot_pids('local',   procs) == [11]
+    assert endpoint_proc.pilot_pids('other',   procs) == []
+
+
+def test_endpoint_pids_matches_the_whole_name():
+
+    procs = [(10, PILOT_A), (12, EP_A),
+             (14, EP_A.replace('ep_local_a', 'ep_local_ab'))]
+
+    assert endpoint_proc.endpoint_pids('ep_local_a', procs)  == [12]
+    assert endpoint_proc.endpoint_pids('ep_local_ab', procs) == [14]
+    assert endpoint_proc.endpoint_pids('ep_nope', procs)     == []
 
 
 def test_leave_stops_endpoint_and_pilots(broker, table, capsys):
@@ -580,9 +739,9 @@ def test_leave_stops_endpoint_and_pilots(broker, table, capsys):
     broker.resources.append({'name': 'local_a'})
     endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
 
-    tbl = table({100: 'radical-orbit-endpoint.py --name ep_local_a',
-                 200: 'radical-orbit-endpoint.py --name fed-local_a_1',
-                 300: 'radical-orbit-endpoint.py --name fed-other_1'})
+    tbl = table({100: EP_A,
+                 200: PILOT_A,
+                 300: PILOT_A.replace('fed-local_a_', 'fed-other_')})
 
     rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
                      'local_a'])
@@ -612,6 +771,40 @@ def test_leave_without_a_pidfile(broker, table, capsys):
     assert 'no pidfile' in capsys.readouterr().err
 
 
+def test_leave_finds_the_endpoint_without_a_pidfile(broker, table, capsys):
+
+    # the CLI was killed before it could write a pidfile -- the endpoint
+    # is still found in the process table
+    broker.resources.append({'name': 'local_a'})
+    tbl = table({100: EP_A, 200: PILOT_A})
+
+    rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                     'local_a'])
+
+    assert rc == 0
+    assert [pid for pid, sig in tbl.killed if sig == signal.SIGTERM] \
+        == [100, 200]
+    assert 'found endpoint ep_local_a in the process table' \
+        in capsys.readouterr().out
+
+
+def test_leave_ignores_a_stale_pidfile(broker, table, capsys):
+
+    broker.resources.append({'name': 'local_a'})
+    endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
+
+    # pid 100 was reused by something else entirely
+    tbl = table({100: '/usr/bin/rsync -a /data /backup'})
+
+    rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                     'local_a'])
+
+    assert rc == 0
+    assert tbl.killed == []                     # the innocent pid survives
+    assert 'pidfile stale' in capsys.readouterr().err
+    assert endpoint_proc.read_pidfile('local_a') is None
+
+
 def test_leave_tolerates_an_unknown_resource(broker, table):
 
     table({})
@@ -639,7 +832,7 @@ def test_leave_reports_a_broker_error(broker, table, capsys):
 
     broker.errors['/federation/leave/'] = (500, 'boom')
     endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
-    table({100: 'radical-orbit-endpoint.py --name ep_local_a'})
+    table({100: EP_A})
 
     rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
                      'local_a'])
@@ -652,13 +845,115 @@ def test_leave_can_keep_the_endpoint(broker, table):
 
     broker.resources.append({'name': 'local_a'})
     endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
-    tbl = table({100: 'radical-orbit-endpoint.py --name ep_local_a'})
+    tbl = table({100: EP_A})
 
     rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
                      'local_a', '--keep-endpoint'])
 
     assert rc == 0
     assert tbl.killed == []
+
+
+def test_detach_then_leave_round_trip(broker, proc, table, capsys):
+
+    rc = join.main(ARGS_LOCAL + ['--detach'])
+    assert rc == 0
+    assert pidfile('local_a')['pid'] == 4242
+
+    capsys.readouterr()
+
+    # the detached endpoint, as `atomic-leave` will find it: same pid,
+    # same pidfile, plus a pilot it spawned meanwhile
+    tbl = table({4242: EP_A, 4300: PILOT_A})
+
+    rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                     'local_a'])
+
+    assert rc == 0
+    assert broker.left      == ['local_a']
+    assert broker.resources == []
+    assert [pid for pid, sig in tbl.killed if sig == signal.SIGTERM] \
+        == [4242, 4300]
+    assert endpoint_proc.read_pidfile('local_a') is None
+
+
+# ---------------------------------------------------------------------------
+# the real child process (no fakes below this line)
+# ---------------------------------------------------------------------------
+
+STUB = """\
+import sys, time
+sys.stderr.write('stub endpoint: %s\\n' % ' '.join(sys.argv[1:]))
+sys.stderr.flush()
+time.sleep(60)
+"""
+
+
+def test_real_endpoint_process_start_and_stop(tmp_path):
+
+    stub = tmp_path / 'radical-orbit-endpoint.py'
+    stub.write_text(STUB)
+
+    ep = endpoint_proc.EndpointProcess('real_a', 'https://127.0.0.1:1',
+                                       binary=str(stub))
+    pid = ep.start()
+    try:
+        assert pid > 0
+        assert ep.is_alive()
+        assert ep.returncode is None
+
+        # the log carries the command header and the child's own output
+        deadline = time.time() + 5
+        while 'stub endpoint' not in ep.log_tail(50) and time.time() < deadline:
+            time.sleep(0.05)
+
+        tail = ep.log_tail(50)
+        assert str(stub) in tail                       # the header line
+        assert '--name ep_real_a' in tail
+        assert 'stub endpoint' in tail                 # stdout/err captured
+
+        # ... and it runs in its own session, so a Ctrl-C on our terminal
+        # does not race the orderly shutdown
+        assert os.getsid(pid) == pid
+
+    finally:
+        ep.stop(timeout=5)
+
+    assert not ep.is_alive()
+    assert ep.returncode is not None                   # reaped, no zombie
+    assert not endpoint_proc.pid_alive(pid) or _is_zombie(pid)
+
+
+def _is_zombie(pid):
+
+    try:
+        with open('/proc/%d/stat' % pid, 'r', encoding='utf-8') as fin:
+            return fin.read().rsplit(')', 1)[-1].split()[0] == 'Z'
+    except OSError:
+        return False
+
+
+def test_kill_pids_terminates_a_real_child():
+
+    child = subprocess.Popen([sys.executable, '-c',
+                              'import time; time.sleep(60)'])
+    try:
+        # a killed child of *ours* stays a zombie until it is reaped, and
+        # a zombie still answers `kill(pid, 0)` -- so reap it in parallel,
+        # the way the real target (a pilot, not our child) disappears
+        reaper = threading.Thread(target=child.wait)
+        reaper.start()
+
+        gone = endpoint_proc.kill_pids([child.pid], timeout=5)
+
+        reaper.join(5)
+        assert child.returncode == -signal.SIGTERM
+        assert gone == [child.pid]
+
+    finally:
+        if child.poll() is None:                       # pragma: no cover
+            child.kill()
+            child.wait(5)
 
 
 # ---------------------------------------------------------------------------

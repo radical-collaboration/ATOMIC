@@ -19,6 +19,12 @@ from urllib.parse import urlsplit
 
 
 # ---------------------------------------------------------------------------
+def error_body(status: int, detail: str) -> Dict[str, Any]:
+    """The gateway's error envelope, as the real broker sends it."""
+
+    return {'error': True, 'status_code': status, 'detail': detail}
+
+
 class FakeResponse:
     """The bits of ``requests.Response`` the client actually uses."""
 
@@ -64,6 +70,9 @@ class FakeBroker:
         self.allocation: Optional[Dict[str, Any]] = None
         self.has_queue_info = True
 
+        # what the federation fills in when a join carries no budget
+        self.derived_budget = 2.0
+
         # federation state
         self.resources: List[Dict[str, Any]] = []
         self.joined:    List[Dict[str, Any]] = []
@@ -104,7 +113,7 @@ class FakeBroker:
 
         for route, (status, msg) in self.errors.items():
             if route in path:
-                return FakeResponse(status, {'detail': msg})
+                return FakeResponse(status, error_body(status, msg))
 
         parts = [p for p in path.split('/') if p]
 
@@ -124,7 +133,7 @@ class FakeBroker:
             return self._endpoint_route(method, parts[0], parts[1],
                                         parts[2:])
 
-        return FakeResponse(404, {'detail': 'no such route: %s' % parts})
+        return FakeResponse(404, error_body(404, 'no such route: %s' % parts))
 
     def _endpoint_list(self) -> List[Dict[str, Any]]:
 
@@ -141,8 +150,8 @@ class FakeBroker:
                         rest: List[str]) -> FakeResponse:
 
         if endpoint not in self.endpoints:
-            return FakeResponse(404, {'detail': 'endpoint %r not connected'
-                                                % endpoint})
+            return FakeResponse(404, error_body(404, 'endpoint %r not connected'
+                                                % endpoint))
 
         if plugin == 'sysinfo':
             if rest[:1] == ['register_session']:
@@ -151,7 +160,7 @@ class FakeBroker:
                 return FakeResponse(200, {'sid': sid})
             if rest[:1] == ['metrics']:
                 if rest[1:] and rest[1] not in self.sysinfo_sessions:
-                    return FakeResponse(404, {'detail': 'unknown session'})
+                    return FakeResponse(404, error_body(404, 'unknown session'))
                 return FakeResponse(200, self.metrics)
             if rest[:1] == ['unregister_session']:
                 if rest[1:] and rest[1] in self.sysinfo_sessions:
@@ -160,17 +169,17 @@ class FakeBroker:
 
         if plugin == 'queue_info' and rest == ['job_allocation']:
             if not self.has_queue_info:
-                return FakeResponse(404, {'detail': 'plugin not loaded'})
+                return FakeResponse(404, error_body(404, 'plugin not loaded'))
             return FakeResponse(200, {'allocation': self.allocation})
 
-        return FakeResponse(404, {'detail': 'no such plugin route'})
+        return FakeResponse(404, error_body(404, 'no such plugin route'))
 
     def _broker_route(self, method: str, plugin: str,
                       rest: List[str]) -> FakeResponse:
 
         if plugin != 'federation':
-            return FakeResponse(503, {'detail': 'plugin %r not hosted'
-                                                % plugin})
+            return FakeResponse(503, error_body(503, 'plugin %r not hosted'
+                                                % plugin))
 
         if rest[:2] == ['join', 'default']:
             return self._join()
@@ -185,9 +194,9 @@ class FakeBroker:
             for rec in self.resources:
                 if rec.get('name') == rest[2]:
                     return FakeResponse(200, rec)
-            return FakeResponse(404, {'detail': 'unknown resource'})
+            return FakeResponse(404, error_body(404, 'unknown resource'))
 
-        return FakeResponse(404, {'detail': 'no such federation route'})
+        return FakeResponse(404, error_body(404, 'no such federation route'))
 
     def _join(self) -> FakeResponse:
 
@@ -195,17 +204,21 @@ class FakeBroker:
         name   = record.get('name')
 
         if any(r.get('name') == name for r in self.resources):
-            return FakeResponse(409, {'detail': 'name %r exists' % name})
+            return FakeResponse(409, error_body(409, 'name %r exists' % name))
+
+        # a record without a budget is one the federation derives itself
+        # (allocation mode: nodes x walltime) -- it comes back filled in
+        budget = record.get('budget') or {'node_hours': self.derived_budget}
 
         full = dict(record)
         full.update({'joined_at'     : 1757100000.0,
                      'dispatcher_sid': 'fed-%s' % name,
                      'pool_name'     : 'fed-%s' % name,
                      'liveness'      : 'ok',
+                     'budget'        : budget,
                      'usage'         : {'node_hours_used'     : 0.0,
                                         'node_hours_remaining':
-                                            (record.get('budget') or {})
-                                            .get('node_hours', 0.0),
+                                            budget['node_hours'],
                                         'pilots_active': 0,
                                         'tasks_running': 0,
                                         'tasks_done'   : 0}})
@@ -225,7 +238,7 @@ class FakeBroker:
                 self.resources.remove(rec)
                 return FakeResponse(200, {'ok': True})
 
-        return FakeResponse(404, {'detail': 'unknown resource %r' % name})
+        return FakeResponse(404, error_body(404, 'unknown resource %r' % name))
 
     # ------------------------------------------------------------- helpers
     def connect(self, endpoint: str, plugins: Optional[List[str]] = None

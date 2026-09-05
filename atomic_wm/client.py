@@ -53,6 +53,41 @@ class ClientError(RuntimeError):
         self.url = url
 
 
+# ORBIT's operator-placed fallbacks -- the same files
+# `radical-orbit-endpoint.py` falls back to (CLI > env > file), so a
+# machine set up for ORBIT needs no --cert/--token here either
+DEFAULT_CERT_FILE  = '~/.radical/orbit/broker_cert.pem'
+DEFAULT_TOKEN_FILE = '~/.radical/orbit/broker.token'
+
+
+def _default_cert() -> Optional[str]:
+    """``~/.radical/orbit/broker_cert.pem`` if the operator placed one."""
+
+    path = os.path.expanduser(DEFAULT_CERT_FILE)
+
+    return path if os.path.exists(path) else None
+
+
+def _default_token() -> str:
+    """Token from ``$RADICAL_ORBIT_TOKEN``, the env, or the token file.
+
+    An empty result is normal and means "no ``Authorization`` header" --
+    which is what a ``--no-auth`` broker wants.
+    """
+
+    for var in ['RADICAL_ORBIT_TOKEN', 'RADICAL_ORBIT_BROKER_TOKEN']:
+        token = (os.environ.get(var) or '').strip()
+        if token:
+            return token
+
+    try:
+        with open(os.path.expanduser(DEFAULT_TOKEN_FILE), 'r',
+                  encoding='utf-8') as fin:
+            return fin.read().strip()
+    except OSError:
+        return ''
+
+
 class PinnedCertAdapter(requests.adapters.HTTPAdapter):
     """Verify the broker against one pinned certificate, no hostname match.
 
@@ -94,10 +129,9 @@ class Client:
                  timeout: float = 30.0):
         self.broker = (broker or os.environ.get('RADICAL_ORBIT_BROKER_URL')
                        or '').rstrip('/')
-        self.token = token if token is not None else os.environ.get(
-            'RADICAL_ORBIT_TOKEN',
-            os.environ.get('RADICAL_ORBIT_BROKER_TOKEN', ''))
-        self.cert = cert or os.environ.get('RADICAL_ORBIT_BROKER_CERT')
+        self.token = token if token is not None else _default_token()
+        self.cert = cert or os.environ.get(
+            'RADICAL_ORBIT_BROKER_CERT') or _default_cert()
         self.timeout = timeout
         if not self.broker:
             raise ValueError('broker URL required (--broker or '
@@ -144,6 +178,13 @@ class Client:
                                         headers=self.headers(),
                                         timeout=self.timeout,
                                         verify=verify)
+        except requests.exceptions.SSLError as e:
+            # the full urllib3 chain is 300 characters of noise; what the
+            # caller needs is the one thing that fixes it
+            raise ClientError(0, 'TLS verification failed -- pass --cert '
+                                 '<broker cert> (or set '
+                                 '$RADICAL_ORBIT_BROKER_CERT)', url) from e
+
         except requests.RequestException as e:
             raise ClientError(0, 'cannot reach broker: %s' % e, url) from e
 
@@ -343,9 +384,14 @@ def add_connection_args(parser) -> None:
     parser.add_argument('--broker', default=None,
                         help='gateway URL (default $RADICAL_ORBIT_BROKER_URL)')
     parser.add_argument('--token', default=None,
-                        help='bearer token (default $RADICAL_ORBIT_TOKEN)')
+                        help='bearer token (default $RADICAL_ORBIT_TOKEN, '
+                             'then $RADICAL_ORBIT_BROKER_TOKEN, then '
+                             '~/.radical/orbit/broker.token; may be empty '
+                             'for a --no-auth broker)')
     parser.add_argument('--cert', default=None,
-                        help='broker TLS cert (default $RADICAL_ORBIT_BROKER_CERT)')
+                        help='broker TLS cert (default '
+                             '$RADICAL_ORBIT_BROKER_CERT, then '
+                             '~/.radical/orbit/broker_cert.pem)')
 
 
 def client_from_args(args) -> Client:

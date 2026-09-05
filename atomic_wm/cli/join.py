@@ -49,11 +49,6 @@ POLL_INTERVAL     = 1.0
 LOOP_INTERVAL     = 1.0
 LIVENESS_INTERVAL = 10.0
 
-# node-hour budget assumed in allocation mode when neither --node-hours
-# nor the batch system tell us better (mirrors the federation's own
-# default of one node for one hour)
-DEFAULT_NODE_HOURS = 1.0
-
 GIB = 1024 ** 3
 
 
@@ -68,6 +63,10 @@ class JoinError(Exception):
     def __init__(self, msg: str, hint: str = ''):
         super().__init__(msg)
         self.hint = hint
+
+
+class Interrupted(Exception):
+    """A signal arrived before the join was complete."""
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--node-hours', type=float, default=None,
                         metavar='H',
                         help='node-hour budget this join contributes '
-                             '(required in login mode)')
+                             '(required in login mode; in allocation mode '
+                             'the federation derives one from the '
+                             'allocation if you do not give it)')
     parser.add_argument('--scratch', default=None, metavar='DIR',
                         help='scratch base for tasks on this resource '
                              '(must be under $HOME or /tmp)')
@@ -346,67 +347,67 @@ def detect(client: Client, endpoint: str, mode: str,
                                               Optional[Dict[str, Any]]]:
     """Detect capabilities and (allocation mode) the current allocation.
 
+    Only allocation mode detects: there, the machine the endpoint runs on
+    *is* the resource.  In login mode the endpoint sits on a login node
+    whose cores and memory say nothing about the pilots it would submit
+    — the size comes from the ``--nodes``/``--cpus`` flags instead.
+
     Detection is best effort: a missing or failing plugin is a warning,
     not an error -- what is missing afterwards must have been declared.
     """
 
+    if mode != 'allocation':
+        return {}, None
+
     detected: Dict[str, Any] = {}
 
-    if all(key in declared for key in DECLARE_KEYS):
-        # everything was declared -- do not bother the endpoint
-        pass
-    else:
+    if not all(key in declared for key in DECLARE_KEYS):
         try:
             detected = capabilities_from_metrics(
                            client.sysinfo_metrics(endpoint))
         except ClientError as e:
             warn('capability detection via sysinfo failed: %s' % e)
 
-    alloc = None
-    if mode == 'allocation':
-        alloc = client.job_allocation(endpoint)
-
-    return detected, alloc
+    return detected, client.job_allocation(endpoint)
 
 
 # ---------------------------------------------------------------------------
 # the resource record
 # ---------------------------------------------------------------------------
 
-def budget_node_hours(args: argparse.Namespace,
-                      alloc: Optional[Dict[str, Any]]) -> float:
-    """Node-hour budget of this join.
+def pool_capabilities(args: argparse.Namespace) -> Dict[str, Any]:
+    """What one login-mode pilot offers: `nodes` x the per-node numbers."""
 
-    ``--node-hours`` wins; in allocation mode we otherwise derive it from
-    the allocation the endpoint runs in (nodes x remaining walltime), and
-    fall back to the federation's own default of one node-hour.
-    """
+    if args.mode != 'login':
+        return {}
 
-    if args.node_hours is not None:
-        return float(args.node_hours)
-
-    if alloc:
-        nodes   = alloc.get('n_nodes') or 1
-        runtime = alloc.get('runtime')
-        if runtime:
-            return round(float(nodes) * float(runtime) / 3600.0, 3)
-
-    return DEFAULT_NODE_HOURS
+    return {'cores': (args.nodes or 0) * (args.cpus or 0),
+            'gpus' : (args.nodes or 0) * (args.gpus_per_node or 0)}
 
 
 def assemble_record(args: argparse.Namespace,
                     detected: Optional[Dict[str, Any]] = None,
                     alloc: Optional[Dict[str, Any]] = None
                     ) -> Dict[str, Any]:
-    """Build the federation resource record -- declared beats detected."""
+    """Build the federation resource record.
 
-    caps: Dict[str, Any] = {}
+    Capability precedence: ``--declare`` > detected (allocation mode) or
+    derived from the pilot description (login mode).  ``budget`` is sent
+    only when ``--node-hours`` was given; in allocation mode the
+    federation otherwise derives it from the allocation itself
+    (nodes x walltime), which it knows better than we do.
+    """
+
+    caps:    Dict[str, Any] = {}
+    derived: Dict[str, Any] = pool_capabilities(args)
 
     for key in DECLARE_KEYS:
         if key in args.declared:
             caps[key] = args.declared[key]
         elif detected and key in detected:
             caps[key] = detected[key]
+        elif key in derived:
+            caps[key] = derived[key]
 
     caps['software'] = list(args.software)
 
@@ -417,8 +418,10 @@ def assemble_record(args: argparse.Namespace,
         'site'        : args.site,
         'kind'        : args.kind,
         'capabilities': caps,
-        'budget'      : {'node_hours': budget_node_hours(args, alloc)},
     }
+
+    if args.node_hours is not None:
+        record['budget'] = {'node_hours': float(args.node_hours)}
 
     if args.scratch:
         record['scratch_base'] = args.scratch
@@ -444,14 +447,21 @@ def assemble_record(args: argparse.Namespace,
 
 def wait_connected(client: Client, endpoint: str, timeout: float,
                    proc: Optional[Any] = None,
-                   interval: Optional[float] = None) -> None:
-    """Block until `endpoint` is a connected participant."""
+                   interval: Optional[float] = None,
+                   stop: Optional[threading.Event] = None) -> None:
+    """Block until `endpoint` is a connected participant.
+
+    A signal (`stop`) aborts the wait: Ctrl-C during a 60 s connect wait
+    must not be ignored.
+    """
 
     interval = POLL_INTERVAL if interval is None else interval
     deadline = time.time() + timeout
     last_err = ''
 
     while time.time() < deadline:
+
+        _check_stop(stop)
 
         if proc is not None and not proc.is_alive():
             raise JoinError('the endpoint process died while connecting '
@@ -463,7 +473,10 @@ def wait_connected(client: Client, endpoint: str, timeout: float,
         except ClientError as e:
             last_err = str(e)
 
-        time.sleep(interval)
+        if stop is not None:
+            stop.wait(interval)
+        else:
+            time.sleep(interval)
 
     hint = _log_hint(proc)
     if last_err:
@@ -493,15 +506,38 @@ def _log_hint(proc: Optional[Any]) -> str:
     return hint
 
 
-def join_error_hint(e: ClientError, name: str) -> str:
+def _check_stop(stop: Optional[threading.Event]) -> None:
+    """Raise :class:`Interrupted` if a signal asked us to stop."""
+
+    if stop is not None and stop.is_set():
+        raise Interrupted()
+
+
+def join_error_hint(e: ClientError, name: str,
+                    log: str = '') -> str:
     """Turn a federation error into something actionable."""
 
     if e.status == 0:
         return ('the broker is not reachable -- check --broker, --cert and '
                 'that the broker is running')
-    if e.status in (404, 503):
+
+    detail = e.detail.lower()
+
+    if e.status in (404, 503) and 'dispatcher' in detail:
+        # the federation is there, but it has nothing to route tasks with
+        return ('the broker hosts the federation but no task dispatcher -- '
+                'start it with `--plugins task_dispatcher,federation`')
+
+    if e.status == 503 or (e.status == 404 and 'no route' in detail):
         return ("the broker does not host the 'federation' plugin -- start "
                 "it with `--plugins …,federation`")
+
+    if e.status == 404:
+        # the plugin answered: it is the *endpoint* it cannot see
+        hint = ('the federation does not see the endpoint as connected -- '
+                'it may have dropped out again')
+        return hint + ('\nendpoint log: %s' % log if log else '')
+
     if e.status == 409:
         return ('a resource named %r is already in the federation -- pick '
                 'another --name or run `atomic-leave %s` first' % (name, name))
@@ -597,21 +633,21 @@ def foreground(client: Client, name: str, endpoint: str,
 
 
 def connect_and_join(client: Client, args: argparse.Namespace,
-                     endpoint: str, proc: Any
+                     endpoint: str, proc: Any,
+                     stop: Optional[threading.Event] = None
                      ) -> Tuple[Dict[str, Any], Any]:
     """Steps 2-4: wait for the endpoint, detect, join.
 
     Returns ``(record we sent, record the federation returned)``; raises
-    :class:`JoinError` or :class:`ClientError`.
+    :class:`JoinError`, :class:`Interrupted` or :class:`ClientError`.
     """
 
-    wait_connected(client, endpoint, args.connect_timeout, proc)
+    wait_connected(client, endpoint, args.connect_timeout, proc, stop=stop)
     info('endpoint %s is connected' % endpoint)
 
     detected, alloc = detect(client, endpoint, args.mode, args.declared)
+    _check_stop(stop)
 
-    if detected:
-        info('detected: %s' % _fmt_caps(detected))
     if alloc:
         info('allocation: %s node(s), %s s remaining'
              % (alloc.get('n_nodes'), alloc.get('runtime')))
@@ -622,6 +658,12 @@ def connect_and_join(client: Client, args: argparse.Namespace,
         raise JoinError('no core count for this resource',
                         'sysinfo did not report one -- declare it: '
                         '--declare cores=<N>')
+
+    # what actually goes on the record: detected values, overridden by
+    # anything --declare'd
+    info('capabilities: %s%s' % (_fmt_caps(record['capabilities']),
+                                 ' (declared values win)'
+                                 if args.declared else ''))
 
     return record, client.fed_join(record)
 
@@ -639,6 +681,15 @@ def run(args: argparse.Namespace) -> int:
         error(str(e))
         return 2
 
+    if client.broker.startswith('http://'):
+        warn('the broker URL is plain http -- ORBIT brokers always serve '
+             'TLS; https:// is almost certainly what you want')
+
+    # signals are handled from here on: a Ctrl-C during the connect wait
+    # or the capability detection must still tear the endpoint down
+    stop = threading.Event()
+    install_signal_handlers(stop)
+
     # ---------------------------------------------------------- 1. endpoint
     proc = EndpointProcess(name, client.broker,
                            endpoint =endpoint,
@@ -653,45 +704,65 @@ def run(args: argparse.Namespace) -> int:
         error(str(e))
         return 1
 
+    # the pidfile is written immediately, and in *both* modes: from now
+    # on there is a child process, and if this CLI is killed outright
+    # `atomic-leave` must be able to find and stop it.
+    path = endpoint_proc.write_pidfile(name, pid, endpoint, client.broker)
+
     info('started endpoint %s (pid %s), log: %s' % (endpoint, pid, proc.log))
 
     try:
-        record, full = connect_and_join(client, args, endpoint, proc)
+        record, full = connect_and_join(client, args, endpoint, proc, stop)
 
-    except JoinError as e:
-        error(str(e), e.hint)
-        proc.stop()
-        return 1
-
-    except ClientError as e:
-        error('join failed: %s' % e, join_error_hint(e, name))
-        proc.stop()
-        return 1
-
-    except KeyboardInterrupt:
-        error('interrupted')
-        proc.stop()
+    except (Interrupted, JoinError, ClientError, KeyboardInterrupt) as e:
+        _report_join_failure(e, name, proc.log)
+        abort(name, proc)
         return 1
 
     _report_joined(name, record, full)
 
     # ------------------------------------------------------------ 5. serve
-    # the pidfile is written in *both* modes: if this process is killed
-    # with SIGKILL, `atomic-leave` is still able to stop the endpoint it
-    # left behind.  A clean teardown removes it again.
-    path = endpoint_proc.write_pidfile(name, proc.pid or 0, endpoint,
-                                       client.broker)
-
     if args.detach:
         proc.detach()
         info('detached -- pidfile: %s' % path)
         info('teardown: atomic-leave %s' % name)
         return 0
 
-    stop = threading.Event()
-    install_signal_handlers(stop)
+    if stop.is_set():
+        # the signal arrived between the join and here -- honour it
+        teardown(client, name, proc)
+        return 0
 
     return foreground(client, name, endpoint, proc, stop)
+
+
+def _report_join_failure(e: BaseException, name: str, log: str) -> None:
+    """Explain why the join did not happen (see :func:`join_error_hint`)."""
+
+    if isinstance(e, Interrupted):
+        info('interrupted -- stopping the endpoint (nothing was joined)')
+
+    elif isinstance(e, KeyboardInterrupt):               # pragma: no cover
+        error('interrupted -- stopping the endpoint (nothing was joined)')
+
+    elif isinstance(e, ClientError):
+        error('join failed: %s' % e, join_error_hint(e, name, log))
+
+    else:                                                # JoinError
+        error(str(e), getattr(e, 'hint', ''))
+
+
+def abort(name: str, proc: EndpointProcess) -> None:
+    """Undo a join that never completed: stop the child, drop the pidfile."""
+
+    proc.stop()
+
+    pids = endpoint_proc.kill_pilots(name)
+    if pids:
+        info('terminated %d surviving pilot process(es): %s'
+             % (len(pids), ', '.join(str(p) for p in pids)))
+
+    endpoint_proc.remove_pidfile(name)
 
 
 def _fmt_caps(caps: Dict[str, Any]) -> str:
@@ -705,15 +776,22 @@ def _report_joined(name: str, record: Dict[str, Any],
     """Summarise what was joined."""
 
     full = full if isinstance(full, dict) else {}
-    caps = record['capabilities']
+    caps = full.get('capabilities') or record['capabilities']
+
+    # the budget is reported as the *federation* recorded it: in
+    # allocation mode without --node-hours it derives one from the
+    # allocation itself, and that is the number that counts
+    budget = (full.get('budget') or record.get('budget') or {})
 
     info('joined federation as %r (%s, %s)'
          % (name, record['mode'], record['kind']))
     info('  capabilities : %s%s'
          % (_fmt_caps(caps),
-            (', software=' + ','.join(caps['software']))
-            if caps['software'] else ''))
-    info('  node-hours   : %s' % record['budget']['node_hours'])
+            (', software=' + ','.join(caps.get('software') or []))
+            if caps.get('software') else ''))
+    info('  node-hours   : %s%s'
+         % (budget.get('node_hours', 'derived by the federation'),
+            '' if record.get('budget') else ' (derived from the allocation)'))
     info('  pool         : %s' % full.get('pool_name', 'fed-%s' % name))
     if full.get('scratch_base') or record.get('scratch_base'):
         info('  scratch      : %s' % (full.get('scratch_base')

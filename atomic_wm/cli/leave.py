@@ -92,26 +92,60 @@ def leave_federation(args: argparse.Namespace) -> int:
         return 1
 
 
-def stop_endpoint(args: argparse.Namespace) -> int:
-    """Step 2 -- stop the endpoint recorded in the pidfile."""
+def endpoint_pid(args: argparse.Namespace) -> Optional[int]:
+    """The pid of `name`'s endpoint — from the pidfile, else from ``/proc``.
 
-    info_rec = endpoint_proc.read_pidfile(args.name)
+    A pid read from a pidfile is only trusted once ``/proc`` confirms it
+    is really this resource's endpoint: pids are reused, and killing an
+    unrelated process because a stale file named it would be worse than
+    doing nothing.
+    """
 
-    if not info_rec:
-        warn('no pidfile for %r (%s) -- was it started with --detach?'
-             % (args.name, endpoint_proc.pid_path(args.name)))
-        return 0
+    endpoint = endpoint_proc.endpoint_name(args.name)
+    record   = endpoint_proc.read_pidfile(args.name)
 
-    pid = int(info_rec['pid'])
+    if record:
+        pid     = int(record['pid'])
+        cmdline = endpoint_proc.cmdline_of(pid)
 
-    if not endpoint_proc.pid_alive(pid):
-        info('endpoint pid %d is already gone' % pid)
+        if endpoint_proc.is_endpoint_cmdline(cmdline, endpoint):
+            return pid
+
+        if not cmdline:
+            info('endpoint pid %d is already gone' % pid)
+        else:
+            warn('pidfile stale: pid %d is not %s -- ignoring it'
+                 % (pid, endpoint))
+
         endpoint_proc.remove_pidfile(args.name)
+
+    # no (usable) pidfile: the CLI may have been killed before it wrote
+    # one.  Look the endpoint up in the process table instead.
+    found = endpoint_proc.endpoint_pids(endpoint)
+
+    if found:
+        info('found endpoint %s in the process table (pid %s)'
+             % (endpoint, ', '.join(str(p) for p in found)))
+        return found[0]
+
+    if not record:
+        warn('no pidfile for %r (%s) and no running %s'
+             % (args.name, endpoint_proc.pid_path(args.name), endpoint))
+
+    return None
+
+
+def stop_endpoint(args: argparse.Namespace) -> int:
+    """Step 2 -- stop this resource's endpoint process."""
+
+    pid = endpoint_pid(args)
+
+    if pid is None:
         return 0
 
     if endpoint_proc.stop_pid(pid, timeout=args.timeout):
         info('stopped endpoint %s (pid %d)'
-             % (info_rec.get('endpoint', '?'), pid))
+             % (endpoint_proc.endpoint_name(args.name), pid))
         endpoint_proc.remove_pidfile(args.name)
         return 0
 

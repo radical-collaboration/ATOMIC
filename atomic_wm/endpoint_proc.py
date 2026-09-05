@@ -26,6 +26,7 @@ stderr ourselves to ``<state>/endpoint.log``.
 
 import errno
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -184,8 +185,10 @@ def find_endpoint_bin(explicit: Optional[str] = None) -> str:
     """Locate ``radical-orbit-endpoint.py``.
 
     Order: explicit path (``--endpoint-bin``) > ``$ATOMIC_ENDPOINT_BIN`` >
-    ``$PATH`` > next to the running interpreter (the usual case: the CLI
-    and the endpoint live in the same venv).
+    next to the running interpreter > ``$PATH``.  The interpreter's own
+    ``bin`` wins over ``$PATH`` on purpose: the child runs with
+    ``sys.executable``, so the endpoint from *this* venv is the one whose
+    dependencies are guaranteed to be importable.
     """
 
     for cand in [explicit, os.environ.get(ENV_ENDPOINT_BIN)]:
@@ -195,14 +198,14 @@ def find_endpoint_bin(explicit: Optional[str] = None) -> str:
                 raise EndpointError('endpoint binary not found: %s' % cand)
             return os.path.abspath(cand)
 
-    found = shutil.which(ENDPOINT_SCRIPT)
-    if found:
-        return found
-
     cand = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
                         ENDPOINT_SCRIPT)
     if os.path.exists(cand):
         return cand
+
+    found = shutil.which(ENDPOINT_SCRIPT)
+    if found:
+        return found
 
     raise EndpointError('cannot find %s -- install radical.orbit into this '
                         'environment, put it on $PATH, or pass '
@@ -445,31 +448,86 @@ def iter_processes() -> List[Tuple[int, str]]:
     return out
 
 
+def cmdline_of(pid: int) -> str:
+    """The command line of `pid`, or '' if it is gone / not ours to read."""
+
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as fin:
+            raw = fin.read()
+    except OSError:
+        return ''
+
+    return raw.replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+
+
+def _named_endpoint_re(endpoint: str) -> 'Any':
+    """Match an orbit endpoint command line running exactly `endpoint`.
+
+    The name has to be matched as a whole argument (``-n``/``--name``
+    followed by it, then whitespace or end of line): a substring test
+    makes the resource ``local`` claim the processes of ``local_a``.
+    """
+
+    return re.compile(r'(?:^|\s)(?:-n|--name)\s+%s(?:\s|$)'
+                      % re.escape(endpoint))
+
+
+def is_endpoint_cmdline(cmdline: str, endpoint: str) -> bool:
+    """Is `cmdline` an orbit endpoint serving exactly `endpoint`?"""
+
+    if PILOT_MARKER not in cmdline:
+        return False
+
+    return bool(_named_endpoint_re(endpoint).search(cmdline))
+
+
 def pilot_pids(name: str,
                procs: Optional[Iterable[Tuple[int, str]]] = None
                ) -> List[int]:
     """Pids of pilot children still running for the resource `name`.
 
     psij's ``local`` executor cancels only the wrapper job, so a pilot's
-    endpoint can outlive its pool.  A pilot is recognised by running an
-    orbit endpoint **and** carrying this resource's pool prefix
-    (``fed-<name>_``) — that is the dispatcher's child endpoint name.
+    endpoint can outlive its pool.  A pilot is an orbit endpoint whose
+    ``--name`` is the dispatcher's child endpoint name for this
+    resource's pool: ``fed-<name>_p.<hex>`` (``plugin_task_dispatcher``
+    builds it as ``f'{pool}_{pid}'`` with ``pid = f'p.{uuid4().hex[:10]}'``).
+    Matching the whole argument matters: a plain prefix test would let
+    the resource ``local`` kill the pilots of ``local_a``.
     """
 
     if procs is None:
         procs = iter_processes()
 
-    mine   = os.getpid()
-    prefix = pool_prefix(name)
-    found  = []
+    mine    = os.getpid()
+    pattern = re.compile(r'(?:^|\s)(?:-n|--name)\s+%sp\.[0-9a-f]+(?:\s|$)'
+                         % re.escape(pool_prefix(name)))
+    found   = []
 
     for pid, cmdline in procs:
         if pid == mine:
             continue
-        if PILOT_MARKER in cmdline and prefix in cmdline:
+        if PILOT_MARKER in cmdline and pattern.search(cmdline):
             found.append(pid)
 
     return found
+
+
+def endpoint_pids(endpoint: str,
+                  procs: Optional[Iterable[Tuple[int, str]]] = None
+                  ) -> List[int]:
+    """Pids of orbit endpoints running under the name `endpoint`.
+
+    The fallback for ``atomic-leave`` when there is no pidfile (the CLI
+    was killed before it wrote one, or somebody removed it).
+    """
+
+    if procs is None:
+        procs = iter_processes()
+
+    mine = os.getpid()
+
+    return [pid for pid, cmdline in procs
+            if pid != mine and is_endpoint_cmdline(cmdline, endpoint)]
 
 
 def kill_pilots(name: str,
@@ -479,9 +537,8 @@ def kill_pilots(name: str,
                 alive: Any = None) -> List[int]:
     """Terminate the surviving pilot children of the resource `name`.
 
-    (`killer`/`alive` are injectable for tests, as in :func:`kill_pids`.) of the resource `name`.
-
     Returns the pids which were signalled (empty when there were none).
+    `killer`/`alive` are injectable, as in :func:`kill_pids`.
     """
 
     pids = pilot_pids(name, procs)
@@ -495,7 +552,7 @@ def kill_pilots(name: str,
 def kill_pids(pids: Sequence[int], timeout: float = 5.0,
               killer: Any = None,
               alive: Any = None) -> List[int]:
-    """SIGTERM (then SIGKILL) `pids`; return those which are gone.
+    """SIGTERM (then SIGKILL) `pids`; return the pids which are gone.
 
     `killer` and `alive` are resolved at call time (and injectable) so
     the teardown logic can be tested without spawning processes.
@@ -506,14 +563,11 @@ def kill_pids(pids: Sequence[int], timeout: float = 5.0,
     if alive is None:
         alive = pid_alive
 
-    gone: List[int] = []
     left: List[int] = []
 
     for pid in pids:
         if _signal(pid, signal.SIGTERM, killer):
             left.append(pid)
-        else:
-            gone.append(pid)
 
     deadline = time.time() + timeout
     while left and time.time() < deadline:
@@ -524,7 +578,13 @@ def kill_pids(pids: Sequence[int], timeout: float = 5.0,
     for pid in left:
         _signal(pid, signal.SIGKILL, killer)
 
-    return gone + [pid for pid in pids if pid not in left]
+    if left:
+        # SIGKILL is asynchronous -- give the kernel a moment before we
+        # report what survived it
+        time.sleep(0.2)
+        left = [pid for pid in left if alive(pid)]
+
+    return [pid for pid in pids if pid not in left]
 
 
 def pid_alive(pid: int) -> bool:
