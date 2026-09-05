@@ -1,0 +1,629 @@
+"""Executor seam: run workflow instances through the federation.
+
+``StageRunner`` drives ONE stage: submit the task through the federation,
+stage the previous stage's outputs into its working directory, poll the task
+until it is terminal, collect the declared outputs immediately, write a
+manifest.  ``CampaignRunner`` drives a whole campaign: stages sequentially
+within a workflow, workflows concurrently (bounded by a semaphore), with
+failure isolated to the workflow it happened in.
+
+Everything the runner needs from the outside world is behind
+:class:`FederationAPI` -- the plugin implements it with in-process calls to
+the ``federation`` / ``task_dispatcher`` plugins and broker-caller calls to a
+pilot's ``staging`` plugin; the tests implement it with a scripted fake.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from .state import Campaign, StageRun, WorkflowInstance
+from .state import (CANCELED, DONE, FAILED, PENDING, RUNNING, SKIPPED,
+                    STAGING, SUBMITTED, TERMINAL_STATES)
+from .store import ResultStore, Source, stage_manifest
+
+log = logging.getLogger('radical.orbit')
+
+# dispatcher task states we treat as terminal (00-overview "Facts")
+TASK_TERMINAL = ('DONE', 'FAILED', 'CANCELED')
+
+# tools that only exist on PATH inside a pilot whose venv has atomic-wm
+# installed; $ATOMIC_TOOL_PREFIX gives them an explicit home (see docs).
+_TOOL_PREFIX_ENV = 'ATOMIC_TOOL_PREFIX'
+
+
+# --------------------------------------------------------------------------
+class FederationUnavailable(RuntimeError):
+    """The resource federation is not reachable on this service.
+
+    The message ends up on screen verbatim (campaign/stage ``reason``), so
+    it is phrased in the demo's vocabulary -- resources, campaigns,
+    workflows, stages -- and never in ORBIT's.
+    """
+
+    DEFAULT = 'the resource federation is not available'
+
+
+# --------------------------------------------------------------------------
+class StageFailed(RuntimeError):
+    """A stage could not be run to a successful, collected end."""
+
+
+# --------------------------------------------------------------------------
+class FederationAPI:
+    """Everything the runner needs from the outside world.
+
+    The plugin's implementation talks to the ``federation`` and
+    ``task_dispatcher`` plugins in-process and to a pilot's ``staging``
+    plugin over the broker caller; tests substitute a fake.
+    """
+
+    async def submit(self, task: Dict[str, Any],
+                     requirements: Dict[str, Any]) -> Dict[str, Any]:
+        """``POST federation/submit/default`` -> ``{task, resource, pool,
+        dispatcher_sid}``.  Raises :class:`FederationUnavailable`."""
+        raise NotImplementedError
+
+    async def task(self, task_id: str) -> Dict[str, Any]:
+        """``GET federation/task/default/<task_id>`` -> dispatcher task dict
+        plus ``resource`` (and ``child_endpoint`` while the pilot lives)."""
+        raise NotImplementedError
+
+    async def resources(self) -> List[Dict[str, Any]]:
+        """``GET federation/resources/default`` -> the resource records."""
+        raise NotImplementedError
+
+    async def stage_in(self, dispatcher_sid: str, pool: str, task_id: str,
+                       filename: str, data: bytes) -> Dict[str, Any]:
+        """Dispatcher ``stage_in`` -- writes into the task scratch dir on the
+        broker host.  Returns ``{'cwd', 'size'}``."""
+        raise NotImplementedError
+
+    async def stage_out(self, dispatcher_sid: str, task_id: str,
+                        filename: str) -> Optional[bytes]:
+        """Dispatcher ``stage_out`` -- read a file from the task scratch dir
+        on the broker host; ``None`` when it is not there."""
+        raise NotImplementedError
+
+    async def staging_get(self, endpoint: str,
+                          path: str) -> Optional[bytes]:
+        """Pilot-side ``staging get`` (no shared filesystem needed)."""
+        raise NotImplementedError
+
+    async def staging_put(self, endpoint: str, path: str,
+                          data: bytes) -> bool:
+        """Pilot-side ``staging put``; best effort, returns success."""
+        raise NotImplementedError
+
+    async def cancel_task(self, dispatcher_sid: str, task_id: str) -> bool:
+        """Best-effort dispatcher task cancel."""
+        raise NotImplementedError
+
+
+# --------------------------------------------------------------------------
+class StageRunner:
+    """Run the stages of one workflow instance, sequentially."""
+
+    def __init__(self, fed: FederationAPI, store: ResultStore, *,
+                 poll_interval:     float = 1.0,
+                 poll_max_interval: float = 3.0,
+                 stage_timeout:     float = 900.0,
+                 tool_prefix:       Optional[str] = None,
+                 on_change:         Optional[Callable[[], None]] = None,
+                 sleep:             Callable[[float], Any] = asyncio.sleep,
+                 clock:             Callable[[], float] = time.time) -> None:
+
+        self._fed          = fed
+        self._store        = store
+        self._poll         = float(poll_interval)
+        self._poll_max     = float(poll_max_interval)
+        self._timeout      = float(stage_timeout)
+        self._tool_prefix  = tool_prefix if tool_prefix is not None \
+                             else os.environ.get(_TOOL_PREFIX_ENV)
+        self._on_change    = on_change
+        self._sleep        = sleep
+        self._clock        = clock
+
+    # ----------------------------------------------------------------------
+    def _changed(self) -> None:
+        """Tell the owner something moved (it persists the state)."""
+
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception as exc:                              # noqa: BLE001
+            log.warning('[atomic_campaign] state persist failed: %s', exc)
+
+    # ----------------------------------------------------------------------
+    def resolve_cmd(self, cmd: Sequence[str]) -> List[str]:
+        """Prefix a bare ``atomic-fake-*`` tool with ``$ATOMIC_TOOL_PREFIX``.
+
+        The synthetic workload is on ``PATH`` inside a pilot only when the
+        pilot's venv has ``atomic-wm`` installed.  Where it is not, the
+        operator points ``ATOMIC_TOOL_PREFIX`` at a bin directory and the
+        runner rewrites ``argv[0]`` to an absolute path.
+        """
+
+        out = list(cmd)
+        if not out or not self._tool_prefix:
+            return out
+        argv0 = out[0]
+        if '/' in argv0 or not argv0.startswith('atomic-fake-'):
+            return out
+        out[0] = str(Path(self._tool_prefix).expanduser() / argv0)
+        return out
+
+    # ----------------------------------------------------------------------
+    async def run_workflow(self, campaign: Campaign, wf: WorkflowInstance,
+                           cancel: Optional[asyncio.Event] = None) -> None:
+        """Run every stage of *wf* in order; stop at the first failure.
+
+        Never raises for a stage failure -- the workflow records it and the
+        campaign carries on with the other workflows.  A missing federation
+        is the one exception: it is re-raised so the campaign as a whole can
+        report it.
+        """
+
+        wf.state  = RUNNING
+        wf.reason = None
+        self._changed()
+
+        produced: Dict[str, bytes] = {}
+        failure: Optional[StageRun] = None
+
+        for stage in wf.stages:
+            if failure is not None:
+                stage.state  = SKIPPED
+                stage.reason = 'stage %r did not succeed' % failure.name
+                continue
+            if cancel is not None and cancel.is_set():
+                stage.state  = CANCELED
+                stage.reason = 'campaign canceled'
+                failure      = stage
+                continue
+            await self._guarded_stage(campaign, wf, stage, produced, cancel)
+            if stage.state != DONE:
+                failure = stage
+
+        self._finish_workflow(wf, failure)
+
+    # ----------------------------------------------------------------------
+    async def _guarded_stage(self, campaign: Campaign, wf: WorkflowInstance,
+                             stage: StageRun, produced: Dict[str, bytes],
+                             cancel: Optional[asyncio.Event]) -> None:
+        """Run one stage, turning every failure into stage state.
+
+        Only a missing federation and a cancelled driver escape -- the first
+        because the whole campaign must report it, the second because the
+        asyncio contract says so.
+        """
+
+        try:
+            await self._run_stage(campaign, wf, stage, produced, cancel)
+        except FederationUnavailable as exc:
+            stage.state  = FAILED
+            stage.reason = str(exc) or FederationUnavailable.DEFAULT
+            wf.state     = FAILED
+            wf.reason    = stage.reason
+            wf.finished_at = self._clock()
+            self._changed()
+            raise
+        except StageFailed as exc:
+            if stage.state != CANCELED:
+                stage.state = FAILED
+            stage.reason = stage.reason or str(exc)
+        except asyncio.CancelledError:
+            stage.state  = CANCELED
+            stage.reason = 'the campaign was stopped'
+            wf.state     = CANCELED
+            wf.reason    = stage.reason
+            self._changed()
+            raise
+        except Exception as exc:                              # noqa: BLE001
+            log.exception('[atomic_campaign] stage %s/%s crashed',
+                          wf.id, stage.name)
+            stage.state  = FAILED
+            stage.reason = '%s: %s' % (type(exc).__name__, exc)
+        finally:
+            self._changed()
+
+    # ----------------------------------------------------------------------
+    def _finish_workflow(self, wf: WorkflowInstance,
+                         failure: Optional[StageRun]) -> None:
+        """Roll the stage outcomes up into the workflow's final state."""
+
+        if failure is None:
+            wf.state, wf.reason = DONE, None
+        elif failure.state == CANCELED:
+            wf.state  = CANCELED
+            wf.reason = failure.reason
+        else:
+            wf.state  = FAILED
+            wf.reason = 'stage %r failed: %s' % (failure.name,
+                                                 failure.reason or 'unknown')
+        wf.finished_at = self._clock()
+        self._changed()
+
+    # ----------------------------------------------------------------------
+    async def _run_stage(self, campaign: Campaign, wf: WorkflowInstance,
+                         stage: StageRun, produced: Dict[str, bytes],
+                         cancel: Optional[asyncio.Event]) -> None:
+        """Submit, stage in, poll, collect, manifest.  Raises on failure."""
+
+        cid          = campaign.campaign_id
+        stage.task_id = '%s-%s-%s' % (cid, wf.id, stage.name)
+        stage.state   = SUBMITTED
+        stage.submitted_at = self._clock()
+        self._changed()
+
+        task = {'task_id' : stage.task_id,
+                'cmd'     : self.resolve_cmd(stage.cmd),
+                'inputs'  : [],
+                'outputs' : list(stage.declared_outputs),
+                'priority': 0}
+
+        resp = await self._fed.submit(task, dict(stage.requirements))
+        self._record_submit(stage, resp)
+        self._changed()
+
+        pushed = await self._stage_inputs(stage, produced)
+
+        try:
+            task_dict = await self._poll_task(stage, cancel, produced)
+        finally:
+            self._changed()
+
+        # collect FIRST -- the pilot may vanish moments after the task ends
+        collected = await self._collect(campaign, wf, stage)
+        extra = {'inputs_staged': pushed} if pushed else None
+        self._finish_stage(stage, task_dict)
+        try:
+            self._store.write_manifest(
+                cid, wf.id, stage.name,
+                stage_manifest(cid, wf, stage, collected, extra=extra))
+        except OSError as exc:
+            log.warning('[atomic_campaign] manifest write failed for %s/%s: %s',
+                        wf.id, stage.name, exc)
+
+        missing = [c['name'] for c in collected if c['via'] is None]
+        if stage.state != DONE:
+            raise StageFailed(stage.reason or 'task did not succeed')
+        if missing:
+            stage.state  = FAILED
+            stage.reason = 'output(s) not collected: %s' % ', '.join(missing)
+            raise StageFailed(stage.reason)
+
+        # feed the next stage
+        for entry in collected:
+            data = self._store.read_output(cid, wf.id, stage.name,
+                                           entry['name'])
+            if data is not None:
+                produced[entry['name']] = data
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _record_submit(stage: StageRun, resp: Dict[str, Any]) -> None:
+        """Copy the federation submit response onto the stage record."""
+
+        resp = resp or {}
+        task = resp.get('task') or {}
+        stage.resource       = resp.get('resource')
+        stage.pool           = resp.get('pool')
+        stage.dispatcher_sid = resp.get('dispatcher_sid')
+        if task.get('cwd'):
+            stage.cwd = task['cwd']
+        if task.get('task_id'):
+            stage.task_id = task['task_id']
+
+    # ----------------------------------------------------------------------
+    async def _stage_inputs(self, stage: StageRun,
+                            produced: Dict[str, bytes]) -> List[Dict[str, Any]]:
+        """Stage this stage's inputs into the task working directory.
+
+        Path: the dispatcher's ``stage_in`` (broker host, shared filesystem).
+        A cross-host pilot additionally gets a best-effort ``put`` through its
+        own staging plugin once its child endpoint is known (see
+        :meth:`_push_inputs`).
+        """
+
+        if not stage.inputs:
+            return []
+
+        stage.state = STAGING
+        self._changed()
+        staged: List[Dict[str, Any]] = []
+        for name in stage.inputs:
+            data = produced.get(name)
+            if data is None:
+                stage.state  = FAILED
+                stage.reason = ('input %r was not produced by an earlier '
+                                'stage' % name)
+                raise StageFailed(stage.reason)
+            try:
+                res = await self._fed.stage_in(
+                    stage.dispatcher_sid or '', stage.pool or '',
+                    stage.task_id or '', name, data)
+            except Exception as exc:                          # noqa: BLE001
+                stage.state  = FAILED
+                stage.reason = 'could not stage input %r: %s' % (name,
+                                                                  exc)
+                raise StageFailed(stage.reason) from exc
+            if isinstance(res, dict) and res.get('cwd'):
+                stage.cwd = res['cwd']
+            staged.append({'name': name, 'via': 'dispatcher_stage_in',
+                           'size': len(data)})
+
+        stage.state = SUBMITTED
+        self._changed()
+        return staged
+
+    # ----------------------------------------------------------------------
+    async def _push_inputs(self, stage: StageRun,
+                           produced: Dict[str, bytes]) -> None:
+        """Best-effort ``put`` of the inputs onto the pilot that got the task.
+
+        Only useful when broker host and pilot do NOT share a filesystem --
+        there the dispatcher's ``stage_in`` wrote to the wrong host.  Failure
+        is logged and ignored (on a shared filesystem the file is already
+        there and the put is refused as 'exists').
+        """
+
+        if not stage.inputs or not stage.child_endpoint or not stage.cwd:
+            return
+        for name in stage.inputs:
+            data = produced.get(name)
+            if data is None:
+                continue
+            try:
+                ok = await self._fed.staging_put(
+                    stage.child_endpoint, str(Path(stage.cwd) / name), data)
+            except Exception as exc:                          # noqa: BLE001
+                log.info('[atomic_campaign] input push %s -> %s failed: %s',
+                         name, stage.child_endpoint, exc)
+                continue
+            log.info('[atomic_campaign] input push %s -> %s: %s',
+                     name, stage.child_endpoint, 'ok' if ok else 'skipped')
+
+    # ----------------------------------------------------------------------
+    async def _poll_task(self, stage: StageRun,
+                         cancel: Optional[asyncio.Event],
+                         produced: Dict[str, bytes]) -> Dict[str, Any]:
+        """Poll until the task is terminal; 1 s, backing off to 3 s.
+
+        The timeout is counted on the TASK state only -- a pilot that takes a
+        minute to boot is normal and must not fail a stage.
+        """
+
+        deadline = self._clock() + self._timeout
+        interval = self._poll
+        task_dict: Dict[str, Any] = {}
+        pushed   = False
+
+        while True:
+            await self._sleep(interval)
+            interval = min(interval * 1.5, self._poll_max)
+
+            if cancel is not None and cancel.is_set():
+                await self._cancel_task(stage)
+                stage.state  = CANCELED
+                stage.reason = 'campaign canceled'
+                raise StageFailed(stage.reason)
+
+            try:
+                task_dict = await self._fed.task(stage.task_id or '') or {}
+            except FederationUnavailable:
+                raise
+            except Exception as exc:                          # noqa: BLE001
+                # a transient lookup error must not fail the stage
+                log.info('[atomic_campaign] task poll for %s failed: %s',
+                         stage.task_id, exc)
+                task_dict = {}
+
+            self._observe(stage, task_dict)
+            if not pushed and stage.child_endpoint:
+                pushed = True
+                await self._push_inputs(stage, produced)
+
+            state = str(task_dict.get('state') or '')
+            if state in TASK_TERMINAL:
+                return task_dict
+
+            if self._clock() > deadline:
+                await self._cancel_task(stage)
+                stage.state  = FAILED
+                stage.reason = ('stage timed out after %.0f s (last '
+                                'state: %s)'
+                                % (self._timeout, state or 'unknown'))
+                raise StageFailed(stage.reason)
+
+    # ----------------------------------------------------------------------
+    def _observe(self, stage: StageRun, task_dict: Dict[str, Any]) -> None:
+        """Fold one task-dict poll into the stage record."""
+
+        state = str(task_dict.get('state') or '')
+        child = task_dict.get('child_endpoint')
+        if not child and task_dict.get('pilot_id') and stage.pool:
+            # the dispatcher names a pilot's child endpoint '<pool>_<pid>'
+            child = '%s_%s' % (stage.pool, task_dict['pilot_id'])
+        if child and child != stage.child_endpoint:
+            stage.child_endpoint = child
+            self._changed()
+        if task_dict.get('cwd'):
+            stage.cwd = task_dict['cwd']
+        if state == 'RUNNING' and stage.state != RUNNING:
+            stage.state = RUNNING
+            if stage.started_at is None:
+                stage.started_at = self._clock()
+            self._changed()
+
+    # ----------------------------------------------------------------------
+    def _finish_stage(self, stage: StageRun,
+                      task_dict: Dict[str, Any]) -> None:
+        """Map the terminal task dict onto the stage's outcome."""
+
+        state = str(task_dict.get('state') or '')
+        stage.exit_code   = task_dict.get('exit_code')
+        stage.finished_at = task_dict.get('finished_at') or self._clock()
+        # success == DONE with a zero (or absent) exit code -- 00-overview
+        if state == 'DONE' and stage.exit_code in (0, None):
+            stage.state  = DONE
+            stage.reason = None
+        else:
+            stage.state  = CANCELED if state == 'CANCELED' else FAILED
+            stage.reason = (task_dict.get('error')
+                            or 'the stage did not succeed (state %s, exit '
+                               'code %s)' % (state or 'unknown',
+                                             stage.exit_code))
+
+    # ----------------------------------------------------------------------
+    async def _cancel_task(self, stage: StageRun) -> None:
+        if not stage.dispatcher_sid or not stage.task_id:
+            return
+        try:
+            await self._fed.cancel_task(stage.dispatcher_sid, stage.task_id)
+        except Exception as exc:                              # noqa: BLE001
+            log.info('[atomic_campaign] cancel of %s failed: %s',
+                     stage.task_id, exc)
+
+    # ----------------------------------------------------------------------
+    async def _collect(self, campaign: Campaign, wf: WorkflowInstance,
+                       stage: StageRun) -> List[Dict[str, Any]]:
+        """Collect the declared outputs, immediately, in the documented order.
+
+        1. the pilot's own ``staging`` plugin (works without a shared FS),
+        2. the dispatcher's ``stage_out`` (shared FS),
+        3. a direct read on the broker host (localhost).
+        """
+
+        collected = await self._store.collect(
+            campaign.campaign_id, wf.id, stage.name,
+            list(stage.declared_outputs), self._sources(stage))
+        stage.outputs = collected
+        self._changed()
+        return collected
+
+    # ----------------------------------------------------------------------
+    def _sources(self, stage: StageRun) -> List[Source]:
+
+        async def _pilot(name: str) -> Optional[bytes]:
+            if not stage.child_endpoint or not stage.cwd:
+                return None
+            return await self._fed.staging_get(
+                stage.child_endpoint, str(Path(stage.cwd) / name))
+
+        async def _stage_out(name: str) -> Optional[bytes]:
+            if not stage.dispatcher_sid or not stage.task_id:
+                return None
+            return await self._fed.stage_out(stage.dispatcher_sid,
+                                             stage.task_id, name)
+
+        async def _local(name: str) -> Optional[bytes]:
+            if not stage.cwd:
+                return None
+            path = Path(stage.cwd) / name
+            if not path.is_file():
+                return None
+            return path.read_bytes()
+
+        return [('pilot_staging', _pilot),
+                ('dispatcher_stage_out', _stage_out),
+                ('broker_local', _local)]
+
+
+# --------------------------------------------------------------------------
+class CampaignRunner:
+    """Drive a whole campaign: workflows concurrently, stages sequentially."""
+
+    def __init__(self, fed: FederationAPI, store: ResultStore, *,
+                 max_concurrent_workflows: int = 8,
+                 on_change: Optional[Callable[[], None]] = None,
+                 **stage_kwargs: Any) -> None:
+
+        self._fed       = fed
+        self._store     = store
+        self._max       = max(1, int(max_concurrent_workflows))
+        self._on_change = on_change
+        self._kwargs    = stage_kwargs
+        self.cancel_event = asyncio.Event()
+
+    # ----------------------------------------------------------------------
+    def cancel(self) -> None:
+        """Ask the driver to stop; running stages end as CANCELED."""
+
+        self.cancel_event.set()
+
+    # ----------------------------------------------------------------------
+    def make_stage_runner(self) -> StageRunner:
+        return StageRunner(self._fed, self._store,
+                           on_change=self._on_change, **self._kwargs)
+
+    # ----------------------------------------------------------------------
+    async def run(self, campaign: Campaign) -> Campaign:
+        """Run every workflow of *campaign*; return it in its final state."""
+
+        sem = asyncio.Semaphore(self._max)
+
+        async def _one(wf: WorkflowInstance) -> None:
+            async with sem:
+                if self.cancel_event.is_set():
+                    self._mark_canceled(wf)
+                    return
+                await self.make_stage_runner().run_workflow(
+                    campaign, wf, self.cancel_event)
+
+        results = await asyncio.gather(
+            *[_one(wf) for wf in campaign.workflows], return_exceptions=True)
+
+        for wf, res in zip(campaign.workflows, results):
+            if isinstance(res, asyncio.CancelledError):
+                self._mark_canceled(wf)
+            elif isinstance(res, FederationUnavailable):
+                reason = str(res) or FederationUnavailable.DEFAULT
+                campaign.reason = campaign.reason or reason
+                self._mark_failed(wf, reason)
+            elif isinstance(res, BaseException):
+                log.exception('[atomic_campaign] workflow %s crashed: %s',
+                              wf.id, res)
+                self._mark_failed(wf, '%s: %s' % (type(res).__name__, res))
+
+        campaign.refresh_state()
+        self._changed()
+        return campaign
+
+    # ----------------------------------------------------------------------
+    def _changed(self) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception as exc:                              # noqa: BLE001
+            log.warning('[atomic_campaign] state persist failed: %s', exc)
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _mark_failed(wf: WorkflowInstance, reason: str) -> None:
+        if wf.state not in TERMINAL_STATES:
+            wf.state = FAILED
+        wf.reason = wf.reason or reason
+        for stage in wf.stages:
+            if stage.state == PENDING:
+                stage.state  = SKIPPED
+                stage.reason = reason
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _mark_canceled(wf: WorkflowInstance) -> None:
+        if wf.state not in TERMINAL_STATES:
+            wf.state  = CANCELED
+            wf.reason = wf.reason or 'campaign canceled'
+        for stage in wf.stages:
+            if stage.state not in TERMINAL_STATES:
+                stage.state  = CANCELED
+                stage.reason = 'campaign canceled'
