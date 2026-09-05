@@ -15,8 +15,8 @@ Three levels:
   network, no DOM library) is handed to `init()`, and the HTML the module
   writes into the page is asserted on: resources table, node-hour bar,
   stage chips labelled with their resource, the two SVG charts, the
-  submit round-trip, the 2 s poll while a campaign runs, graceful
-  degradation when the federation or the campaign service is absent, and
+  submit round-trip, the poll cadence (5 s hidden / 2 s while running),
+  the notification nudge, the results drawer, stale-data retention, and
   the on-screen vocabulary rule (no Orbit internals in visible text).
 
 The fake-Explorer harness lives in this file as `HARNESS_JS` rather than
@@ -25,6 +25,7 @@ the assertions it makes, and it keeps `atomic_wm/ui/` holding exactly the
 one file the broker serves.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -50,9 +51,10 @@ const MODULE = process.argv[2];
 // Freeze the module's polling before it is imported: the module resolves
 // setTimeout off the global object at call time, so a stub installed here
 // captures every scheduled poll instead of keeping node alive.
-const timers = [];
+let timers = [];
 globalThis.setTimeout   = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
 globalThis.clearTimeout = () => {};
+const delays = () => timers.map(t => t[1]);
 
 const fail = [];
 function check(cond, msg) { if (!cond) fail.push(msg); }
@@ -62,16 +64,18 @@ class El {
   constructor(sel) {
     this.sel = sel;
     this.innerHTML = ''; this.textContent = ''; this.className = '';
-    this.value = ''; this.disabled = false; this.listeners = {};
+    this.value = ''; this.title = ''; this.disabled = false;
+    this.listeners = {};
   }
   addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn); }
 }
 
 class Page {
-  constructor() {
+  constructor(active = true) {
     this.els = new Map();
     this.isConnected = true;
-    this.classList = { contains: c => c === 'active' };
+    this.active = active;
+    this.classList = { contains: c => c === 'active' && this.active };
     this.listeners = {};
   }
   querySelector(sel) {
@@ -80,6 +84,15 @@ class Page {
   }
   addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn); }
   html(sel) { return this.querySelector(sel).innerHTML; }
+}
+
+// fire a delegated click carrying the data-ac-action attributes the module
+// reads off the clicked node
+function fireClick(el, attrs) {
+  const node = { getAttribute: k => (k in attrs ? attrs[k] : null),
+                 disabled: false };
+  const ev = { target: { closest: () => node } };
+  for (const fn of (el.listeners.click || [])) fn(ev);
 }
 
 // --- canned backend (the frozen contract's shapes) ------------------------
@@ -103,11 +116,12 @@ const RESOURCES = { resources: [
     liveness: 'suspect' },
 ] };
 
-function wf(id, temp, s1, r1, s2, r2) {
+function wf(id, temp, s1, r1, s2, r2, reason) {
   return { id, params: { temperature: temp },
            stages: [ { name: 'md', state: s1, resource: r1,
                        task_id: 't.' + id + '.md',
-                       exit_code: s1 === 'DONE' ? 0 : null },
+                       exit_code: s1 === 'DONE' ? 0 : null,
+                       reason: reason || null },
                      { name: 'train', state: s2, resource: r2,
                        task_id: 't.' + id + '.train' } ] };
 }
@@ -117,7 +131,19 @@ const DETAIL = {
   created_at: NOW - 95,
   workflows: [ wf('wf.0', 300, 'DONE', 'local_a', 'DONE', 'local_a'),
                wf('wf.1', 600, 'DONE', 'local_b', 'RUNNING', 'local_b'),
-               wf('wf.2', 900, 'RUNNING', 'local_a', 'NEW', null) ],
+               wf('wf.2', 900, 'RUNNING', 'local_a', 'NEW', null),
+               wf('wf.3', 1200, 'STAGING', 'local_b', 'SKIPPED', null) ],
+};
+
+// a second, terminal campaign: exercises INTERRUPTED, the campaign-level
+// `reason`, and the "no data" placeholder on a campaign that will never
+// produce metrics
+const DEAD = {
+  campaign_id: 'camp.000', name: 'vacancy-md-only', state: 'INTERRUPTED',
+  created_at: NOW - 900, finished_at: NOW - 800,
+  reason: 'stopped while the service restarted',
+  workflows: [ wf('wf.x', 300, 'INTERRUPTED', 'local_a', 'SKIPPED', null,
+                  'stage did not finish') ],
 };
 
 function md(temp) {
@@ -142,14 +168,22 @@ function train(temp) {
 
 const RESULTS = { workflows: [
   { id: 'wf.0', params: { temperature: 300 },
-    metrics: { md: md(300), train: train(300) } },
-  { id: 'wf.1', params: { temperature: 600 }, metrics: { md: md(600) } },
+    metrics: { md: md(300), train: train(300) },
+    files  : { md   : [ { name: 'md.json', size: 5120, json: true } ],
+               train: [ { name: 'model.json', size: 2048, json: true },
+                        { name: 'stderr.txt', size: 12, json: false,
+                          error: 'could not be parsed' } ] } },
+  { id: 'wf.1', params: { temperature: 600 }, metrics: { md: md(600) },
+    files: { md: [ { name: 'md.json', size: 5120, json: true } ] } },
   { id: 'wf.2', params: { temperature: 900 }, metrics: {} },
 ] };
 
 const SUMMARY = { campaign_id: 'camp.001', name: 'vacancy-classifier',
                   state: 'RUNNING', created_at: NOW - 95,
-                  workflows: DETAIL.workflows };
+                  n_workflows: 4, workflows: DETAIL.workflows };
+const SUMMARY0 = { campaign_id: 'camp.000', name: 'vacancy-md-only',
+                   state: 'INTERRUPTED', created_at: NOW - 900,
+                   n_workflows: 1 };
 
 const calls = [];
 let submitted = null;
@@ -162,9 +196,12 @@ const api = {
       return { campaign_id: 'camp.002', state: 'RUNNING',
                workflows: [{}, {}, {}] };
     }
-    if (path === 'campaigns/default')         return { campaigns: [SUMMARY] };
+    if (path === 'campaigns/default')
+      return { campaigns: [SUMMARY, SUMMARY0] };
     if (path === 'campaign/default/camp.001') return DETAIL;
+    if (path === 'campaign/default/camp.000') return DEAD;
     if (path === 'results/default/camp.001')  return RESULTS;
+    if (path === 'results/default/camp.000')  return { workflows: [] };
     if (path === 'store/default')
       return { root: '/home/u/.radical/orbit/atomic_store' };
     throw new Error('HTTP 404: no route ' + path);
@@ -194,12 +231,34 @@ for (const id of ['ac-panel-resources', 'ac-panel-submit',
   check(tmpl.includes('id="' + id + '"'), `template() lacks panel id ${id}`);
 }
 
-// --- drive a full refresh --------------------------------------------------
-const page = new Page();
+// the spec editor must not push the campaigns panel off a 720 px screen
+check(/min-height:\s*140px/.test(style), 'spec editor is not short (140px)');
+check(/rows="8"/.test(tmpl), 'spec editor is not 8 rows');
+
+// chart text is sized in viewBox units: ~16 units -> ~10 px on screen once
+// two 660-unit plots share a 1280 px row
+check(/\.ac-tick-text[^}]*font-size:\s*16px/.test(style),
+      'chart tick text is smaller than 16 viewBox units');
+check(m._internals.PLOT_GEOMETRY.PAD.l >= 80,
+      'left padding is too small for 16-unit tick labels');
+
+// --- the page starts hidden: poll idles at 5 s ----------------------------
+const page = new Page(false);
 await m.init(page, api);
+check(calls.length === 0, 'a hidden page must not fetch: ' + calls);
+check(JSON.stringify(delays()) === '[5000]',
+      'a hidden page must re-check in 5000 ms, got ' + JSON.stringify(delays()));
+
+// --- becomes visible: onShow does a full load and drops to 2 s ------------
+timers = [];
+page.active = true;
+await m.onShow(page, api);
+check(delays()[delays().length - 1] === 2000,
+      'poll is not 2000 ms while a campaign RUNs: ' + JSON.stringify(delays()));
 
 for (const p of ['/broker/federation/resources/default', 'campaigns/default',
-                 'campaign/default/camp.001', 'results/default/camp.001']) {
+                 'campaign/default/camp.001', 'results/default/camp.001',
+                 'store/default']) {
   check(calls.includes(p), `route never called: ${p}`);
 }
 
@@ -211,38 +270,74 @@ check(res.includes('ac-dot ok') && res.includes('ac-dot suspect'),
       'status dots missing');
 check(res.includes('serving endpoint: ep_local_a'),
       'endpoint name missing from the tooltip');
+check((res.match(/allocation/g) || []).length === 1,
+      'the join mode is rendered twice (badge + Type column)');
 check(!/NaN|undefined/.test(res), 'resources HTML contains NaN/undefined');
 
 const camp = page.html('.ac-campaigns-body');
 check(camp.includes('vacancy-classifier'), 'campaign name missing');
 check(camp.includes('temperature=300') && camp.includes('temperature=900'),
       'workflow params missing');
-check(camp.includes('st-done') && camp.includes('st-run')
-      && camp.includes('st-wait'), 'stage chip state classes missing');
+for (const cls of ['st-done', 'st-run', 'st-wait', 'st-cancel', 'st-fail']) {
+  check(camp.includes(cls), `stage chip class ${cls} never rendered`);
+}
+check(camp.includes('staging') && camp.includes('skipped')
+      && camp.includes('interrupted'),
+      'STAGING / SKIPPED / INTERRUPTED are not spelled out');
 check((camp.match(/local_a/g) || []).length >= 2,
       'stage chips are not labelled with their resource');
+check(camp.includes('stage did not finish'),
+      'the stage `reason` is not in the chip tooltip');
+check(camp.includes('stopped while the service restarted'),
+      'the campaign-level `reason` is not shown for INTERRUPTED');
 check(camp.includes('<svg'), 'no svg chart rendered');
 check((camp.match(/<polyline/g) || []).length >= 3,
       'expected at least 3 polylines (2 md series + 1 train series)');
 check(camp.includes('Energy vs step') && camp.includes('Accuracy vs epoch'),
       'chart titles missing');
+check(camp.includes('no md data was collected'),
+      'a terminal campaign should say "no data", not "waiting"');
 check(camp.includes('elapsed'), 'campaign elapsed time missing');
 check(!/NaN|undefined|\[object Object\]/.test(camp),
       'campaign HTML contains NaN/undefined');
 
-check(timers.length > 0 && timers[timers.length - 1][1] === 2000,
-      'poll interval is not 2000 ms while a campaign RUNs: '
-      + JSON.stringify(timers));
-
-// on-screen vocabulary: Orbit internals only ever inside attributes
-const visible = (res + camp + tmpl).replace(/<[^>]*>/g, ' ');
-for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher']) {
+// on-screen vocabulary: Orbit internals only ever inside attributes.  (The
+// campaign's own `reason` is server-authored prose and is exempt -- it is
+// stripped here with the elements the module wraps it in.)
+const visible = (res + camp + tmpl).replace(/<div class="ac-reason">[^<]*<\/div>/g, ' ')
+                                   .replace(/<[^>]*>/g, ' ');
+for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher', 'namespace']) {
   check(!new RegExp(w, 'i').test(visible),
         `forbidden word "${w}" in visible text`);
 }
 
+// --- a notification nudges exactly one extra refresh ----------------------
+timers = [];
+m.onNotification({endpoint: 'broker', plugin: 'atomic_campaign',
+                  topic: 'stage', data: {}}, page, api);
+m.onNotification({endpoint: 'broker', plugin: 'atomic_campaign',
+                  topic: 'stage', data: {}}, page, api);
+check(JSON.stringify(delays()) === '[250]',
+      'a burst of notifications must coalesce into one 250 ms nudge, got '
+      + JSON.stringify(delays()));
+
+// --- results drawer -------------------------------------------------------
+const body = page.querySelector('.ac-campaigns-body');
+fireClick(body, {'data-ac-action': 'toggle-results', 'data-cid': 'camp.001'});
+const drawer = page.html('.ac-campaigns-body');
+check(drawer.includes('/home/u/.radical/orbit/atomic_store/camp.001/wf.0/md/'),
+      'the store path is not rendered in the results drawer');
+check(drawer.includes('md.json') && drawer.includes('model.json'),
+      'collected file names are not rendered');
+check(drawer.includes('kB'), 'collected file sizes are not rendered');
+check(drawer.includes('could not be parsed'),
+      'a per-file error is not surfaced');
+check(drawer.includes('mean_energy'), 'summary scalars are not rendered');
+fireClick(body, {'data-ac-action': 'toggle-results', 'data-cid': 'camp.001'});
+check(!page.html('.ac-campaigns-body').includes('mean_energy'),
+      'the results drawer does not close again');
+
 // --- submit round-trip -----------------------------------------------------
-await m.init(page, api);          // reloads the example spec into the textarea
 const spec = page.querySelector('.ac-spec').value;
 check(JSON.parse(spec).name === 'vacancy-classifier',
       'bundled example spec not loaded into the textarea');
@@ -261,6 +356,23 @@ await btn.listeners.click[0]();
 check(submitted === null, 'invalid JSON was submitted anyway');
 check(/not valid JSON/.test(page.querySelector('.ac-submit-status').textContent),
       'no JSON error shown to the user');
+
+// a rejected submit shows a fixed phrase; the server's words go in a tooltip
+const page9 = new Page();
+const api9  = { ...api,
+                fetch: async (p, o = {}) => {
+                  if (o.method === 'POST') {
+                    throw new Error('HTTP 503: dispatcher plugin not hosted');
+                  }
+                  return api.fetch(p, o);
+                } };
+await m.init(page9, api9);
+await page9.querySelector('[data-action="ac-submit"]').listeners.click[0]();
+const status = page9.querySelector('.ac-submit-status');
+check(!/dispatcher/i.test(status.textContent),
+      'a raw server error leaked into visible text: ' + status.textContent);
+check(/dispatcher/i.test(status.title),
+      'the server error is not preserved in the tooltip');
 
 // --- degrade gracefully ----------------------------------------------------
 const page2 = new Page();
@@ -282,19 +394,53 @@ check(page3.html('.ac-resources-body').includes('No resources joined'),
 check(page3.html('.ac-campaigns-body').includes('unavailable'),
       'campaign service error note missing');
 
+// --- a failed poll keeps the last good data --------------------------------
+const page4 = new Page();
+let broken = false;
+const api4 = {
+  ...api,
+  fetch   : async (p, o) => { if (broken) throw new Error('HTTP 500: dispatcher exploded'); return api.fetch(p, o); },
+  fetchRaw: async (p)    => { if (broken) throw new Error('HTTP 500: dispatcher exploded'); return api.fetchRaw(p); },
+};
+await m.init(page4, api4);
+check(page4.html('.ac-resources-body').includes('local_a'), 'first load failed');
+broken = true;
+await m.onShow(page4, api4);
+const r4 = page4.html('.ac-resources-body');
+const c4 = page4.html('.ac-campaigns-body');
+check(r4.includes('local_a'), 'a failed poll blanked the resources table');
+check(c4.includes('vacancy-classifier'), 'a failed poll blanked the campaigns');
+check(r4.includes('last known resources') && c4.includes('last known campaigns'),
+      'a failed poll shows no stale-data warning');
+check(!/dispatcher/i.test((r4 + c4).replace(/<[^>]*>/g, ' ')),
+      'the raw poll error leaked into visible text');
+
 // --- pure helpers ----------------------------------------------------------
 const I = m._internals;
 check(JSON.stringify(I.parseSweepValues('300, 600,900')) === '[300,600,900]',
       'parseSweepValues does not parse numbers');
 check(JSON.stringify(I.parseSweepValues('a, b ,')) === '["a","b"]',
       'parseSweepValues does not keep strings / drop blanks');
-check(I.stateClass('DONE') === 'st-done'
-      && I.stateClass('zzz') === 'st-unknown', 'stateClass');
+check(I.stateClass('STAGING') === 'st-run'
+      && I.stateClass('SKIPPED') === 'st-cancel'
+      && I.stateClass('INTERRUPTED') === 'st-fail'
+      && I.stateClass('DONE') === 'st-done'
+      && I.stateClass('zzz') === 'st-unknown', 'stateClass mapping');
+check(I.stateWord('STAGING') === 'staging'
+      && I.stateWord('SKIPPED') === 'skipped'
+      && I.stateWord('INTERRUPTED') === 'interrupted', 'stateWord mapping');
+check(I.stateBadge('INTERRUPTED') === 'badge-red', 'stateBadge(INTERRUPTED)');
+check(I.paramsLabel({a: [1, 2]}) === 'a=[1,2]',
+      'a non-scalar param is not JSON-stringified: ' + I.paramsLabel({a: [1, 2]}));
 check(I.niceTicks(0, 100, 5).length >= 4, 'niceTicks');
 check(I.downsample(Array.from({length: 5000}, (_, i) => [i, i]), 400).length
       <= 402, 'downsample');
-check(I.renderPlot({stage: 'md', title: 't', xlabel: 'x', ylabel: 'y'}, [])
+check(I.renderPlot({stage: 'md', title: 't', xlabel: 'x', ylabel: 'y'}, [], false)
        .includes('waiting for'), 'empty plot has no placeholder');
+check(I.renderPlot({stage: 'md', title: 't', xlabel: 'x', ylabel: 'y'}, [], true)
+       .includes('no md data'), 'terminal empty plot still says "waiting"');
+check(I.renderFiles([{name: 'a.json', size: 2048, json: true}])
+       .includes('2 kB'), 'renderFiles size');
 check(I.EXAMPLES.length >= 1
       && I.EXAMPLES[0].spec.name === 'vacancy-classifier',
       'bundled examples missing');
@@ -306,6 +452,23 @@ if (fail.length) {
 }
 console.log('OK (' + calls.length + ' api calls)');
 """
+
+
+# dumps the module's first bundled example spec as JSON on stdout
+DUMP_SPEC_JS = r"""
+const m = await import(process.argv[2]);
+process.stdout.write(JSON.stringify(m._internals.EXAMPLES[0].spec));
+"""
+
+
+# ---------------------------------------------------------------------------
+def _run_node(script, tmp_path, name):
+
+    path = tmp_path / name
+    path.write_text(script, encoding='utf-8')
+
+    return subprocess.run([NODE, str(path), ui_module_path()],
+                          capture_output=True, text=True, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -324,34 +487,6 @@ def test_ui_module_is_present():
 
 
 # ---------------------------------------------------------------------------
-def test_ui_module_matches_the_bundled_example_spec():
-
-    # the dropdown's `vacancy-classifier` entry and examples/
-    # workflow_vacancy.json are the same spec written twice (the module
-    # cannot read a file at load time); keep them in step
-    import json
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ex   = os.path.join(root, 'examples', 'workflow_vacancy.json')
-
-    if not os.path.exists(ex):
-        pytest.skip('examples/workflow_vacancy.json not present')
-
-    with open(ex, encoding='utf-8') as fin:
-        want = json.load(fin)
-
-    src = open(ui_module_path(), encoding='utf-8').read()
-
-    # a cheap structural comparison: every stage name, every command token
-    # and the workflow name must appear in the module source
-    assert "name  : '%s'" % want['name'] in src
-    for stage in want['stages']:
-        assert "name: '%s'" % stage['name'] in src
-        for token in stage['cmd']:
-            assert "'%s'" % token in src
-
-
-# ---------------------------------------------------------------------------
 @needs_node
 def test_ui_module_parses():
 
@@ -363,13 +498,30 @@ def test_ui_module_parses():
 
 # ---------------------------------------------------------------------------
 @needs_node
+def test_bundled_example_equals_the_shipped_spec(tmp_path):
+
+    # the dropdown's `vacancy-classifier` entry and examples/
+    # workflow_vacancy.json are the same spec written twice (the module
+    # cannot read a file at load time) -- they must stay byte-equivalent
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ref  = os.path.join(root, 'examples', 'workflow_vacancy.json')
+
+    if not os.path.exists(ref):
+        pytest.skip('examples/workflow_vacancy.json not present')
+
+    out = _run_node(DUMP_SPEC_JS, tmp_path, 'dump.mjs')
+
+    assert out.returncode == 0, out.stderr
+
+    with open(ref, encoding='utf-8') as fin:
+        assert json.loads(out.stdout) == json.load(fin)
+
+
+# ---------------------------------------------------------------------------
+@needs_node
 def test_ui_module_drives_a_fake_explorer(tmp_path):
 
-    harness = tmp_path / 'harness.mjs'
-    harness.write_text(HARNESS_JS, encoding='utf-8')
-
-    out = subprocess.run([NODE, str(harness), ui_module_path()],
-                         capture_output=True, text=True, timeout=60)
+    out = _run_node(HARNESS_JS, tmp_path, 'harness.mjs')
 
     assert out.returncode == 0, (out.stdout + '\n' + out.stderr)
     assert 'OK' in out.stdout

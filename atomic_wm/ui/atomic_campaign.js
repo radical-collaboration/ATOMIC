@@ -166,11 +166,29 @@ function shortId(id) {
   return s.length > 14 ? s.slice(0, 12) + '…' : s;
 }
 
+// A sweep value is normally a scalar, but the planner takes a cartesian
+// product of whatever the spec declares -- a list or an object must still
+// print as something, not as "[object Object]".
+function scalar(v) {
+  if (v === null || v === undefined) return '–';
+  const t = typeof v;
+  if (t === 'string' || t === 'number' || t === 'boolean') return String(v);
+  try { return JSON.stringify(v); } catch (e) { return String(v); }
+}
+
 function paramsLabel(params) {
   if (!params || typeof params !== 'object') return '';
   const keys = Object.keys(params);
   if (!keys.length) return '';
-  return keys.map(k => k + '=' + params[k]).join(' · ');
+  return keys.map(k => k + '=' + scalar(params[k])).join(' · ');
+}
+
+function fmtBytes(n) {
+  const b = Number(n);
+  if (!Number.isFinite(b) || b < 0) return '';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return fmtNum(b / 1024, 1) + ' kB';
+  return fmtNum(b / (1024 * 1024), 1) + ' MB';
 }
 
 // ---------------------------------------------------------------------------
@@ -184,10 +202,13 @@ function stateOf(page) {
   if (!st) {
     st = {timer      : null,
           busy       : false,
+          pending    : false,    // a refresh was asked for while busy
           resources  : [],
-          fedError   : null,
+          fedError   : null,     // last poll failed (stale data may show)
+          fedEver    : false,    // the federation ever answered
           campaigns  : [],       // [{summary, detail, results}]
           campError  : null,
+          campEver   : false,
           storeRoot  : null,
           openResults: {},       // cid -> bool
           lastRender : 0};
@@ -246,9 +267,10 @@ export function template() {
           <div class="ac-submit-status"></div>
         </div>
         <div class="form-group ac-spec-group">
-          <label for="ac-spec">Workflow specification (editable)</label>
+          <label for="ac-spec">Workflow specification (editable — drag the
+            corner to enlarge)</label>
           <textarea id="ac-spec" class="ac-spec" spellcheck="false"
-                    rows="18"></textarea>
+                    rows="8"></textarea>
         </div>
       </div>
     </div>
@@ -298,6 +320,22 @@ export function css() {
       padding: 10px 2px;
     }
     .ac-note.ac-bad { color: var(--danger); }
+    /* a poll failed but the panel still shows the last good data */
+    .ac-stale {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 3px 10px;
+      border-radius: 10px;
+      font-size: .76rem;
+      background: rgba(255, 179, 71, .12);
+      color: var(--warn);
+      border: 1px solid rgba(255, 179, 71, .3);
+    }
+    .ac-reason {
+      margin: 2px 0 10px;
+      font-size: .82rem;
+      color: #fb7185;
+    }
 
     /* ---- resources table ---- */
     .ac-table { width: 100%; border-collapse: collapse; }
@@ -317,17 +355,6 @@ export function css() {
       font-size: .82rem;
     }
     .ac-res-name { font-weight: 600; color: var(--text); }
-    .ac-res-mode {
-      display: inline-block;
-      margin-left: 6px;
-      padding: 1px 7px;
-      border-radius: 10px;
-      font-size: .68rem;
-      font-weight: 600;
-      background: var(--bg3);
-      color: var(--muted);
-      border: 1px solid var(--border);
-    }
     .ac-soft {
       display: inline-block;
       margin: 1px 4px 1px 0;
@@ -375,8 +402,12 @@ export function css() {
       align-items: start;
     }
     .ac-spec-group { margin-bottom: 0; }
+    /* deliberately short: the campaigns panel must stay above the fold at
+       1280x720 -- the editor is resizable for when a demo needs it big */
     .ac-spec {
-      min-height: 300px;
+      min-height: 140px;
+      max-height: 60vh;
+      resize: vertical;
       font-size: .78rem !important;
       line-height: 1.45;
       white-space: pre;
@@ -508,11 +539,14 @@ export function css() {
       padding: 26px 0;
       text-align: center;
     }
-    .ac-axis      { stroke: var(--border); stroke-width: 1; }
-    .ac-grid      { stroke: rgba(100,116,139,.22); stroke-width: 1; }
-    .ac-tick-text { fill: var(--muted); font-size: 11px;
+    /* Font sizes are in viewBox units: two plots side by side at 1280x720
+       render the 660-unit viewBox at roughly 410 px, so 16 units lands at
+       about 10 px on screen -- the floor for a screen share. */
+    .ac-axis      { stroke: var(--border); stroke-width: 1.4; }
+    .ac-grid      { stroke: rgba(100,116,139,.22); stroke-width: 1.2; }
+    .ac-tick-text { fill: var(--muted); font-size: 16px;
                     font-family: 'JetBrains Mono', monospace; }
-    .ac-axis-text { fill: var(--muted); font-size: 11px; font-weight: 600;
+    .ac-axis-text { fill: #94a3b8; font-size: 17px; font-weight: 600;
                     font-family: 'Inter', sans-serif; }
 
     /* ---- results drawer ---- */
@@ -608,7 +642,9 @@ function schedule(page, api, delay) {
 
 async function refresh(page, api) {
   const st = stateOf(page);
-  if (st.busy) return;
+  // a refresh asked for mid-poll (a submit, a notification) is not dropped:
+  // it is replayed once the in-flight one lands
+  if (st.busy) { st.pending = true; return; }
 
   // The Explorer keeps hidden pages in the DOM; do not poll what nobody sees,
   // but keep the timer alive so the page is current the moment it is shown.
@@ -631,6 +667,11 @@ async function refresh(page, api) {
   }
 
   schedule(page, api, anyRunning(st) ? POLL_BUSY_MS : POLL_IDLE_MS);
+
+  if (st.pending) {
+    st.pending = false;
+    await refresh(page, api);
+  }
 }
 
 function anyRunning(st) {
@@ -647,9 +688,11 @@ async function loadResources(page, api) {
                                  {quiet: true});
     st.resources = isArr(r && r.resources) ? r.resources : [];
     st.fedError  = null;
+    st.fedEver   = true;
   } catch (e) {
-    st.resources = [];
-    st.fedError  = shortError(e);
+    // keep the last good resource list: one failed poll on a demo network
+    // must not blank the table mid-sentence
+    st.fedError = shortError(e);
   }
 }
 
@@ -662,8 +705,9 @@ async function loadCampaigns(page, api) {
          : isArr(r && r.campaigns) ? r.campaigns
          : [];
     st.campError = null;
+    st.campEver  = true;
   } catch (e) {
-    st.campaigns = [];
+    // as above: hold the last good campaign list
     st.campError = shortError(e);
     return;
   }
@@ -747,7 +791,7 @@ function render(page) {
   if (sum) {
     const nres = st.resources.length;
     const ncmp = st.campaigns.length;
-    sum.textContent = st.fedError
+    sum.textContent = (st.fedError && !nres)
       ? 'no federation'
       : `${nres} resource${nres === 1 ? '' : 's'} · `
       + `${ncmp} campaign${ncmp === 1 ? '' : 's'}`;
@@ -761,11 +805,14 @@ function renderResources(page, st) {
   const count = page.querySelector('.ac-res-count');
   if (!body) return;
 
-  if (st.fedError) {
-    body.innerHTML = `<div class="ac-note">No federation available — `
-                   + `no resources have been joined yet.`
-                   + `<div class="ac-path" style="margin-top:6px">`
-                   + `${esc(st.fedError)}</div></div>`;
+  // Raw server text can name Orbit internals ("dispatcher", "Namespace not
+  // found for ..."); it lives in a tooltip, never in visible text.
+  if (st.fedError && !st.resources.length) {
+    const msg = st.fedEver ? 'Resources unavailable.'
+                           : 'No federation available — no resources have '
+                           + 'been joined yet.';
+    body.innerHTML = `<div class="ac-note" title="${esc(st.fedError)}">`
+                   + `${esc(msg)}</div>`;
     if (count) count.textContent = '';
     return;
   }
@@ -776,6 +823,10 @@ function renderResources(page, st) {
     return;
   }
 
+  const stale = st.fedError
+    ? `<div class="ac-stale" title="${esc(st.fedError)}">`
+    + `⚠ showing the last known resources — refresh failed</div>` : '';
+
   if (count) {
     const nh = st.resources.reduce(
       (a, r) => a + num(r && r.usage && r.usage.node_hours_used, 0), 0);
@@ -783,7 +834,7 @@ function renderResources(page, st) {
   }
 
   const rows = st.resources.map(renderResourceRow).join('');
-  body.innerHTML = `
+  body.innerHTML = `${stale}
     <div style="overflow-x:auto">
       <table class="ac-table">
         <thead><tr>
@@ -835,8 +886,7 @@ function renderResourceRow(r) {
   const tip = r.endpoint ? `serving endpoint: ${r.endpoint}` : '';
 
   return `<tr>
-    <td><span class="ac-res-name" title="${esc(tip)}">${esc(r.name)}</span>
-        ${r.mode ? `<span class="ac-res-mode">${esc(r.mode)}</span>` : ''}</td>
+    <td><span class="ac-res-name" title="${esc(tip)}">${esc(r.name)}</span></td>
     <td>${esc(r.site || '–')}</td>
     <td>${esc(kind)}</td>
     <td class="ac-mono">${esc(caps.cores !== undefined ? caps.cores : '–')}</td>
@@ -874,11 +924,14 @@ function parseSweepValues(text) {
     });
 }
 
-function setSubmitStatus(page, msg, kind) {
+// `tip` carries the server's own wording, which may name Orbit internals --
+// it belongs in a tooltip, never in the visible line.
+function setSubmitStatus(page, msg, kind, tip) {
   const el = page.querySelector('.ac-submit-status');
   if (!el) return;
   el.className = 'ac-submit-status' + (kind ? ' ' + kind : '');
   el.textContent = msg;
+  el.title = tip || '';
 }
 
 async function submitCampaign(page, api) {
@@ -931,7 +984,8 @@ async function submitCampaign(page, api) {
     if (api.flash) api.flash('Campaign submitted');
     await refresh(page, api);
   } catch (e) {
-    setSubmitStatus(page, 'Submit failed: ' + shortError(e), 'ac-bad');
+    setSubmitStatus(page, 'Submit failed — the campaign service rejected '
+                        + 'the request.', 'ac-bad', shortError(e));
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -953,7 +1007,11 @@ function onCampaignClick(ev, page, api) {
     t.disabled = true;
     api.fetch(`cancel/${SID}/${cid}`, {method: 'POST'})
        .then(() => refresh(page, api))
-       .catch(e => { if (api.flash) api.flash(shortError(e), false); });
+       .catch(() => {
+         // again: a fixed phrase, not the server's own words
+         if (api.flash) api.flash('Could not stop the campaign', false);
+         t.disabled = false;
+       });
   }
 }
 
@@ -962,9 +1020,11 @@ function renderCampaigns(page, st) {
   const count = page.querySelector('.ac-camp-count');
   if (!body) return;
 
-  if (st.campError) {
-    body.innerHTML = `<div class="ac-note ac-bad">Campaign service `
-                   + `unavailable: ${esc(st.campError)}</div>`;
+  // as in the resources panel: the server's own words stay in a tooltip
+  if (st.campError && !st.campaigns.length) {
+    body.innerHTML = `<div class="ac-note ac-bad" `
+                   + `title="${esc(st.campError)}">Campaign service `
+                   + `unavailable.</div>`;
     if (count) count.textContent = '';
     return;
   }
@@ -980,7 +1040,12 @@ function renderCampaigns(page, st) {
     count.textContent = running ? `· ${running} running` : '';
   }
 
-  body.innerHTML = st.campaigns.map(c => renderCampaign(c, st)).join('');
+  const stale = st.campError
+    ? `<div class="ac-stale" title="${esc(st.campError)}">`
+    + `⚠ showing the last known campaigns — refresh failed</div>` : '';
+
+  body.innerHTML = stale
+                 + st.campaigns.map(c => renderCampaign(c, st)).join('');
 }
 
 function renderCampaign(item, st) {
@@ -1008,26 +1073,43 @@ function renderCampaign(item, st) {
     ? wfs.map((w, i) => renderWorkflowRow(w, colours[i])).join('')
     : '<div class="ac-note">No workflows in this campaign.</div>';
 
-  const plots   = renderPlots(item, colours);
+  const plots   = renderPlots(item, colours, isTerminal(state));
   const results = renderResults(item, st, cid);
 
   const cancel = (state === 'RUNNING')
     ? `<button class="btn btn-secondary btn-sm" data-ac-action="cancel"
                data-cid="${esc(cid)}">⊘ Stop</button>` : '';
 
+  // the detail fetch may have failed while the summary is still good
+  const nwf = wfs.length
+           || num(firstOf(item.summary, ['n_workflows', 'workflow_count']), 0);
+
+  // `reason` is the campaign's own explanation (P4's Campaign.reason) --
+  // written by the campaign plugin for a human, so it may be shown
+  const reason = (state === 'FAILED' || state === 'INTERRUPTED'
+                  || state === 'CANCELED')
+    ? firstOf(item.detail, ['reason']) || firstOf(item.summary, ['reason'])
+    : null;
+
   return `<div class="ac-camp">
     <div class="ac-camp-head">
       <span class="ac-camp-name">${esc(name)}</span>
-      <span class="badge ${stateBadge(state)}">${esc(state)}</span>
+      <span class="badge ${stateBadge(state)}">${esc(stateLabel(state))}</span>
       <span class="ac-camp-id" title="${esc(cid)}">${esc(shortId(cid))}</span>
       ${elapsed ? `<span class="ac-camp-elapsed">${esc(elapsed)} elapsed
-        · ${wfs.length} workflow${wfs.length === 1 ? '' : 's'}</span>` : ''}
+        · ${nwf} workflow${nwf === 1 ? '' : 's'}</span>` : ''}
       <span class="ac-camp-actions">${cancel}</span>
     </div>
+    ${reason ? `<div class="ac-reason">${esc(reason)}</div>` : ''}
     ${rows}
     ${plots}
     ${results}
   </div>`;
+}
+
+function isTerminal(state) {
+  const c = stateClass(state);
+  return c === 'st-done' || c === 'st-fail' || c === 'st-cancel';
 }
 
 function workflowName(wfs) {
@@ -1053,9 +1135,22 @@ function renderWorkflowRow(w, colour) {
     if (s && s.exit_code !== undefined && s.exit_code !== null) {
       bits.push('exit ' + s.exit_code);
     }
-    if (s && s.error) bits.push(String(s.error));
-    const sub = res ? esc(res)
-                    : `<span style="opacity:.6">${esc(stateWord(state))}</span>`;
+    // P4 names the human-readable failure explanation `reason` (StageRun,
+    // WorkflowInstance and Campaign all carry it); `error` is tolerated
+    const why = firstOf(s, ['reason', 'error']);
+    if (why) bits.push(String(why));
+    // The chip's job in the demo is to name the resource the stage ran on;
+    // but a failed / skipped / staging chip must still say so in words, not
+    // only in colour.
+    const word = stateWord(state);
+    const dim  = t => `<span style="opacity:.7">${esc(t)}</span>`;
+    let sub;
+    if (!res)                                        sub = dim(word);
+    else if (cls === 'st-fail' || cls === 'st-cancel'
+             || state === 'STAGING')                 sub = esc(res) + ' · '
+                                                         + dim(word);
+    else if (cls === 'st-wait')                      sub = dim(word);
+    else                                             sub = esc(res);
     return (i ? '<span class="ac-arrow">▸</span>' : '')
          + `<span class="ac-chip ${cls}" title="${esc(bits.join(' · '))}">`
          + `${esc((s && s.name) || 'stage')}<small>${sub}</small></span>`;
@@ -1070,25 +1165,43 @@ function renderWorkflowRow(w, colour) {
   </div>`;
 }
 
+// The states P4's state.py declares for a stage / workflow / campaign,
+// mapped onto chip styling.  Anything unknown renders grey rather than
+// breaking, so a new state added later degrades quietly.
+const STATE_STYLE = {
+  NEW        : 'st-wait',   PENDING  : 'st-wait',   QUEUED   : 'st-wait',
+  SUBMITTED  : 'st-wait',   WAITING  : 'st-wait',
+  STAGING    : 'st-run',    RUNNING  : 'st-run',    ACTIVE   : 'st-run',
+  EXECUTING  : 'st-run',
+  DONE       : 'st-done',   COMPLETED: 'st-done',   SUCCESS  : 'st-done',
+  FAILED     : 'st-fail',   ERROR    : 'st-fail',   INTERRUPTED: 'st-fail',
+  CANCELED   : 'st-cancel', CANCELLED: 'st-cancel', SKIPPED  : 'st-cancel'
+};
+
+// what a state is called on screen (never the raw enum for the odd ones)
+const STATE_WORD = {
+  STAGING    : 'staging',    RUNNING : 'running',   ACTIVE   : 'running',
+  EXECUTING  : 'running',    NEW     : 'queued',    PENDING  : 'queued',
+  QUEUED     : 'queued',     SUBMITTED: 'queued',   WAITING  : 'queued',
+  DONE       : 'done',       COMPLETED: 'done',     SUCCESS  : 'done',
+  FAILED     : 'failed',     ERROR   : 'failed',
+  INTERRUPTED: 'interrupted',
+  CANCELED   : 'stopped',    CANCELLED: 'stopped',  SKIPPED  : 'skipped'
+};
+
 function stateClass(state) {
-  const s = String(state || '').toUpperCase();
-  if (s === 'DONE' || s === 'COMPLETED' || s === 'SUCCESS')     return 'st-done';
-  if (s === 'FAILED' || s === 'ERROR')                          return 'st-fail';
-  if (s === 'CANCELED' || s === 'CANCELLED')                    return 'st-cancel';
-  if (s === 'RUNNING' || s === 'ACTIVE' || s === 'EXECUTING')   return 'st-run';
-  if (s === 'NEW' || s === 'PENDING' || s === 'QUEUED'
-      || s === 'SUBMITTED' || s === 'WAITING')                  return 'st-wait';
-  return 'st-unknown';
+  return STATE_STYLE[String(state || '').toUpperCase()] || 'st-unknown';
 }
 
 function stateWord(state) {
-  const c = stateClass(state);
-  return c === 'st-run'    ? 'running'
-       : c === 'st-wait'   ? 'queued'
-       : c === 'st-done'   ? 'done'
-       : c === 'st-fail'   ? 'failed'
-       : c === 'st-cancel' ? 'stopped'
-       : '–';
+  const s = String(state || '').toUpperCase();
+  return STATE_WORD[s] || (s ? s.toLowerCase() : '–');
+}
+
+// the badge on a campaign header: the state spelled the way the page does
+function stateLabel(state) {
+  const s = String(state || '').toUpperCase();
+  return (STATE_WORD[s] || s || 'unknown').toUpperCase();
 }
 
 function stateBadge(state) {
@@ -1120,7 +1233,7 @@ const CHARTS = [
    xlabel: 'epoch', ylabel: 'accuracy'}
 ];
 
-function renderPlots(item, colours) {
+function renderPlots(item, colours, terminal) {
   const res = item.results;
   const wfs = isArr(res && res.workflows) ? res.workflows : [];
   const declared = workflowsOf(item);
@@ -1156,7 +1269,7 @@ function renderPlots(item, colours) {
         points: pts
       });
     });
-    return renderPlot(cfg, series);
+    return renderPlot(cfg, series, terminal);
   }).filter(Boolean);
 
   if (!panels.length) return '';
@@ -1194,7 +1307,7 @@ function varyingKeys(wfs) {
 function legendLabel(w, keys, i) {
   const p = (w && w.params) || {};
   const parts = keys.filter(k => p[k] !== undefined)
-                    .map(k => `${k}=${p[k]}`);
+                    .map(k => `${k}=${scalar(p[k])}`);
   if (parts.length) return parts.join(' · ');
   const id = firstOf(w, ['id', 'wf_id']);
   return id ? shortId(id) : `workflow ${i + 1}`;
@@ -1202,15 +1315,23 @@ function legendLabel(w, keys, i) {
 
 // --- the SVG line chart ----------------------------------------------------
 
-const PW = 660, PH = 300;
-const PAD = {l: 66, r: 16, t: 14, b: 42};
+// Geometry is in viewBox units.  Two plots side by side at 1280x720 render
+// this 660-unit box at roughly 410 px (scale ~0.62), so the 16-unit tick
+// text lands near 10 px on screen; the padding is sized for that text, not
+// for the 11 px it used to be.
+const PW = 660, PH = 320;
+const PAD = {l: 88, r: 18, t: 16, b: 56};
 
-function renderPlot(cfg, series) {
+function renderPlot(cfg, series, terminal) {
   if (!series.length) {
+    // a campaign that will never produce this metric should say so, rather
+    // than leave a "waiting…" that waits forever
+    const msg = terminal
+      ? `no ${cfg.stage} data was collected`
+      : `waiting for the first ${cfg.stage} stage to finish…`;
     return `<div class="ac-plot">
       <div class="ac-plot-title">${esc(cfg.title)}</div>
-      <div class="ac-plot-empty">waiting for the first
-        ${esc(cfg.stage)} stage to finish…</div>
+      <div class="ac-plot-empty">${esc(msg)}</div>
     </div>`;
   }
 
@@ -1242,7 +1363,7 @@ function renderPlot(cfg, series) {
     const y = sy(t).toFixed(1);
     g += `<line class="ac-grid" x1="${PAD.l}" y1="${y}"
                 x2="${PAD.l + iw}" y2="${y}"/>`
-       + `<text class="ac-tick-text" x="${PAD.l - 8}" y="${y}"`
+       + `<text class="ac-tick-text" x="${PAD.l - 10}" y="${y}"`
        + ` text-anchor="end" dominant-baseline="middle">`
        + `${esc(fmtNum(t, 3))}</text>`;
   }
@@ -1250,7 +1371,7 @@ function renderPlot(cfg, series) {
     const x = sx(t).toFixed(1);
     g += `<line class="ac-grid" x1="${x}" y1="${PAD.t}"
                 x2="${x}" y2="${PAD.t + ih}"/>`
-       + `<text class="ac-tick-text" x="${x}" y="${PAD.t + ih + 16}"`
+       + `<text class="ac-tick-text" x="${x}" y="${PAD.t + ih + 22}"`
        + ` text-anchor="middle">${esc(fmtNum(t, 3))}</text>`;
   }
 
@@ -1265,20 +1386,20 @@ function renderPlot(cfg, series) {
                    .join(' ');
     const dots = pts.length <= 24
       ? pts.map(p => `<circle cx="${sx(p[0]).toFixed(1)}"
-                              cy="${sy(p[1]).toFixed(1)}" r="2.6"
+                              cy="${sy(p[1]).toFixed(1)}" r="3.4"
                               fill="${s.colour}"/>`).join('')
       : '';
-    return `<polyline fill="none" stroke="${s.colour}" stroke-width="2"
+    return `<polyline fill="none" stroke="${s.colour}" stroke-width="2.6"
                       stroke-linejoin="round" stroke-linecap="round"
                       points="${d}"/>${dots}`;
   }).join('');
 
   const ymid   = PAD.t + ih / 2;
   const labels = `<text class="ac-axis-text" x="${PAD.l + iw / 2}"`
-               + ` y="${PH - 6}" text-anchor="middle">`
+               + ` y="${PH - 8}" text-anchor="middle">`
                + `${esc(cfg.xlabel)}</text>`
-               + `<text class="ac-axis-text" x="14" y="${ymid}"`
-               + ` text-anchor="middle" transform="rotate(-90 14 ${ymid})">`
+               + `<text class="ac-axis-text" x="18" y="${ymid}"`
+               + ` text-anchor="middle" transform="rotate(-90 18 ${ymid})">`
                + `${esc(cfg.ylabel)}</text>`;
 
   const legend = series.map(s =>
@@ -1338,9 +1459,14 @@ function renderResults(item, st, cid) {
   const root = st.storeRoot;
   const rows = [];
   for (const w of wfs) {
-    const wid = String(firstOf(w, ['id', 'wf_id']) || '');
-    const m   = (w && w.metrics) || {};
-    for (const stage of Object.keys(m)) {
+    const wid   = String(firstOf(w, ['id', 'wf_id']) || '');
+    const m     = (w && w.metrics) || {};
+    const files = (w && w.files)   || {};   // P4's store.py: {stage: [file]}
+    // a stage may have collected files but no parsable metrics (or the
+    // other way round) -- list the union, so nothing silently vanishes
+    const stages = Array.from(new Set(Object.keys(m)
+                                      .concat(Object.keys(files))));
+    for (const stage of stages) {
       const doc  = m[stage] || {};
       const sums = (doc && doc.summary) || {};
       const txt  = Object.keys(sums).slice(0, 4)
@@ -1349,6 +1475,7 @@ function renderResults(item, st, cid) {
       rows.push(`<tr>
         <td>${esc(paramsLabel(w.params) || shortId(wid))}</td>
         <td>${esc(stage)}</td>
+        <td>${renderFiles(files[stage])}</td>
         <td>${esc(txt || '–')}</td>
         <td class="ac-path">${esc(path)}</td>
       </tr>`);
@@ -1357,7 +1484,8 @@ function renderResults(item, st, cid) {
 
   const body = rows.length
     ? `<table class="ac-table"><thead><tr>
-         <th>Workflow</th><th>Stage</th><th>Summary</th><th>Stored at</th>
+         <th>Workflow</th><th>Stage</th><th>Files</th>
+         <th>Summary</th><th>Stored at</th>
        </tr></thead><tbody>${rows.join('')}</tbody></table>`
     : '<div class="ac-note">Nothing collected yet.</div>';
 
@@ -1365,12 +1493,36 @@ function renderResults(item, st, cid) {
             <div class="ac-results-body">${body}</div></div>`;
 }
 
+// One stage's collected files: P4's store.py records each as
+// {name, size, json, error?} -- `json` says the file was parsed into the
+// metrics above, `error` says why collection or parsing did not work.
+function renderFiles(files) {
+  if (!isArr(files) || !files.length) {
+    return '<span style="color:var(--muted)">–</span>';
+  }
+  return files.map(f => {
+    f = f || {};
+    const size = fmtBytes(f.size);
+    const bits = [];
+    if (size) bits.push(size);
+    if (f.json) bits.push('plotted');
+    const tail = bits.length ? ` <span style="color:var(--muted)">(`
+                             + esc(bits.join(', ')) + ')</span>' : '';
+    const bad  = f.error
+      ? ` <span style="color:#fb7185" title="${esc(f.error)}">⚠</span>` : '';
+    return `<div class="ac-path" style="color:var(--text)">`
+         + `${esc(f.name || '?')}${tail}${bad}</div>`;
+  }).join('');
+}
+
 // ---------------------------------------------------------------------------
 // exported for tests (pure helpers, no DOM)
 // ---------------------------------------------------------------------------
 
 export const _internals = {
-  EXAMPLES, esc, fmtNum, fmtDuration, toEpoch, parseSweepValues,
-  stateClass, stateBadge, stateWord, varyingKeys, legendLabel,
-  niceTicks, downsample, renderPlot, renderResourceRow, pickMetrics
+  EXAMPLES, esc, scalar, fmtNum, fmtBytes, fmtDuration, toEpoch,
+  parseSweepValues, stateClass, stateBadge, stateWord, stateLabel,
+  varyingKeys, legendLabel, paramsLabel, niceTicks, downsample,
+  renderPlot, renderFiles, renderResourceRow, pickMetrics,
+  PLOT_GEOMETRY: {PW, PH, PAD}
 };
