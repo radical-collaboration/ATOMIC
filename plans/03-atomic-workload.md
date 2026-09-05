@@ -27,7 +27,11 @@ demo/local/               # (06)
 
 ## Workloads (contract in 00-overview §"Fake workload")
 
-- Deterministic under `--seed`; wall time controlled by `--duration-sec`
+- Deterministic **by default**: seed = stable hash (e.g. `zlib.crc32`) of
+  the tool's own parameters (temperature, steps / epochs), `--seed`
+  overrides; the train plateau gaps (0.99 / 0.93 / 0.85 for 300 / 600 /
+  900 K, monotone in T) dominate the noise so `final_accuracy` is strictly
+  decreasing in temperature — tested. Wall time controlled by `--duration-sec`
   (default 5) so the demo paces itself; write output atomically (tmp +
   rename); exit non-zero with a clear message on bad input; print a
   one-line summary to stdout (shows up in task logs).

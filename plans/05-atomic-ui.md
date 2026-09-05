@@ -7,16 +7,21 @@ It is the thing on screen during the demo, so it must be calm, legible at
 
 ## Constraints
 
-- Plain ES module, no external libraries, no build step (Explorer is a
-  single-file SPA served by the gateway; study
-  `radical.orbit/src/radical/orbit/data/orbit_explorer.html` for the module
-  API — `export const name`, `template()`, `css()`, and the render/action
-  hooks used by `task_dispatcher.js` / `sysinfo.js`; reuse
-  `session_util.js` helpers for session registration).
-- Data via the gateway: federation `resources/{sid}`, campaign
-  `campaigns/{sid}`, `campaign/{sid}/{cid}`, `results/{sid}/{cid}`. Poll
-  every 2 s while a campaign is running; fall back gracefully when the
-  federation plugin is absent (show "no federation").
+- Plain ES module, no external libraries, no build step. File name is
+  fixed: `atomic_wm/ui/atomic_campaign.js` (served at
+  `/plugins/atomic_campaign.js`; the gateway caches it until a miss →
+  restart the broker after edits). Module API (verified in
+  `orbit_explorer.html:1244-1259, 2551-2607`): `export const name =
+  'atomic_campaign'`, `template()`, `css()`, `init(page, api)`, `onShow()`,
+  `onNotification(evt)`. Study `task_dispatcher.js` / `sysinfo.js` and
+  `session_util.js`.
+- Data via the gateway. `api.fetch` is namespaced to this plugin
+  (campaign routes: `campaigns/default`, `campaign/default/{cid}`,
+  `results/default/{cid}`, `POST campaigns/default`); federation calls go
+  through `api.fetchRaw('/broker/federation/resources/default')` with
+  `api.getSession('federation', {sid: 'default'})`. Poll every 2 s while
+  a campaign is running, 5 s otherwise; degrade gracefully when the
+  federation plugin is absent ("no federation").
 - Language on screen matches the slides: *resources, campaigns,
   workflows, stages*; never "pilot", "broker", "endpoint" (endpoint name
   may appear in a tooltip).
@@ -47,11 +52,10 @@ Explorer CSS variables where possible, tooltip optional.
 - `atomic_wm/ui/atomic.js` (+ packaged via `pyproject` package-data).
 - `docs/ui.md` — what the page shows, how it maps to demo steps, how to
   reach it (Explorer → broker → atomic_campaign).
-- `tests/test_ui_module.py` — load the JS with `node --check` for syntax
-  and, if `quickjs` is available in ve3 (orbit's `test_explorer_js.py`
-  uses it), assert exports and that `template()`/`css()` return strings;
-  otherwise a node-based smoke (`node -e "import(...)"`) — pick what works
-  on this machine and document it.
+- `tests/test_ui_module.py` — node-based (node v22 present; `quickjs` is
+  not in ve3): `node --check` for syntax, then `node --input-type=module
+  -e "import(...)"` asserting the exports exist and `template()`/`css()`
+  return non-empty strings; skip cleanly if `node` is missing.
 
 ## Acceptance
 

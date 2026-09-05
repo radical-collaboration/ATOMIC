@@ -38,21 +38,65 @@ tests; integrate for real in P6.
 - `tests/test_planner.py`, `test_runner.py` (fake federation client with
   scripted task-state transitions and staged output bytes; asserts
   sequential stages, concurrent workflows, failure isolation, store
-  layout, manifest content), `test_plugin_campaign.py` (routes via an
-  in-process FastAPI app if orbit's Plugin can be mounted standalone —
-  check how `test_plugin_task_dispatcher.py` does it; else test the
-  handlers directly).
+  layout, manifest content), `test_plugin_campaign.py` — mount the plugin
+  the way `radical.orbit/tests/unittests/test_plugin_task_dispatcher.py`
+  does (`_make_plugin`/`_register`: bare `FastAPI()`,
+  `app.state.is_broker = True`, broker state attributes,
+  `starlette.testclient.TestClient(plugin._app)`), with a fake
+  `_FederationAPI`.
+- Plugin config: state root `~/.radical/orbit/atomic_campaign/`
+  overridable by `ATOMIC_CAMPAIGN_STATE`; store root by
+  `ATOMIC_STORE_ROOT`. `ui_module` path must be named
+  `atomic_campaign.js` (served at `/plugins/atomic_campaign.js`).
+
+## Talking to the federation
+
+In-process only: `host = self._app.state.endpoint_service`;
+`await host.handle_request('POST', '/federation/submit/default', {},
+body)` etc. (see 00 Facts). Wrap in `_FederationAPI` (submit, task,
+resources) so tests can substitute a fake. 503 if the federation plugin is
+not hosted. All campaign routes use sid `default`
+(`self._ensure_default_session()` first).
 
 ## Output collection (important for Tuesday)
 
-Order of attempts per declared output:
-1. Pilot-side `staging` plugin `get` (path = task cwd/output) through the
-   gateway — works when broker and pilot do **not** share a filesystem.
-   The pilot endpoint name is available from the dispatcher task/pilot
-   records (`pilot_id`/child endpoint); document how it is resolved.
-2. Dispatcher `stage_out/{sid}/{task_id}/{filename}` (shared-FS case).
-3. Direct read of `cwd/output` on the broker host (localhost case).
-Record which path succeeded in the manifest.
+Collect **immediately when the task reaches a terminal state**, before
+the pilot can end (pilot walltime / allocation end makes path 1
+disappear). Order of attempts per declared output:
+1. Pilot-side `staging` plugin, works without a shared filesystem. The
+   child endpoint name comes back from federation `task/default/<task_id>`
+   as `child_endpoint` while the pilot is live (dispatcher child name
+   pattern `f'{pool}_{pid}'`). Call `POST /<child_endpoint>/staging/get/
+   {staging_sid}` with body `{"filename": "<abs cwd>/<output>"}` → response
+   `{"path", "size", "content"}` — the key is `content` (base64), **not**
+   `content_b64`. Needs its own staging session on that child (register,
+   use, unregister; one per task is fine). Paths must resolve under `~` or
+   `/tmp` (staging plugin rule) — hence `scratch_base` defaults.
+   In-process from the broker, this is a broker-caller call to a remote
+   participant (`self._broker_caller` / `_make_child_client` pattern from
+   the dispatcher, `plugin_task_dispatcher.py:780`), which IS supported
+   for endpoints.
+2. Dispatcher `stage_out/{dispatcher_sid}/{task_id}/{filename}` (shared-FS
+   case; key `content_b64`). The `dispatcher_sid` is in the federation
+   submit response.
+3. Direct read of `<cwd>/<output>` on the broker host (localhost case).
+Record which path succeeded in `manifest.json`.
+
+Inputs for stage k+1: `stage_in/{dispatcher_sid}/{task_id}` writes on the
+**broker host** only (`plugin_task_dispatcher.py:1281-1289`). Fine on
+localhost and shared-FS setups; cross-host input staging is a documented
+gap for Tuesday (`docs/campaign.md` §Limitations) — the demo's workflow
+must therefore keep stage inputs small and, if the two stages of a
+workflow may land on different hosts, the runner additionally pushes
+inputs to the *target* pilot via its staging plugin `put` once the task's
+`child_endpoint` is known (best effort, logged). Implement path 1 +
+`put` best-effort now; do not over-engineer.
+
+## Task outcome
+
+Terminal = `state ∈ {DONE, FAILED, CANCELED}`; success = `state == DONE
+and exit_code in (0, None)`. Poll interval 1 s → 3 s backoff; per-stage
+timeout configurable (default 15 min) counted on **task** state only.
 
 ## Results endpoint
 

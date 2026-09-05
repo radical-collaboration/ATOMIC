@@ -51,9 +51,56 @@ Decisions already taken with Andre (do not relitigate):
 
 - Dispatcher pools are declared per **session** via
   `POST /broker/task_dispatcher/register_session` with `{"pools": [...]}`;
-  there is no add-pool route. Pool identity = `(name, endpoint_name)`.
+  there is no add-pool route. Pool identity = `(owning_sid, name)`.
   → The federation creates **one dispatcher session per joined resource**,
-  holding exactly one pool. Zero dispatcher changes needed for routing.
+  holding exactly one pool. Routing itself needs no dispatcher change; two
+  small, sanctioned dispatcher touches are listed in 01 (min_pilots floor,
+  pilot `finished_at` + history in the verbose pool summary).
+- **Broker-hosted plugins call each other in-process, never via the
+  broker caller**: `BrokerCaller` resolves `dst` through the participant
+  registry and raises `RuntimeError("endpoint 'broker' unknown")` for the
+  broker itself (`broker.py:886-888`). The supported path is
+  `host = app.state.endpoint_service` (the `BrokerPluginHost`,
+  `broker_plugin_host.py:41`) then
+  `await host.handle_request('POST', '/task_dispatcher/register_session',
+  {}, body_bytes)` (`broker_plugin_host.py:103-139`) — same event loop,
+  exact route semantics incl. `HTTPException` codes, no token. Look the
+  target plugin up lazily at call time (plugins load in filter order) and
+  answer 503 if it is absent. This applies to federation→dispatcher and to
+  atomic_campaign→federation.
+- **Plugin sessions expire.** A session registered without an owner
+  (server-side `handle_request` carries no `x-orbit-src`) is ephemeral and
+  is swept `session_ttl` (3600 s) after `last_access`; dispatcher routes do
+  not bump `last_access`, and sweeping a dispatcher session cancels its
+  pools/pilots (`plugin_base.py:787-831`, `plugin_task_dispatcher.py:
+  2083-2111`). Rules: (i) the federation registers each dispatcher session
+  with `{"pools": [...], "lifetime": "persistent"}` (`plugin_base.py:479`)
+  and unregisters explicitly on leave; (ii) **all federation and
+  atomic_campaign routes are used with the reserved sid `default`**
+  (always present and persistent, `plugin_base.py:468-511`; handlers call
+  `self._ensure_default_session()` before checking `self._sessions`).
+  CLIs and the UI never register their own federation/campaign sessions.
+- **Pilot records**: `PilotRecord` has `submitted_at`, `active_at`,
+  `walltime_deadline` but no end timestamp, and `fleet/{sid}` /
+  `pool/{sid}/{name}` list **live pilots only** — finished pilots vanish
+  from the API. Hence dispatcher touch #2 in 01.
+- Child pilot endpoint name is `f'{pool}_{pid}'` (`plugin_task_dispatcher.
+  py:1558`); a task's `pilot_id` maps to `pilots[].child_endpoint_name` in
+  the verbose pool summary **while the pilot is live**.
+- Task dict = `asdict(TaskRecord)`: `state`, `exit_code`, `error`,
+  `finished_at`, `pilot_id`. **Terminal** = `state ∈ {DONE, FAILED,
+  CANCELED}`; **success** = `state == DONE and exit_code in (0, None)`.
+- Conservative policy defaults: tick 5 s, `min_dwell_sec 30`,
+  `max_in_flight_submissions 2`, handshake timeout 300 s. Federation-made
+  pools set `strategy_config: {"min_dwell_sec": 5,
+  "max_in_flight_submissions": 1}`. Runners time out on **task** state,
+  never on pilot state, and budget 60–90 s pilot warm-up per resource.
+- `detect_batch_system().psij_executor` for pilot submission runs on the
+  **broker host** (`plugin_task_dispatcher.py:1565`), not on the endpoint.
+  Correct for localhost and allocation mode; a Tuesday gap for login mode
+  from a non-Slurm broker host — record, do not fix now.
+- `PoolConfig.queue` must be non-empty and not the sentinel `"default"`;
+  allocation-mode pools use `queue: "allocation", account: null`.
 - A pilot is a psij job running `radical-orbit-endpoint-wrapper.sh -n
   <child> --plugins default`; the child endpoint dials the broker and hosts
   `rhapsody` (backend from `PilotSize.rhapsody_backend`; use `concurrent`
@@ -106,8 +153,23 @@ Per-piece plans: `01-orbit-federation.md`, `02-atomic-join-cli.md`,
 All broker-hosted routes live under the plugin instance namespace,
 reached through the gateway as `/broker/<instance>/<route>`. Every plugin
 already gets `register_session` / `unregister_session/{sid}` / `health` /
-`version` / `list_sessions` for free (Plugin base). `sid` below is the
-caller's plugin session id.
+`version` / `list_sessions` for free (Plugin base). **`{sid}` is always
+the reserved `default` session for federation and atomic_campaign routes**
+(see Facts); the dispatcher sessions the federation creates internally are
+per-resource and persistent.
+
+Explorer / ui_module facts (verified): a broker-hosted plugin's
+`ui_module` may be any absolute `.js` path; it is served at
+`/plugins/<pname>.js` where `<pname>` is the plugin's load-filter key (so
+the file must be named `atomic_campaign.js`; regex
+`^[a-z_][a-z0-9_.]*\.js$`). The gateway caches the JS until a miss —
+**restart the broker after editing the module**. Module hooks:
+`export const name`, `template()`, `css()`, `init(page, api)`, `onShow`,
+`onNotification` (`orbit_explorer.html:1244-1259, 2551-2607`). `api.fetch`
+is namespaced to the module's own plugin; cross-plugin calls use
+`api.fetchRaw('/broker/federation/...')` with
+`api.getSession('federation', {sid: 'default'})`. `quickjs` is not in
+`ve3`; node v22 is on the machine → JS tests are node-based.
 
 ### federation (orbit, instance name `federation`)
 
@@ -122,6 +184,9 @@ Resource record (JSON):
   "capabilities": {"cores": 128, "gpus": 4, "mem_gb": 256,
                    "software": ["lammps", "pytorch"]},
   "budget": {"node_hours": 40.0},     // declared allowance for this join
+  "scratch_base": "/tmp/atomic-demo/perlmutter_a",  // optional; default
+                                      // ~/.radical/orbit/federation/scratch/<name>
+                                      // (must lie under ~ or /tmp — staging plugin rule)
   "pool": {                           // login mode only; allocation mode derives it
     "queue": "regular", "account": "m1234",
     "nodes": 1, "cpus_per_node": 128, "gpus_per_node": 4,
@@ -138,15 +203,22 @@ Resource record (JSON):
 ```
 Routes:
 - `POST join/{sid}` body = resource record (client fields) → 200 full
-  record. 409 if name exists. Creates a dispatcher session + one pool
-  `fed-<name>` bound to `endpoint`. In `allocation` mode the pool is
-  `{max_pilots: 1, nodes/cpus/gpus from capabilities or queue_info
-  job_allocation, walltime = remaining allocation or 3600}`; budget
-  defaults to `nodes × walltime_h` if not declared.
+  record. 409 if name exists; 404 if `endpoint` is not a connected
+  participant; 503 if the dispatcher plugin is not hosted. Creates a
+  **persistent** dispatcher session + one pool `fed-<name>` bound to
+  `endpoint` (in-process `handle_request`, see Facts). In `allocation`
+  mode the pool is `{queue: "allocation", account: null, min_pilots: 1,
+  max_pilots: 1, nodes/cpus/gpus from capabilities or queue_info
+  job_allocation, walltime = remaining allocation or 3600}` — the
+  allocation's pilot starts at join (dispatcher touch #1); budget defaults
+  to `nodes × walltime_h` if not declared.
 - `POST leave/{sid}/{name}` → 200; cancels the pool's tasks, unregisters
   the dispatcher session.
-- `GET resources/{sid}` → `{"resources": [record, …]}` (usage refreshed
-  from dispatcher fleet/pool state on each call, cached ≤2 s).
+- `GET resources/{sid}` → `{"resources": [record, …]}`. Usage refreshed on
+  each call (cached ≤2 s): node-hours from the dispatcher verbose pool
+  summary's pilot history (`finished_at` — touch #2; live pilots use now);
+  `tasks_running/done` from the federation's **own submit ledger** (the
+  dispatcher's `recent_tasks` is capped at 50).
 - `GET resource/{sid}/{name}` → record.
 - `POST pick/{sid}` body `{"requirements": {"cores": 4, "gpus": 0,
   "software": ["lammps"], "node_hours": 0.1}}` → `{"resource": name,
@@ -164,8 +236,17 @@ Routes:
   "dispatcher_sid": …}`. This is the single call the campaign plugin uses.
 - `GET task/{sid}/{task_id}` → dispatcher task dict + `resource`.
 - Persistence: `~/.radical/orbit/federation/<instance>/state.json`
-  (resources + their dispatcher sids); on restart, resources whose
-  endpoint is connected are re-attached, others marked `lost`.
+  (resources + their dispatcher sids + submit ledger); on restart, for each
+  resource whose endpoint is connected, re-register the dispatcher session
+  with the **stored sid, the identical pool and `lifetime: persistent`** —
+  the dispatcher has already replayed the pool state for that sid and
+  `_materialise_pool` returns it (verified, `plugin_task_dispatcher.py:
+  584-640`); others are marked `lost`.
+- Env override for state root (tests + demo isolation):
+  `RADICAL_ORBIT_STATE_ROOT` if the dispatcher already supports one (check
+  `_state_root` construction) — otherwise the federation and campaign
+  plugins honour `RADICAL_ORBIT_FEDERATION_STATE` / `ATOMIC_CAMPAIGN_STATE`
+  and the demo backs up + clears the dispatcher state dir.
 - UI hook: `ui_config` minimal (a resources monitor) so the plain Explorer
   shows the federation without the ATOMIC UI.
 
@@ -201,7 +282,10 @@ Routes:
 - `GET store/{sid}` → central store layout for the UI to link.
 - Central store: `~/.radical/orbit/atomic_store/<cid>/<wf_id>/<stage>/…`
   on the broker host; each collected output is copied there, plus
-  `manifest.json` (resource, task_id, timings).
+  `manifest.json` (resource, task_id, timings, collection path used).
+- The campaign plugin talks to the federation **in-process**
+  (`host.handle_request('POST', '/federation/submit/default', …)`), never
+  over HTTP; only the CLI and UI use HTTP.
 - Campaign driver = one asyncio task per campaign inside the plugin;
   state persisted to `~/.radical/orbit/atomic_campaign/state.json`; on
   restart, running campaigns are marked `INTERRUPTED` (no resume needed).
@@ -219,29 +303,83 @@ Routes:
   `atomic-campaign status CID`, `atomic-campaign results CID --json`.
 - All talk HTTP to the gateway: `--broker URL` (default
   `$RADICAL_ORBIT_BROKER_URL`), `--token` (default
-  `$RADICAL_ORBIT_TOKEN`, may be empty with `--no-auth` brokers).
+  `$RADICAL_ORBIT_TOKEN`, may be empty with `--no-auth` brokers),
+  `--cert` (default `$RADICAL_ORBIT_BROKER_CERT`; TLS is always on).
+  They use sid `default` for federation/campaign routes and register
+  short-lived sessions only for endpoint-side plugins they query
+  (`sysinfo` metrics are session-scoped; `queue_info/job_allocation` is
+  session-less).
+- Shared-file ownership: P3 creates `pyproject.toml` (with **all**
+  console-script and entry-point lines up front) and `atomic_wm/__init__.py`;
+  the supervisor seeds `atomic_wm/client.py` with the contract's function
+  signatures before P2/P4/P5 start; P2 implements it; P4/P5 only call it
+  (P4's tests mock it). Nobody else edits `pyproject.toml` without a
+  STATUS.md handoff line.
 
 ### Fake workload (atomic repo, console scripts)
 
 - `atomic-fake-md --temperature T --steps N --out md.json [--seed S]
   [--duration-sec D]` → JSON `{"type":"simulation","temperature":T,
   "series":{"step":[…],"energy":[…],"temperature":[…]},"summary":{…}}`.
-  Deterministic given seed; runtime ≈ D (default 5 s).
+  Deterministic: the default seed is a stable hash of the tool's own
+  parameters (temperature, steps), so identical params ⇒ identical output
+  without `--seed`; runtime ≈ D (default 5 s).
 - `atomic-fake-train --in md.json --epochs E --out model.json` → JSON
   `{"type":"ml_training","series":{"epoch":[…],"loss":[…],"accuracy":[…]},
-  "summary":{"final_accuracy":…}}`; accuracy trend depends on input
-  temperature (higher T → lower plateau) so plots differ per workflow.
+  "summary":{"final_accuracy":…}}`; accuracy plateau is a monotone
+  function of input temperature (e.g. 0.99 @300 K, 0.93 @600 K, 0.85
+  @900 K) with noise amplitude far below the plateau gaps, so
+  `final_accuracy` is **strictly decreasing** in temperature by
+  construction (the smoke test asserts this).
 - `atomic-fake-descriptors --in md.json --out desc.json` (optional third
   stage type `analysis`).
 
+## Spike result (2026-09-06 00:10) — local pool path WORKS
+
+Proven three times on localhost: broker `--no-auth` + one standalone
+endpoint + dispatcher pool (`endpoint_name` bound, `rhapsody_backend:
+concurrent`, psij `local` executor) → pilot ACTIVE 4.6 s after submit,
+task DONE + `stage_out` at 5.1 s (warm broker: 2.8 s). Endpoint-mode also
+works when the endpoint process has `RADICAL_ORBIT_RHAPSODY_BACKEND=
+concurrent` exported (otherwise rhapsody defaults to `dragon_v3` and
+fails). Environment rules every runner script must follow:
+
+- `PATH` must include `ve3/bin` **in the endpoint process** (psij resolves
+  `radical-orbit-endpoint-wrapper.sh` by name).
+- `PYTHONPATH=$ORBIT_SRC/src` for broker/endpoint/clients when running
+  from source; it does **not** reach pilots (wrapper prepends ve3
+  site-packages). `ve3` currently holds a stale radical.orbit **0.3.0**
+  (src is 0.8.0) plus a pre-#121 wrapper → the local run script runs
+  `ve3/bin/pip install /home/merzky/radical/radical.orbit` first (allowed,
+  non-editable) so pilots run current code.
+- `unset RADICAL_LOG_LVL` (the user's shell exports `DEBUG_9`, which the
+  endpoint's `--log-level` default rejects); use `RADICAL_ORBIT_LOG_LVL`.
+  Do **not** export `RADICAL_ORBIT_LOG_FILE` (pilots would inherit it).
+- TLS is mandatory even with `--no-auth`: broker needs
+  `~/.radical/orbit/broker_cert.pem` + `broker_key.pem` (present here);
+  clients/endpoints use `https://127.0.0.1:<port>` and
+  `RADICAL_ORBIT_BROKER_CERT=~/.radical/orbit/broker_cert.pem`.
+- Broker `--host 127.0.0.1` (the advertised URL is the literal bind host;
+  `0.0.0.0` would advertise the FQDN to pilots). Use a non-default port
+  (e.g. 8010) to avoid the user's usual broker on 8000/8003.
+- Pool `queue` must not be the literal string `"default"` (dispatcher
+  sentinel); anything else is fine locally.
+- Wipe/isolate `~/.radical/orbit/task_dispatcher/state/` for demo runs
+  (stale sessions are replayed at broker start) — prefer pointing state
+  dirs at `/tmp/atomic-demo/...` if the plugins allow configuring them;
+  otherwise back up and clear.
+- The conservative policy submits a pilot ~3.5 s after the first task
+  arrives; `min_pilots` is parsed by config but not obviously honoured by
+  the policy — P1 must verify and, if unhonoured, either implement
+  "start `min_pilots` pilots at pool materialisation" in the policy hook
+  (`on_tick` may call `submit_pilot`) or accept first-task start-up
+  (5 s) and say so in docs.
+
 ## Risks and their answers
 
-- Local pool path unproven → spike runs first; fallback = endpoint mode via
-  rhapsody plugin + endpoint `staging` plugin for outputs.
-- Pilot child runs the **installed** orbit from `ve3` (wrapper prepends
-  site-packages). Endpoint-side code changes need `ve3/bin/pip install
-  /home/merzky/radical/radical.orbit`; broker-side changes run from src.
-  Prefer broker-side changes only.
+- Pilot child runs the **installed** orbit from `ve3` (see above) — the
+  local run script refreshes ve3 from the feature branch; broker-side
+  changes are exercised from src regardless.
 - Three endpoints on one host: unique `--name`, separate scratch dirs
   (`scratch_base` per pool under `/tmp/atomic-demo/<name>`), no port
   clashes (endpoints dial out; only the broker listens).

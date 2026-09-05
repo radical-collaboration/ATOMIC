@@ -21,19 +21,30 @@ atomic-join --broker http://127.0.0.1:8000 --name local_a --mode allocation \
 
 Steps performed:
 1. Start an endpoint: `radical-orbit-endpoint.py --name ep_<name> --url …
-   [--token …] --plugins default` as a child process (stdout/err to
-   `~/.radical/orbit/atomic/<name>/endpoint.log`). `PATH` must include the
-   venv `bin` so psij-launched pilots find `radical-orbit-endpoint-wrapper.sh`.
+   [--token …] [--cert …] --plugins default` as a child process (the
+   endpoint has no log-file flag: redirect stdout/err to
+   `~/.radical/orbit/atomic/<name>/endpoint.log`). The child's env: `PATH`
+   with the venv `bin` first (psij-launched pilots find
+   `radical-orbit-endpoint-wrapper.sh` by name), `RADICAL_ORBIT_LOG_LVL`
+   set, `RADICAL_LOG_LVL` and `RADICAL_ORBIT_LOG_FILE` removed,
+   `RADICAL_ORBIT_RHAPSODY_BACKEND` passed through if set.
 2. Wait until the endpoint shows as connected (`GET /endpoints`, timeout
    60 s, clear error otherwise).
-3. Auto-detect capabilities unless `--declare` overrides: call the
-   endpoint's `sysinfo` (`cores_logical`, memory, GPUs) and `queue_info`
-   (`job_allocation` in allocation mode) through the gateway.
-4. `POST /broker/federation/join/{sid}` with the assembled record (own
-   plugin session via `register_session`).
+3. Auto-detect capabilities unless `--declare` overrides: `sysinfo` is
+   session-scoped — register a sysinfo session on the endpoint, `GET
+   /<ep>/sysinfo/metrics/{sid}` (`cores_logical`, `memory.total`, GPUs),
+   unregister; `queue_info/job_allocation` is session-less (allocation
+   mode only). Declared values win over detected ones.
+4. `POST /broker/federation/join/default` with the assembled record
+   (federation routes always use the reserved `default` sid — no session
+   registration needed). Include `scratch_base` from `--scratch` if given.
 5. Stay in the foreground, relaying endpoint liveness; on SIGINT/SIGTERM
-   call `leave` and stop the endpoint. `--detach` writes a pidfile and
-   exits (for the demo's pre-joined resources).
+   call `leave/default/<name>` and stop the endpoint. `--detach` writes a
+   pidfile (`~/.radical/orbit/atomic/<name>/endpoint.pid`) and exits (for
+   the demo's pre-joined resources); `atomic-leave NAME` reads it, calls
+   `leave`, and terminates the endpoint process **and any surviving pilot
+   children** (psij `local` cancel only cancels the wrapper job — match
+   on `radical-orbit-endpoint` + the pool prefix `fed-<name>_`).
 
 ## Files
 
@@ -42,8 +53,10 @@ Steps performed:
   mode, cores/gpus/mem, software, node-hours used/remaining, pilots,
   tasks, liveness; `--json`).
 - `atomic_wm/client.py` — thin HTTP client for gateway + federation +
-  campaign routes (`requests`/`httpx` — use what orbit already depends on;
-  check `setup.py` install_requires). Shared by 02/04/05 CLI pieces.
+  campaign routes (`requests`, present in ve3; TLS verify against
+  `--cert`/`$RADICAL_ORBIT_BROKER_CERT`, sid `default` baked in). The
+  supervisor seeds this file with the function signatures; P2 implements
+  it; P4's CLI calls it (P4 tests mock it) — do not rename functions.
 - `atomic_wm/endpoint_proc.py` — start/stop/health of the endpoint child.
 - `bootstrap.sh` (repo root) — `bootstrap.sh <venv-dir> <atomic-join args…>`:
   create venv if missing, `pip install` radical.orbit (from a configurable
