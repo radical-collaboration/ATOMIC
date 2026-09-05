@@ -38,3 +38,7 @@ nosetests.xml
 .project
 .pydevproject
 .idea
+
+# demo / runtime artefacts
+telemetry-output/
+demo/local/run/
