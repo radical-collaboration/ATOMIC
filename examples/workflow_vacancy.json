@@ -1,0 +1,10 @@
+{
+  "name": "vacancy-classifier",
+  "params": {"temperature": 300},
+  "stages": [
+    {"name": "md",    "type": "simulation",  "cmd": ["atomic-fake-md", "--temperature", "{temperature}", "--steps", "200", "--out", "md.json"],
+     "requirements": {"cores": 2, "software": ["lammps"]}, "inputs": [], "outputs": ["md.json"]},
+    {"name": "train", "type": "ml_training", "cmd": ["atomic-fake-train", "--in", "md.json", "--epochs", "20", "--out", "model.json"],
+     "requirements": {"cores": 2, "gpus": 0, "software": ["pytorch"]}, "inputs": ["md.json"], "outputs": ["model.json"]}
+  ]
+}

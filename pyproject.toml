@@ -1,0 +1,52 @@
+[build-system]
+requires      = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "atomic-wm"
+description     = "ATOMIC workflow/campaign demo layer on top of radical.orbit"
+requires-python = ">=3.10"
+authors         = [{name = "RADICAL / ATOMIC"}]
+dynamic         = ["version"]
+
+# The synthetic workloads are deliberately stdlib-only: a task runs them
+# with whatever python the target resource provides, so `pip install
+# atomic-wm` on an HPC login node must not need to reach the network.
+# The HTTP client used by the CLI lives in the optional `cli` extra
+# (`requests` is already present in the orbit venv `ve3`).
+dependencies    = []
+
+[project.optional-dependencies]
+cli  = ["requests"]
+test = ["pytest", "flake8"]
+
+[project.scripts]
+# synthetic workload (P3)
+atomic-fake-md          = "atomic_wm.workload.fake_md:main"
+atomic-fake-train       = "atomic_wm.workload.fake_train:main"
+atomic-fake-descriptors = "atomic_wm.workload.fake_descriptors:main"
+# federation / campaign CLI (P2, P4) -- placeholders until then
+atomic-join             = "atomic_wm.cli.join:main"
+atomic-leave            = "atomic_wm.cli.leave:main"
+atomic-resources        = "atomic_wm.cli.resources:main"
+atomic-campaign         = "atomic_wm.cli.campaign:main"
+
+# The broker-hosted campaign plugin (P4).  The entry point targets the
+# `atomic_wm.plugins` *package*, whose __init__ imports the plugin class
+# defensively -- so the entry point resolves (and the install stays
+# usable) both before P4 lands and in environments without orbit.
+[project.entry-points."radical.orbit.plugins"]
+atomic_campaign = "atomic_wm.plugins"
+
+[tool.setuptools.dynamic]
+version = {attr = "atomic_wm.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["atomic_wm*"]
+
+[tool.setuptools.package-data]
+# the Explorer UI module added by P5 (glob is a no-op until then)
+atomic_wm = ["ui/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
