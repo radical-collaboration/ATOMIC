@@ -487,6 +487,38 @@ def test_arguments_can_be_overridden():
 
 
 # ---------------------------------------------------------------------------
+# env.sh fallback
+# ---------------------------------------------------------------------------
+
+def test_demo_env_is_read_back_from_env_sh(monkeypatch):
+    """`up.sh` exports into its own subshell, so smoke.py reads env.sh."""
+
+    for key in smoke.DEMO_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    added = smoke.load_demo_env()
+
+    assert 'RADICAL_ORBIT_BROKER_URL' in added
+    assert os.environ['RADICAL_ORBIT_BROKER_URL'].startswith('https://')
+    assert os.environ['ATOMIC_STORE_ROOT']
+
+
+def test_demo_env_does_not_override_the_caller(monkeypatch):
+
+    monkeypatch.setenv('RADICAL_ORBIT_BROKER_URL', 'https://elsewhere:9999')
+
+    assert smoke.load_demo_env() == []
+    assert os.environ['RADICAL_ORBIT_BROKER_URL'] == 'https://elsewhere:9999'
+
+
+def test_demo_env_survives_a_missing_env_sh(monkeypatch, tmp_path):
+
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL', raising=False)
+
+    assert smoke.load_demo_env(str(tmp_path / 'nope.sh')) == []
+
+
+# ---------------------------------------------------------------------------
 # the wait loop (with a scripted fake client)
 # ---------------------------------------------------------------------------
 

@@ -60,15 +60,20 @@ table plus the accuracies:
 
 ```
 workflow  temperature  stage  state  resource  task
---------  -----------  -----  -----  --------  ----------------
-wf-0      300          md     DONE   local_a   c1-wf-0-md
-wf-0      300          train  DONE   local_c   c1-wf-0-train
+--------  -----------  -----  -----  --------  -------------------------
+wf-000    300          md     DONE   local_a   cmp-b6b15c84-wf-000-md
+wf-000    300          train  DONE   local_c   cmp-b6b15c84-wf-000-train
 …
-[00:15:41] accuracy : temperature=300    wf-0  final_accuracy=0.990100
-[00:15:41] accuracy : temperature=600    wf-1  final_accuracy=0.930200
-[00:15:41] accuracy : temperature=900    wf-2  final_accuracy=0.850300
-[00:15:41] OK       : campaign c1, 3 workflows, 6 stages, 2 resources, 98s
+[01:19:31] accuracy : temperature=300    wf-000  final_accuracy=0.965761
+[01:19:31] accuracy : temperature=600    wf-001  final_accuracy=0.907226
+[01:19:31] accuracy : temperature=900    wf-002  final_accuracy=0.828262
+[01:19:31] OK       : campaign cmp-b6b15c84, 3 workflows, 6 stages, 2 resources, 24s
 ```
+
+Measured on this laptop: `up.sh` ~14 s including both pip installs, pilots
+live before the first readiness poll, campaign wall time ~24 s, `down.sh`
+~3 s. The accuracies are deterministic — the same three numbers come back
+on every run, because the workload seeds itself from its own parameters.
 
 It asserts, and exits 1 naming the assertion if any of it is untrue:
 
@@ -83,6 +88,11 @@ It asserts, and exits 1 naming the assertion if any of it is untrue:
    stage.
 
 Budget: the whole smoke run should stay under five minutes.
+
+`smoke.py` needs no environment of its own: `up.sh` exports into its own
+subshell, so when `$RADICAL_ORBIT_BROKER_URL` is unset `smoke.py` reads
+the handful of variables it needs back out of `env.sh`. Sourcing `env.sh`
+first still wins — an explicitly set variable is never overridden.
 
 ## Where things are
 

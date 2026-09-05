@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -597,6 +598,52 @@ def _bad_json(path: str) -> List[str]:
 # talking to the broker
 # ---------------------------------------------------------------------------
 
+# variables smoke.py needs and env.sh owns; kept short on purpose -- the
+# rest of env.sh only matters to processes the demo *starts*
+DEMO_ENV_KEYS = ('RADICAL_ORBIT_BROKER_URL', 'RADICAL_ORBIT_BROKER_CERT',
+                 'ATOMIC_STORE_ROOT', 'ATOMIC_WM_STATE')
+
+
+def load_demo_env(env_sh: Optional[str] = None) -> List[str]:
+    """Fill in demo defaults from ``env.sh`` when nobody sourced it.
+
+    The documented sequence is ``./demo/local/up.sh && ve3/bin/python
+    demo/local/smoke.py``, and ``up.sh`` exports into its own subshell --
+    so by the time smoke.py runs, the caller's environment may know
+    nothing about the demo.  Rather than duplicate the defaults here,
+    read them back out of ``env.sh`` itself.
+
+    Only *missing* variables are filled in: an explicit setting in the
+    caller's environment always wins.  Returns the names it set.
+    """
+
+    env_sh = env_sh or os.path.join(HERE, 'env.sh')
+
+    if os.environ.get('RADICAL_ORBIT_BROKER_URL'):
+        return []
+
+    if not os.path.isfile(env_sh):
+        return []
+
+    try:
+        proc = subprocess.run(
+            ['bash', '-c', 'source "$1" > /dev/null 2>&1; env -0', '_', env_sh],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        warn('could not read %s (%s) -- pass --broker explicitly' % (env_sh, e))
+        return []
+
+    added = []
+
+    for item in proc.stdout.decode('utf-8', 'replace').split('\0'):
+        key, _, value = item.partition('=')
+        if key in DEMO_ENV_KEYS and value and not os.environ.get(key):
+            os.environ[key] = value
+            added.append(key)
+
+    return added
+
+
 def make_client(args: argparse.Namespace) -> Any:
     """A ``atomic_wm.client.Client`` -- imported here, not at module level.
 
@@ -774,6 +821,11 @@ def run(args: argparse.Namespace) -> int:
 
     run_dir = os.path.abspath(args.run_dir)
     os.makedirs(run_dir, exist_ok=True)
+
+    added = load_demo_env()
+    if added:
+        log('env      : took %s from demo/local/env.sh'
+            % ', '.join(sorted(added)))
 
     client = make_client(args)
 
