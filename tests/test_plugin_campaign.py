@@ -17,9 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
+from atomic_wm.campaign.runner  import (FederationCallError, TaskNotFound,
+                                        REASON_NO_RESOURCE, REASON_NO_STATUS,
+                                        REASON_STAGE_IN)
+from atomic_wm.campaign.state   import REASON_INTERRUPTED
 from atomic_wm.plugins.campaign import PluginAtomicCampaign, _FederationAPI
 
 from test_runner import FakeFederation, _envelope, _spec       # noqa: I100
@@ -29,7 +33,11 @@ NS = '/atomic_campaign'
 
 # ---------------------------------------------------------------------------
 class FakeHost:
-    """Stand-in for ``BrokerPluginHost``: a plugin registry + handle_request."""
+    """Stand-in for ``BrokerPluginHost``: a plugin registry + handle_request.
+
+    A response entry may be a plain dict (200), a ``(status, dict)`` pair, or
+    an ``HTTPException`` to raise -- the three shapes the real host produces.
+    """
 
     def __init__(self, plugins=None, responses=None):
         self.plugins   = plugins or {}
@@ -41,7 +49,13 @@ class FakeHost:
                              query_string=''):
         self.calls.append((method, path, body_bytes))
         from starlette.responses import JSONResponse
-        return JSONResponse(self.responses.get((method, path), {}))
+        entry = self.responses.get((method, path), {})
+        if isinstance(entry, HTTPException):
+            raise entry
+        if isinstance(entry, tuple):
+            status, body = entry
+            return JSONResponse(body, status_code=status)
+        return JSONResponse(entry)
 
     async def send_notification(self, plugin, topic, data):
         self.notified.append((plugin, topic, data))
@@ -359,6 +373,235 @@ class TestFederationAPICalls:
             ('GET', '/federation/resources/default'):
                 {'resources': [{'name': 'res-a'}]}})
         assert asyncio.run(api.resources()) == [{'name': 'res-a'}]
+
+
+# ---------------------------------------------------------------------------
+class TestErrorMapping:
+    """Whatever the sibling plugins say must not reach the screen raw."""
+
+    def _api(self, tmp_path, responses):
+        host = FakeHost(plugins={'federation': object(),
+                                 'task_dispatcher': object()},
+                        responses=responses)
+        app, _ = _make_plugin(tmp_path, host=host)
+        return _FederationAPI(app), host
+
+    def test_http_exception_from_the_host_is_mapped(self, tmp_path):
+        # the real host raises HTTPException rather than returning a body
+        api, _ = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                HTTPException(status_code=503, detail='dispatcher plugin '
+                                                      'not hosted')})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't'}, {}))
+        assert exc.value.reason == 'the stage could not be started'
+        assert 'dispatcher' in exc.value.detail          # kept for the log
+        assert 'dispatcher' not in exc.value.reason
+
+    def test_409_no_resource_is_its_own_phrase(self, tmp_path):
+        api, _ = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                (409, {'detail': 'no resource satisfies requirements: '
+                                 'res-a lacks software lammps'})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't'}, {'cores': 99}))
+        assert exc.value.reason == REASON_NO_RESOURCE
+        assert 'lammps' in exc.value.detail
+
+    def test_404_task_lookup_raises_task_not_found(self, tmp_path):
+        api, _ = self._api(tmp_path, {
+            ('GET', '/federation/task/default/t1'):
+                (404, {'detail': 'unknown task: t1'})})
+        with pytest.raises(TaskNotFound) as exc:
+            asyncio.run(api.task('t1'))
+        assert exc.value.reason == REASON_NO_STATUS
+
+    def test_other_task_errors_are_not_fatal_typed(self, tmp_path):
+        api, _ = self._api(tmp_path, {
+            ('GET', '/federation/task/default/t1'): (500, {'detail': 'boom'})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.task('t1'))
+        assert not isinstance(exc.value, TaskNotFound)
+        assert exc.value.reason == REASON_NO_STATUS
+
+    def test_stage_in_failure_is_mapped(self, tmp_path):
+        api, _ = self._api(tmp_path, {
+            ('POST', '/task_dispatcher/stage_in/sid-a/t1'):
+                (404, {'detail': 'unknown pool: fed-a'})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.stage_in('sid-a', 'fed-a', 't1', 'md.json', b'x'))
+        assert exc.value.reason == REASON_STAGE_IN
+        assert 'pool' in exc.value.detail
+
+    def test_a_campaign_reason_never_carries_orbit_words(self, tmp_path):
+        host = FakeHost(plugins={'federation': object()}, responses={
+            ('POST', '/federation/submit/default'):
+                (409, {'detail': 'no resource satisfies requirements'})})
+        _, plugin = _make_plugin(tmp_path, host=host)
+        client = _request(plugin)
+        camp = _wait_terminal(client, _submit(client).json()['campaign_id'])
+        texts = [camp['reason'] or '']
+        for wf in camp['workflows']:
+            texts.append(wf['reason'] or '')
+            texts += [st['reason'] or '' for st in wf['stages']]
+        for text in texts:
+            for word in ('plugin', 'broker', 'pilot', 'endpoint',
+                         'dispatcher'):
+                assert word not in text, text
+
+
+# ---------------------------------------------------------------------------
+class TestStagingOverTheCaller:
+    """The pilot-side staging path needs a broker caller; without one it is
+    simply unavailable (collection falls through to the next source)."""
+
+    def _api_with_caller(self, tmp_path, caller):
+        app, _ = _make_plugin(tmp_path, host=FakeHost())
+        app.state.broker_caller = caller
+        return _FederationAPI(app)
+
+    def test_get_reads_the_content_key(self, tmp_path):
+        import base64
+
+        class _Caller:
+            def __init__(self):
+                self.calls = []
+
+            def call_threadsafe(self, dst, method, path, *, body=b'',
+                                headers=None, timeout=None):
+                import concurrent.futures
+                self.calls.append((dst, method, path, body))
+                fut = concurrent.futures.Future()
+                if path.endswith('register_session'):
+                    payload = {'sid': 'st.1'}
+                elif '/staging/get/' in path:
+                    payload = {'path': '/tmp/x/md.json', 'size': 2,
+                               'content': base64.b64encode(b'hi').decode()}
+                else:
+                    payload = {'ok': True}
+                fut.set_result({'status': 200, 'headers': {},
+                                'body': json.dumps(payload).encode()})
+                return fut
+
+        caller = _Caller()
+        api    = self._api_with_caller(tmp_path, caller)
+        data   = asyncio.run(api.staging_get('fed-a_p1', '/tmp/x/md.json'))
+        assert data == b'hi'
+        paths = [c[2] for c in caller.calls]
+        assert '/staging/register_session' in paths
+        assert '/staging/get/st.1' in paths
+        assert any(p.startswith('/staging/unregister_session') for p in paths)
+
+    def test_put_sends_the_file(self, tmp_path):
+        sent = {}
+
+        class _Caller:
+            def call_threadsafe(self, dst, method, path, *, body=b'',
+                                headers=None, timeout=None):
+                import concurrent.futures
+                fut = concurrent.futures.Future()
+                if '/staging/put/' in path:
+                    sent.update(json.loads(body))
+                payload = {'sid': 'st.1'} if path.endswith('register_session') \
+                          else {'path': sent.get('filename'), 'size': 3}
+                fut.set_result({'status': 200, 'headers': {},
+                                'body': json.dumps(payload).encode()})
+                return fut
+
+        api = self._api_with_caller(tmp_path, _Caller())
+        assert asyncio.run(api.staging_put('fed-a_p1', '/tmp/x/md.json',
+                                           b'abc')) is True
+        import base64
+        assert sent['filename'] == '/tmp/x/md.json'
+        assert base64.b64decode(sent['content']) == b'abc'
+        assert sent['overwrite'] is True
+
+    def test_a_failing_caller_is_not_fatal(self, tmp_path):
+        class _Caller:
+            def call_threadsafe(self, *args, **kwargs):
+                raise RuntimeError("endpoint 'fed-a_p1' unknown")
+
+        api = self._api_with_caller(tmp_path, _Caller())
+        assert asyncio.run(api.staging_get('fed-a_p1', '/tmp/x')) is None
+        assert asyncio.run(api.staging_put('fed-a_p1', '/tmp/x', b'y')) is False
+
+
+# ---------------------------------------------------------------------------
+class TestShutdown:
+
+    def test_a_running_campaign_becomes_interrupted(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})       # never finishes
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        spec = _spec([_spec()['stages'][0]])
+        cid  = client.post('%s/campaigns/default' % NS,
+                           json={'workflow': spec,
+                                 'sweep': {'temperature': [300]}}
+                           ).json()['campaign_id']
+
+        deadline = time.time() + 5
+        while not fed.submits and time.time() < deadline:
+            time.sleep(0.02)
+
+        client.portal.call(plugin.shutdown)
+
+        camp = plugin._campaigns[cid]
+        assert camp.state  == 'INTERRUPTED'
+        assert camp.reason == REASON_INTERRUPTED
+        assert camp.workflows[0].state == 'INTERRUPTED'
+        assert camp.workflows[0].stages[0].state == 'INTERRUPTED'
+        assert plugin._drivers == {}
+
+        # ... and it is on disk that way, so a restart shows it
+        _, plugin2 = _make_plugin(tmp_path, fed=_fed(tmp_path))
+        assert plugin2._campaigns[cid].state == 'INTERRUPTED'
+
+    def test_shutdown_of_a_finished_campaign_keeps_its_state(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
+        client = _request(plugin)
+        cid = _submit(client).json()['campaign_id']
+        _wait_terminal(client, cid)
+        client.portal.call(plugin.shutdown)
+        assert plugin._campaigns[cid].state == 'DONE'
+
+
+# ---------------------------------------------------------------------------
+class TestKnobsAndPruning:
+
+    def test_bad_concurrency_is_a_400(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
+        r = _request(plugin).post(
+            '%s/campaigns/default' % NS,
+            json={'workflow': _spec(), 'sweep': {'temperature': [300]},
+                  'max_concurrent_workflows': 0})
+        assert r.status_code == 400
+        assert 'max_concurrent_workflows' in r.json()['detail']
+
+    def test_bad_timeout_is_a_400(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
+        r = _request(plugin).post(
+            '%s/campaigns/default' % NS,
+            json={'workflow': _spec(), 'sweep': {'temperature': [300]},
+                  'stage_timeout_sec': 'soon'})
+        assert r.status_code == 400
+        assert 'stage_timeout_sec' in r.json()['detail']
+
+    def test_finished_campaigns_are_capped(self, tmp_path):
+        from atomic_wm.campaign.state import Campaign, prune_campaigns
+        camps = []
+        for idx in range(60):
+            camp = Campaign(campaign_id='cmp-%02d' % idx, state='DONE')
+            camp.finished_at = float(idx)
+            camps.append(camp)
+        camps.append(Campaign(campaign_id='cmp-live', state='RUNNING'))
+        kept = prune_campaigns(camps, keep_terminal=50)
+        ids  = {c.campaign_id for c in kept}
+        assert len(kept) == 51
+        assert 'cmp-live' in ids          # unfinished ones are never dropped
+        assert 'cmp-59' in ids            # newest finished kept
+        assert 'cmp-00' not in ids        # oldest dropped
 
 
 # ---------------------------------------------------------------------------

@@ -206,9 +206,15 @@ def cmd_submit(client: Any, args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------------------
 def wait_for(client: Any, cid: str, args: argparse.Namespace) -> int:
-    """Poll until the campaign is terminal; non-zero exit if it did not pass."""
+    """Poll until the campaign is terminal; non-zero exit if it did not pass.
 
-    last = None
+    ``--timeout`` bounds the wait: on expiry the campaign is printed as it
+    stands and the exit code is 3 (still running), so a script never hangs.
+    """
+
+    last     = None
+    limit    = float(getattr(args, 'timeout', 0) or 0)
+    deadline = (time.time() + limit) if limit > 0 else None
     while True:
         try:
             camp = client.campaign(cid)
@@ -224,6 +230,11 @@ def wait_for(client: Any, cid: str, args: argparse.Namespace) -> int:
             if state in FAILED_STATES:
                 return 1
             return 0
+        if deadline is not None and time.time() >= deadline:
+            print()
+            print_campaign(camp)
+            _err('campaign %s still %s after %.0f s' % (cid, state, limit))
+            return 3
         time.sleep(POLL_SEC)
 
 
@@ -323,6 +334,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument('--wait', action='store_true',
                      help='poll until the campaign is finished '
                           '(exit non-zero if it failed)')
+    sub.add_argument('--timeout', type=float, default=0.0, metavar='SEC',
+                     help='give up waiting after SEC seconds (exit 3); '
+                          '0 (default) waits forever')
     sub.set_defaults(func=cmd_submit)
 
     sub = subs.add_parser('status', help='show one campaign')
@@ -364,7 +378,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         return args.func(client, args)
     except KeyboardInterrupt:
-        return _err('interrupted')
+        sys.stderr.write('\n%s: interrupted\n' % TOOL)
+        return 130                                  # 128 + SIGINT
     except ClientError as exc:
         return _err(str(exc))
 

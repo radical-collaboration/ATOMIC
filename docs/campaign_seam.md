@@ -24,6 +24,12 @@ class FederationAPI:                         # atomic_wm/campaign/runner.py
     async def cancel_task(self, dispatcher_sid, task_id) -> bool
 ```
 
+A call that fails raises `FederationCallError(reason, detail)` — `reason`
+is one of the fixed on-screen phrases, `detail` is what the other plugin
+actually said (`TaskNotFound` is the 404 subclass the runner fails fast
+on). An implementation of this interface is responsible for that mapping;
+see `docs/campaign.md` §"Campaign record" for the phrase table.
+
 - **What to run** is `CampaignPlanner` (`SweepPlanner` is the fake).
 - **How to run it** is `StageRunner` / `CampaignRunner` over a
   `FederationAPI` (`_FederationAPI` in `atomic_wm/plugins/campaign.py` is

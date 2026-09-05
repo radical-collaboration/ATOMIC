@@ -21,7 +21,8 @@ import os
 import time
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, \
+                   Tuple
 
 from .state import Campaign, StageRun, WorkflowInstance
 from .state import (CANCELED, DONE, FAILED, PENDING, RUNNING, SKIPPED,
@@ -36,6 +37,28 @@ TASK_TERMINAL = ('DONE', 'FAILED', 'CANCELED')
 # tools that only exist on PATH inside a pilot whose venv has atomic-wm
 # installed; $ATOMIC_TOOL_PREFIX gives them an explicit home (see docs).
 _TOOL_PREFIX_ENV = 'ATOMIC_TOOL_PREFIX'
+
+# consecutive failed status lookups before a stage gives up
+MAX_POLL_FAILURES = 10
+
+# Every ``reason`` below is shown on screen verbatim, so the set is small,
+# fixed and written in the demo's vocabulary.  Whatever ORBIT said goes to
+# ``StageRun.detail`` and to the log.
+REASON_NO_RESOURCE = 'no resource satisfies the stage requirements'
+REASON_NOT_STARTED = 'the stage could not be started'
+REASON_NO_STATUS   = 'the stage status could not be read'
+REASON_STOPPED     = 'the campaign was stopped'
+REASON_INCOMPLETE  = 'the stage did not complete'
+REASON_STAGE_IN    = 'the input file could not be placed on the resource'
+
+
+# --------------------------------------------------------------------------
+def reason_failed(stage: 'StageRun') -> str:
+    """The on-screen text for a stage whose task did not succeed."""
+
+    if stage.resource:
+        return 'the stage failed on resource %s' % stage.resource
+    return 'the stage failed'
 
 
 # --------------------------------------------------------------------------
@@ -53,6 +76,30 @@ class FederationUnavailable(RuntimeError):
 # --------------------------------------------------------------------------
 class StageFailed(RuntimeError):
     """A stage could not be run to a successful, collected end."""
+
+
+# --------------------------------------------------------------------------
+class FederationCallError(RuntimeError):
+    """A federation/dispatcher call failed.
+
+    Carries both halves of the story: ``reason`` is the on-screen text (demo
+    vocabulary, one of the fixed phrases above) and ``detail`` is whatever
+    the other plugin actually said.
+    """
+
+    def __init__(self, reason: str, detail: str = '') -> None:
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
+# --------------------------------------------------------------------------
+class TaskNotFound(FederationCallError):
+    """The federation does not know this task (404) -- fail fast, do not
+    keep polling for the whole stage timeout."""
+
+    def __init__(self, detail: str = '') -> None:
+        super().__init__(REASON_NO_STATUS, detail)
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +162,7 @@ class StageRunner:
                  poll_max_interval: float = 3.0,
                  stage_timeout:     float = 900.0,
                  tool_prefix:       Optional[str] = None,
+                 push_inputs:       bool = False,
                  on_change:         Optional[Callable[[], None]] = None,
                  sleep:             Callable[[float], Any] = asyncio.sleep,
                  clock:             Callable[[], float] = time.time) -> None:
@@ -126,6 +174,7 @@ class StageRunner:
         self._timeout      = float(stage_timeout)
         self._tool_prefix  = tool_prefix if tool_prefix is not None \
                              else os.environ.get(_TOOL_PREFIX_ENV)
+        self._push         = bool(push_inputs)
         self._on_change    = on_change
         self._sleep        = sleep
         self._clock        = clock
@@ -185,7 +234,7 @@ class StageRunner:
                 continue
             if cancel is not None and cancel.is_set():
                 stage.state  = CANCELED
-                stage.reason = 'campaign canceled'
+                stage.reason = REASON_STOPPED
                 failure      = stage
                 continue
             await self._guarded_stage(campaign, wf, stage, produced, cancel)
@@ -219,18 +268,29 @@ class StageRunner:
             if stage.state != CANCELED:
                 stage.state = FAILED
             stage.reason = stage.reason or str(exc)
+        except FederationCallError as exc:
+            log.warning('[atomic_campaign] stage %s/%s: %s (%s)',
+                        wf.id, stage.name, exc.reason, exc.detail)
+            stage.state  = FAILED
+            stage.reason = exc.reason
+            stage.detail = exc.detail or None
         except asyncio.CancelledError:
-            stage.state  = CANCELED
-            stage.reason = 'the campaign was stopped'
-            wf.state     = CANCELED
-            wf.reason    = stage.reason
+            # an orderly shutdown stamps INTERRUPTED *before* cancelling the
+            # driver -- never overwrite a state that is already final
+            if stage.state not in TERMINAL_STATES:
+                stage.state  = CANCELED
+                stage.reason = REASON_STOPPED
+            if wf.state not in TERMINAL_STATES:
+                wf.state  = CANCELED
+                wf.reason = wf.reason or stage.reason
             self._changed()
             raise
         except Exception as exc:                              # noqa: BLE001
             log.exception('[atomic_campaign] stage %s/%s crashed',
                           wf.id, stage.name)
             stage.state  = FAILED
-            stage.reason = '%s: %s' % (type(exc).__name__, exc)
+            stage.reason = REASON_INCOMPLETE
+            stage.detail = '%s: %s' % (type(exc).__name__, exc)
         finally:
             self._changed()
 
@@ -246,8 +306,9 @@ class StageRunner:
             wf.reason = failure.reason
         else:
             wf.state  = FAILED
-            wf.reason = 'stage %r failed: %s' % (failure.name,
-                                                 failure.reason or 'unknown')
+            wf.reason = 'stage %r: %s' % (failure.name,
+                                          failure.reason or REASON_INCOMPLETE)
+            wf.detail = failure.detail
         wf.finished_at = self._clock()
         self._changed()
 
@@ -350,10 +411,15 @@ class StageRunner:
                 res = await self._fed.stage_in(
                     stage.dispatcher_sid or '', stage.pool or '',
                     stage.task_id or '', name, data)
+            except FederationCallError as exc:
+                stage.state  = FAILED
+                stage.reason = exc.reason
+                stage.detail = exc.detail or None
+                raise StageFailed(stage.reason) from exc
             except Exception as exc:                          # noqa: BLE001
                 stage.state  = FAILED
-                stage.reason = 'could not stage input %r: %s' % (name,
-                                                                  exc)
+                stage.reason = REASON_STAGE_IN
+                stage.detail = 'input %r: %s' % (name, exc)
                 raise StageFailed(stage.reason) from exc
             if isinstance(res, dict) and res.get('cwd'):
                 stage.cwd = res['cwd']
@@ -367,14 +433,17 @@ class StageRunner:
     # ----------------------------------------------------------------------
     async def _push_inputs(self, stage: StageRun,
                            produced: Dict[str, bytes]) -> None:
-        """Best-effort ``put`` of the inputs onto the pilot that got the task.
+        """Best-effort ``put`` of the inputs onto the resource running the task.
 
-        Only useful when broker host and pilot do NOT share a filesystem --
-        there the dispatcher's ``stage_in`` wrote to the wrong host.  Failure
-        is logged and ignored (on a shared filesystem the file is already
-        there and the put is refused as 'exists').
+        Only useful when the two hosts do NOT share a filesystem -- there the
+        dispatcher's ``stage_in`` wrote the file on the wrong host.  It is
+        OFF by default (``push_inputs``): the put uses ``overwrite=True``, so
+        on a shared filesystem it would rewrite the very file the running
+        task is reading.  Failures are logged and ignored.
         """
 
+        if not self._push:
+            return
         if not stage.inputs or not stage.child_endpoint or not stage.cwd:
             return
         for name in stage.inputs:
@@ -405,6 +474,7 @@ class StageRunner:
         interval = self._poll
         task_dict: Dict[str, Any] = {}
         pushed   = False
+        failures = 0
 
         while True:
             await self._sleep(interval)
@@ -413,18 +483,10 @@ class StageRunner:
             if cancel is not None and cancel.is_set():
                 await self._cancel_task(stage)
                 stage.state  = CANCELED
-                stage.reason = 'campaign canceled'
+                stage.reason = REASON_STOPPED
                 raise StageFailed(stage.reason)
 
-            try:
-                task_dict = await self._fed.task(stage.task_id or '') or {}
-            except FederationUnavailable:
-                raise
-            except Exception as exc:                          # noqa: BLE001
-                # a transient lookup error must not fail the stage
-                log.info('[atomic_campaign] task poll for %s failed: %s',
-                         stage.task_id, exc)
-                task_dict = {}
+            task_dict, failures = await self._poll_once(stage, failures)
 
             self._observe(stage, task_dict)
             if not pushed and stage.child_endpoint:
@@ -442,6 +504,37 @@ class StageRunner:
                                 'state: %s)'
                                 % (self._timeout, state or 'unknown'))
                 raise StageFailed(stage.reason)
+
+    # ----------------------------------------------------------------------
+    async def _poll_once(self, stage: StageRun,
+                         failures: int) -> Tuple[Dict[str, Any], int]:
+        """One status lookup; returns ``(task dict, consecutive failures)``.
+
+        A 404 fails the stage immediately -- the task is gone and no amount
+        of waiting brings it back.  Any other error is transient *until* it
+        has happened :data:`MAX_POLL_FAILURES` times in a row; that stops a
+        broken federation from burning the whole stage timeout.
+        """
+
+        try:
+            return await self._fed.task(stage.task_id or '') or {}, 0
+        except FederationUnavailable:
+            raise
+        except TaskNotFound as exc:
+            stage.state  = FAILED
+            stage.reason = exc.reason
+            stage.detail = exc.detail or None
+            raise StageFailed(stage.reason) from exc
+        except Exception as exc:                              # noqa: BLE001
+            failures += 1
+            log.info('[atomic_campaign] status of %s unreadable (%d/%d): %s',
+                     stage.task_id, failures, MAX_POLL_FAILURES, exc)
+            if failures >= MAX_POLL_FAILURES:
+                stage.state  = FAILED
+                stage.reason = REASON_NO_STATUS
+                stage.detail = str(exc)
+                raise StageFailed(stage.reason) from exc
+            return {}, failures
 
     # ----------------------------------------------------------------------
     def _observe(self, stage: StageRun, task_dict: Dict[str, Any]) -> None:
@@ -475,12 +568,17 @@ class StageRunner:
         if state == 'DONE' and stage.exit_code in (0, None):
             stage.state  = DONE
             stage.reason = None
+        elif state == 'CANCELED':
+            stage.state  = CANCELED
+            stage.reason = REASON_STOPPED
+            stage.detail = task_dict.get('error') or None
         else:
-            stage.state  = CANCELED if state == 'CANCELED' else FAILED
-            stage.reason = (task_dict.get('error')
-                            or 'the stage did not succeed (state %s, exit '
-                               'code %s)' % (state or 'unknown',
-                                             stage.exit_code))
+            stage.state  = FAILED
+            stage.reason = reason_failed(stage)
+            # whatever ORBIT said stays out of the UI, but not out of reach
+            stage.detail = (task_dict.get('error')
+                            or 'task state %s, exit code %s'
+                               % (state or 'unknown', stage.exit_code))
 
     # ----------------------------------------------------------------------
     async def _cancel_task(self, stage: StageRun) -> None:
@@ -591,7 +689,8 @@ class CampaignRunner:
             elif isinstance(res, BaseException):
                 log.exception('[atomic_campaign] workflow %s crashed: %s',
                               wf.id, res)
-                self._mark_failed(wf, '%s: %s' % (type(res).__name__, res))
+                self._mark_failed(wf, REASON_INCOMPLETE,
+                                  '%s: %s' % (type(res).__name__, res))
 
         campaign.refresh_state()
         self._changed()
@@ -608,10 +707,12 @@ class CampaignRunner:
 
     # ----------------------------------------------------------------------
     @staticmethod
-    def _mark_failed(wf: WorkflowInstance, reason: str) -> None:
+    def _mark_failed(wf: WorkflowInstance, reason: str,
+                     detail: str = '') -> None:
         if wf.state not in TERMINAL_STATES:
             wf.state = FAILED
         wf.reason = wf.reason or reason
+        wf.detail = wf.detail or (detail or None)
         for stage in wf.stages:
             if stage.state == PENDING:
                 stage.state  = SKIPPED
@@ -622,8 +723,8 @@ class CampaignRunner:
     def _mark_canceled(wf: WorkflowInstance) -> None:
         if wf.state not in TERMINAL_STATES:
             wf.state  = CANCELED
-            wf.reason = wf.reason or 'campaign canceled'
+            wf.reason = wf.reason or REASON_STOPPED
         for stage in wf.stages:
             if stage.state not in TERMINAL_STATES:
                 stage.state  = CANCELED
-                stage.reason = 'campaign canceled'
+                stage.reason = REASON_STOPPED

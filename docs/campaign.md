@@ -74,7 +74,7 @@ campaign : campaign_id, name, state, reason, sweep, created_at,
 workflow : id (wf-000…), name, params, state, reason, created_at,
            finished_at, stages[]
 stage    : name, type, cmd, inputs, declared_outputs, requirements,
-           state, reason, task_id, resource, pool, dispatcher_sid,
+           state, reason, detail, task_id, resource, pool, dispatcher_sid,
            child_endpoint, cwd, exit_code, submitted_at, started_at,
            finished_at, outputs[{name, size, via, path, errors}]
 ```
@@ -86,10 +86,29 @@ A stage succeeds exactly when its task reports `state == DONE` with
 `exit_code in (0, null)` **and** every declared output was collected.
 
 `reason` (on the campaign, the workflow and the stage) is **shown on
-screen verbatim** by the demo UI, so it is written in the demo's
-vocabulary — resources, campaigns, workflows, stages — and never mentions
-brokers, pilots, endpoints or plugins. Keep it that way when adding new
-failure paths; the technical detail belongs in the log.
+screen verbatim** by the demo UI, so it is drawn from a small fixed set of
+phrases written in the demo's vocabulary — resources, campaigns,
+workflows, stages — and never mentions brokers, pilots, endpoints,
+dispatchers or plugins:
+
+| reason | when |
+|---|---|
+| `the resource federation is not available` | the federation is not hosted |
+| `no resource satisfies the stage requirements` | federation `submit` said 409 |
+| `the stage could not be started` | any other submit failure |
+| `the stage failed on resource <name>` | the task ended FAILED / non-zero |
+| `the stage status could not be read` | task 404, or 10 unreadable polls |
+| `the input file could not be placed on the resource` | `stage_in` failed |
+| `output(s) not collected: …` | a declared output was nowhere to be found |
+| `stage timed out after N s (last state: …)` | the per-stage timeout |
+| `the campaign was stopped` | cancel, from the route or the driver |
+| `the service was restarted while this was running` | shutdown / restart |
+| `the stage did not complete` | anything unexpected |
+
+Whatever ORBIT actually said (a task's `error`, a plugin's `detail`, an
+exception) is kept in the sibling **`detail`** field and in the log — never
+in `reason`. `StageRun.to_dict()` also exposes `reason` as `error` for the
+Explorer module. Keep new failure paths inside this set.
 
 ### Results
 
@@ -127,16 +146,24 @@ further JSON ones — are listed under `files[stage]` by name and size only.
    - poll `GET federation/task/default/{task_id}` every 1 s, backing off to
      3 s, until the task state is terminal. The per-stage timeout (default
      15 min) counts **task** state only — a pilot that takes a minute to
-     boot never fails a stage;
-   - once the task's `child_endpoint` is known, the inputs are additionally
-     *pushed* to that pilot's own `staging` plugin (best effort, logged —
-     it is a no-op on a shared filesystem);
+     boot never fails a stage. A **404** fails the stage at once (the task
+     is gone; waiting cannot help), and 10 consecutive unreadable polls do
+     the same rather than burning the whole timeout;
+   - **if `push_inputs` is on**, once the task's `child_endpoint` is known
+     the inputs are additionally *pushed* to that pilot's own `staging`
+     plugin (best effort, logged). It is **off by default**: the put
+     overwrites, so on a shared filesystem it would rewrite the very file
+     the running task is reading. Turn it on for a cross-host setup, where
+     the dispatcher's `stage_in` wrote on the wrong host;
    - at the terminal state the declared outputs are collected
      **immediately** (before the pilot can go away) and a `manifest.json`
      is written.
 4. **Finish.** A stage failure fails its workflow (`reason` kept) and skips
    its remaining stages; other workflows carry on. The campaign is `DONE`
-   when every workflow is, `FAILED`/`CANCELED` otherwise.
+   when every workflow is, `FAILED`/`CANCELED` otherwise. An orderly
+   service shutdown stamps every unfinished campaign `INTERRUPTED` *before*
+   cancelling its driver, so a restart shows "interrupted", not "stopped" —
+   nobody asked for it to stop.
 
 ### Output collection order
 
@@ -186,12 +213,21 @@ alone.
 
 State is persisted to `<state root>/state.json` after every transition
 (atomic temp-file + rename). On restart, campaigns that were still running
-come back as `INTERRUPTED` — there is no resume; re-submit.
+come back as `INTERRUPTED` — there is no resume; re-submit. Unfinished
+campaigns are always kept; the **50 most recently finished** ones are kept
+too, older ones are dropped from the state file and the listing.
+
+Plugin construction knobs (broker config): `state_root`, `store_root`,
+`max_concurrent_workflows`, `stage_timeout_sec`, `poll_interval_sec`,
+`poll_max_interval_sec`, `push_inputs`. `max_concurrent_workflows` and
+`stage_timeout_sec` can also be overridden per campaign in the submit body
+(a non-positive value is a 400).
 
 ## CLI
 
 ```
-atomic-campaign submit SPEC.json --sweep temperature=300,600,900 [--wait]
+atomic-campaign submit SPEC.json --sweep temperature=300,600,900
+                                 [--wait [--timeout SEC]]
 atomic-campaign status  CID [--json]
 atomic-campaign results CID [--json]
 atomic-campaign list    [--json]
@@ -208,16 +244,21 @@ stay numbers. Connection flags are the shared `--broker` / `--token` /
 
 `status` prints one row per workflow — id, parameters, state, and the
 per-stage `stage:STATE@resource` chips. `--wait` polls until the campaign
-is terminal and exits non-zero if it did not finish `DONE`.
+is terminal; `--timeout SEC` bounds the wait so a script never hangs.
+
+Exit codes: `0` success · `1` error or a campaign that did not finish
+`DONE` · `2` usage · `3` `--wait` timed out · `130` interrupted.
 
 ## Limitations (and what to do about them on Tuesday)
 
 - **Cross-host `stage_in`.** The dispatcher's `stage_in` writes on the
   *broker host*; it only reaches the task when broker and pilot share a
-  filesystem. The runner therefore also pushes inputs to the target
-  pilot's `staging` plugin once its child endpoint is known — best effort,
-  and only *after* the task was submitted. Keep stage inputs small, and
-  expect the push to be the working path in a genuinely cross-host setup.
+  filesystem. For a genuinely cross-host setup turn on `push_inputs`: the
+  runner then also pushes the inputs to the target pilot's `staging`
+  plugin once its child endpoint is known — best effort, and only *after*
+  the task was submitted. It is off by default because that put
+  (`overwrite=True`) races a task that is already reading the file on a
+  shared filesystem. Keep stage inputs small either way.
 - **Submit-then-stage ordering.** `dispatcher_sid` and `pool` only exist
   after the federation submit, so inputs are staged a moment *after* the
   task is queued. The dispatcher's conservative policy needs seconds to

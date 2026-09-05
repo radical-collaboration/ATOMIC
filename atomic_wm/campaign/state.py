@@ -45,6 +45,15 @@ TERMINAL_STATES = (DONE, FAILED, CANCELED, SKIPPED, INTERRUPTED)
 
 STATE_FILE = 'state.json'
 
+# every ``reason`` is rendered VERBATIM by the demo UI, so it is written in
+# the demo's vocabulary (resources, campaigns, workflows, stages) and never
+# in ORBIT's (broker, pilot, endpoint, plugin, dispatcher).  The technical
+# text belongs in ``detail`` and in the log.
+REASON_INTERRUPTED = 'the service was restarted while this was running'
+
+# how many finished campaigns to keep (in memory and on disk)
+KEEP_TERMINAL = 50
+
 
 # --------------------------------------------------------------------------
 def default_state_root() -> Path:
@@ -94,7 +103,8 @@ class StageRun:
     requirements:    Dict[str, Any] = field(default_factory=dict)
 
     state:           str            = PENDING
-    reason:          Optional[str]  = None
+    reason:          Optional[str]  = None   # shown on screen, demo words
+    detail:          Optional[str]  = None   # raw technical text, for humans
 
     # filled in as the stage progresses
     task_id:         Optional[str]  = None
@@ -113,7 +123,10 @@ class StageRun:
     outputs:         List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # the Explorer module reads a stage's failure text as `error`
+        d['error'] = self.reason
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'StageRun':
@@ -128,7 +141,9 @@ class StageRun:
         return {'name'    : self.name,
                 'state'   : self.state,
                 'resource': self.resource,
-                'task_id' : self.task_id}
+                'task_id' : self.task_id,
+                'reason'  : self.reason,
+                'error'   : self.reason}
 
 
 # --------------------------------------------------------------------------
@@ -142,6 +157,7 @@ class WorkflowInstance:
     stages:     List[StageRun]       = field(default_factory=list)
     state:      str                  = PENDING
     reason:     Optional[str]        = None
+    detail:     Optional[str]        = None
     created_at: float                = field(default_factory=time.time)
     finished_at: Optional[float]     = None
 
@@ -181,6 +197,7 @@ class Campaign:
     name:        str                    = ''
     state:       str                    = RUNNING
     reason:      Optional[str]          = None
+    detail:      Optional[str]          = None
     sweep:       Dict[str, List[Any]]   = field(default_factory=dict)
     workflows:   List[WorkflowInstance] = field(default_factory=list)
     # created_at == started_at: a campaign starts driving the moment it is
@@ -257,7 +274,12 @@ class Campaign:
         states = {wf.state for wf in self.workflows}
         if CANCELED in states:  self.state = CANCELED
         elif FAILED in states:  self.state = FAILED
-        else:                   self.state = DONE
+        else:
+            # everything succeeded: a cancel that arrived after the last
+            # stage finished must not leave its reason behind
+            self.state  = DONE
+            self.reason = None
+            self.detail = None
         if self.finished_at is None:
             self.finished_at = time.time()
         return self.state
@@ -273,6 +295,23 @@ def write_json_atomic(path: Path, data: Any) -> None:
     with open(tmp, 'w', encoding='utf-8') as fd:
         json.dump(data, fd, indent=2, sort_keys=False, default=str)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+def prune_campaigns(campaigns: List[Campaign],
+                    keep_terminal: int = KEEP_TERMINAL) -> List[Campaign]:
+    """Keep every unfinished campaign and the newest *keep_terminal* others.
+
+    A demo broker that is up for a day must not grow an unbounded state file
+    (or an unbounded ``GET campaigns`` listing).
+    """
+
+    live = [c for c in campaigns if not c.is_terminal()]
+    done = sorted((c for c in campaigns if c.is_terminal()),
+                  key=lambda c: (c.created_at if c.finished_at is None
+                                 else c.finished_at), reverse=True)
+    keep = set(id(c) for c in live) | set(id(c) for c in done[:keep_terminal])
+    return [c for c in campaigns if id(c) in keep]
 
 
 # --------------------------------------------------------------------------
@@ -309,16 +348,20 @@ def load_campaigns(path: Path) -> List[Campaign]:
         except (TypeError, ValueError):
             continue
         if not camp.is_terminal():
-            _mark_interrupted(camp)
+            mark_interrupted(camp)
         out.append(camp)
     return out
 
 
 # --------------------------------------------------------------------------
-def _mark_interrupted(camp: Campaign) -> None:
-    """A campaign that was still running when the broker went away."""
+def mark_interrupted(camp: Campaign) -> None:
+    """Mark a campaign (and its unfinished parts) INTERRUPTED.
 
-    why = 'the service restarted while this was running'
+    Used both on restart -- a campaign found ``RUNNING`` in the state file --
+    and on an orderly shutdown, before the driver tasks are cancelled.
+    """
+
+    why = REASON_INTERRUPTED
     camp.state       = INTERRUPTED
     camp.reason      = camp.reason or why
     camp.finished_at = camp.finished_at or time.time()

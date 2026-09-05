@@ -16,7 +16,11 @@ import pytest
 
 from atomic_wm.campaign.planner import SweepPlanner
 from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
-                                        FederationUnavailable, StageRunner)
+                                        FederationCallError,
+                                        FederationUnavailable, StageRunner,
+                                        TaskNotFound, MAX_POLL_FAILURES,
+                                        REASON_NO_RESOURCE, REASON_NO_STATUS,
+                                        REASON_STOPPED)
 from atomic_wm.campaign.state   import (Campaign, load_campaigns,
                                         save_campaigns)
 from atomic_wm.campaign.store   import ResultStore
@@ -90,7 +94,8 @@ class FakeFederation(FederationAPI):
         stage   = task_id.rsplit('-', 1)[-1]
         plan    = self.plan(stage)
         if plan.get('submit_error'):
-            raise RuntimeError(plan['submit_error'])
+            raise FederationCallError(REASON_NO_RESOURCE,
+                                      plan['submit_error'])
 
         self._stage[task_id] = stage
         cwd = self.root / task_id
@@ -123,6 +128,10 @@ class FakeFederation(FederationAPI):
         n     = self.polls.get(task_id, 0)
         self.polls[task_id] = n + 1
         plan  = self.plan(self._stage_of(task_id))
+        if plan.get('task_404'):
+            raise TaskNotFound('unknown task: %s' % task_id)
+        if plan.get('task_error'):
+            raise RuntimeError(plan['task_error'])
         polls = plan.get('polls') or [{'state': 'DONE', 'exit_code': 0}]
         entry = dict(polls[min(n, len(polls) - 1)])
         entry.setdefault('cwd', self._cwd.get(task_id))
@@ -328,7 +337,7 @@ class TestInputPush:
                                 {'state': 'DONE', 'exit_code': 0,
                                  'child_endpoint': 'fed-a_p1'}]}})
         camp = _campaign(tmp_path)
-        _run(fed, camp, _store(tmp_path))
+        _run(fed, camp, _store(tmp_path), push_inputs=True)
 
         assert len(fed.puts) == 1
         endpoint, path, size = fed.puts[0]
@@ -348,8 +357,21 @@ class TestInputPush:
         fed.staging_put = _boom                        # type: ignore[method-assign]
 
         camp = _campaign(tmp_path)
+        _run(fed, camp, _store(tmp_path), push_inputs=True)
+        assert camp.state == 'DONE'
+
+    def test_pushing_inputs_is_off_by_default(self, tmp_path):
+        # the put overwrites: on a shared filesystem it would rewrite the
+        # very file the running task is reading
+        fed = FakeFederation(tmp_path, plans={
+            'md'   : {'outputs': {'md.json': _envelope('simulation', 1)}},
+            'train': {'outputs': {'model.json': _envelope('ml_training', 2)},
+                      'polls': [{'state': 'DONE', 'exit_code': 0,
+                                 'child_endpoint': 'fed-a_p1'}]}})
+        camp = _campaign(tmp_path)
         _run(fed, camp, _store(tmp_path))
         assert camp.state == 'DONE'
+        assert fed.puts == []
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +403,10 @@ class TestFailures:
         assert bad.stages[0].state == 'FAILED'
         assert bad.stages[0].exit_code == 3
         assert bad.stages[1].state == 'SKIPPED'
-        assert 'boom' in (bad.reason or '')
+        # the on-screen reason is a fixed phrase; ORBIT's text is in `detail`
+        assert bad.stages[0].reason == 'the stage failed on resource res-a'
+        assert 'boom' in (bad.stages[0].detail or '')
+        assert 'boom' not in (bad.reason or '')
         assert camp.state == 'FAILED'
 
     def test_nonzero_exit_code_is_a_failure(self, tmp_path):
@@ -400,7 +425,9 @@ class TestFailures:
                          sweep={'temperature': [300, 600]})
         _run(fed, camp, _store(tmp_path))
         assert all(wf.state == 'FAILED' for wf in camp.workflows)
-        assert 'no resource' in (camp.workflows[0].reason or '')
+        stage = camp.workflows[0].stages[0]
+        assert stage.reason == REASON_NO_RESOURCE
+        assert 'no resource satisfies requirements' in (stage.detail or '')
 
     def test_missing_federation_fails_the_campaign_with_a_clear_reason(
             self, tmp_path):
@@ -427,6 +454,70 @@ class TestFailures:
         assert stage.state == 'FAILED'
         assert 'timed out' in (stage.reason or '')
         assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+
+    def test_an_unknown_task_fails_the_stage_immediately(self, tmp_path):
+        # a 404 must not burn the whole stage timeout
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'}, 'task_404': True}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path), stage_timeout=10 ** 6)
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert stage.reason == REASON_NO_STATUS
+        assert 'unknown task' in (stage.detail or '')
+        assert fed.polls[stage.task_id] == 1        # one look, then out
+
+    def test_repeated_status_errors_give_up_after_the_cap(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'task_error': 'gateway said no'}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path), stage_timeout=10 ** 6)
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert stage.reason == REASON_NO_STATUS
+        assert fed.polls[stage.task_id] == MAX_POLL_FAILURES
+
+    def test_a_canceled_task_is_not_a_failure_text(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'CANCELED', 'error': 'pilot lost'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'CANCELED'
+        assert stage.reason == REASON_STOPPED
+        assert stage.detail == 'pilot lost'
+        assert camp.workflows[0].state == 'CANCELED'
+        assert camp.state == 'CANCELED'
+
+    def test_exit_code_none_still_counts_as_success(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'DONE'}]}})       # no exit_code key
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state     == 'DONE'
+        assert stage.exit_code is None
+        assert camp.state == 'DONE'
+
+    def test_no_reason_carries_orbit_vocabulary(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'FAILED', 'exit_code': 7,
+                              'error': 'rhapsody submit error: child '
+                                       'endpoint unavailable'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+        texts = [camp.reason or '']
+        for wf in camp.workflows:
+            texts.append(wf.reason or '')
+            texts += [s.reason or '' for s in wf.stages]
+        for text in texts:
+            for word in ('pilot', 'broker', 'endpoint', 'plugin',
+                         'dispatcher', 'rhapsody', 'Error'):
+                assert word not in text, text
 
     def test_a_missing_input_fails_the_stage(self, tmp_path):
         # md declares no output, so train's input can never be produced

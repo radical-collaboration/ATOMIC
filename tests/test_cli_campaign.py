@@ -154,6 +154,26 @@ class TestSubmit:
                        '--sweep', 'temperature=300', '--wait'])
         assert rc == 1
 
+    def test_wait_gives_up_after_the_timeout(self, client, spec_file,
+                                             monkeypatch, capsys):
+        ticks = iter([0.0] + [float(i) for i in range(1, 100)])
+        monkeypatch.setattr(cli.time, 'sleep', lambda _s: None)
+        monkeypatch.setattr(cli.time, 'time', lambda: next(ticks))
+        client.campaign_submit.return_value = {'campaign_id': 'cmp-1234',
+                                               'workflows': [{}]}
+        client.campaign.return_value = _campaign('RUNNING')
+        rc = cli.main(['--broker', 'https://x', 'submit', spec_file,
+                       '--sweep', 'temperature=300', '--wait',
+                       '--timeout', '5'])
+        assert rc == 3
+        assert 'still RUNNING' in capsys.readouterr().err
+
+    def test_interrupt_exits_130(self, client, spec_file, capsys):
+        client.campaign_submit.side_effect = KeyboardInterrupt
+        rc = cli.main(['--broker', 'https://x', 'submit', spec_file])
+        assert rc == 130
+        assert 'interrupted' in capsys.readouterr().err
+
     def test_bad_sweep_is_an_error(self, client, spec_file, capsys):
         rc = cli.main(['--broker', 'https://x', 'submit', spec_file,
                        '--sweep', 'nonsense'])
