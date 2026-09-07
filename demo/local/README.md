@@ -194,6 +194,22 @@ whose python environment lacks `atomic-wm` still finds the workload
 tools. The broker process is the one that needs it — it builds the task
 command — and inherits it from `up.sh`.
 
+## Before a cross-host run (Tuesday) — two non-negotiables
+
+1. **Every remote member must declare `shared_fs=false` and an explicit
+   `scratch_base`** in its `--member` spec. A member without them inherits the
+   resource's scratch, which for a login-mode resource falls back to a
+   *broker-local* path: the broker would then copy inputs and `mkdir` a cwd
+   on its own host and the task would run remotely with a bogus cwd and no
+   inputs — silently.
+2. **The pilot's psij executor is detected on the broker host**, not on the
+   member's endpoint. A broker on a non-Slurm host (radical.3) submits every
+   login-mode pilot with the `local` executor — no `sbatch`. Use
+   **allocation mode** for remote resources (the endpoint runs inside the
+   allocation; a local launch there is exactly right), or run the broker on a
+   Slurm-visible login node. Login mode from a non-Slurm broker host is not
+   supported yet (per-member executor override is a known follow-up).
+
 ## Troubleshooting
 
 **`up.sh` says the broker died during startup.** Read
