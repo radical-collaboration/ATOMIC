@@ -20,7 +20,7 @@
 #                  'none' skips the install entirely
 #                  (default: git+https://github.com/radical-cybertools/
 #                            radical.orbit@$ORBIT_BRANCH)
-#   ORBIT_BRANCH   branch used by the default ORBIT_SPEC    (default: devel)
+#   ORBIT_BRANCH   branch used by the default ORBIT_SPEC    (default: feature/atomic-federation until PRs #123-#125 merge)
 #
 #                  NOTE: `devel` does not yet host the `federation` plugin
 #                  the join talks to -- until `feature/atomic-federation`
@@ -40,7 +40,7 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PYTHON="${PYTHON:-python3}"
-ORBIT_BRANCH="${ORBIT_BRANCH:-devel}"
+ORBIT_BRANCH="${ORBIT_BRANCH:-feature/atomic-federation}"
 ORBIT_SPEC="${ORBIT_SPEC:-git+https://github.com/radical-cybertools/radical.orbit@${ORBIT_BRANCH}}"
 ATOMIC_SPEC="${ATOMIC_SPEC:-${SELF}[cli]}"
 ATOMIC_FORCE="${ATOMIC_FORCE:-0}"
