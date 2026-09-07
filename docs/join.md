@@ -20,6 +20,39 @@ and the endpoint is stopped.  Nothing is left behind.
 
 ---
 
+## Resources, members and capability classes
+
+A dispatcher pool is a **capability class** (`fed-cpu`, `fed-gpu`), not a
+site.  A resource declares one **member** per shape of pilot it is
+willing to run, and each member joins the pool for its class:
+
+```
+resource local_b ── members ──┬── local_b.cpu   class cpu → pool fed-cpu
+                              └── local_b.gpu   class gpu → pool fed-gpu
+resource local_a ── members ──── local_a.default class cpu → pool fed-cpu
+```
+
+- a **member short name** matches `^[a-z0-9][a-z0-9_-]*$` — **no dot**,
+  because the dot in the member id is the separator;
+- the **member id** the dispatcher sees is `<resource>.<member>`; a
+  resource name *may* contain dots, so it always splits on the **last**
+  one;
+- the **class** is `class=…` when declared, else `gpu` when the member
+  declares `gpus`, else `cpu`.  A class name that does not match
+  `^[a-z0-9][a-z0-9_-]*$` is rejected, never lower-cased: silently
+  turning `GPU` into `gpu` is how a second, invisible pool appears;
+- `--mode allocation` is exactly **one** member (`default`) — the
+  allocation *is* the resource — and `--member` is an error there;
+- a login-mode join **without** `--member` also becomes one `default`
+  member, built from the flat flags.  Every join that worked before
+  class pools still works, unchanged.
+
+A GPU in a member's size is a **declared** capability used for routing.
+Nothing reserves it this round, so two GPU-tagged tasks can share a
+one-GPU pilot.
+
+---
+
 ## The two modes
 
 | | `--mode allocation` | `--mode login` |
@@ -27,8 +60,9 @@ and the endpoint is stopped.  Nothing is left behind.
 | where it runs | inside a compute allocation (or on a workstation) | on a login node |
 | the resource is | the allocation itself — the whole thing | the right to submit pilots to a queue |
 | size comes from | `sysinfo` + `queue_info/job_allocation` on the endpoint's machine, overridable with `--declare` | the flags you pass (`--nodes × --cpus`, `--nodes × --gpus-per-node`), overridable with `--declare` |
-| pilots | one, started at join time, lives as long as the allocation | submitted on demand, up to `--max-pilots` |
-| budget | `--node-hours`; without it the federation derives nodes × walltime from the allocation | `--node-hours`, **required** |
+| pilots | one, started at join time, lives as long as the allocation | submitted on demand, up to `--max-pilots` (per member) |
+| budget | `--node-hours`; without it the federation derives nodes × walltime from the allocation | `--node-hours`, **required** — unless `--member` carries one per member |
+| members | exactly one, implicit (`default`) | one per `--member`, else one built from the flat flags |
 
 Login mode does **not** probe the machine the endpoint runs on: a login
 node's 8 cores say nothing about the 128-core pilots it would submit.
@@ -44,16 +78,72 @@ atomic-join --broker https://127.0.0.1:8013 --name local_a \
             --mode allocation --declare cores=4,gpus=0 --software lammps \
             --scratch /tmp/atomic-demo/local_a
 
-# a login node which may submit to a partition
+# a login node which may submit to a partition (one implicit member)
 atomic-join --broker https://psc:8003 --name bridges_login --mode login \
             --site PSC --queue RM --account abc123 \
             --nodes 1 --cpus 128 --walltime 3600 --node-hours 20 \
             --software lammps
 
+# the same login node, offering a CPU *and* a GPU shape
+atomic-join --broker https://psc:8003 --name bridges --mode login \
+            --site PSC --kind hpc \
+            --member cpu:queue=RM,account=abc123,nodes=1,cpus=128,\
+walltime=3600,node_hours=20,software=lammps,site=PSC \
+            --member gpu:queue=GPU,account=abc123,nodes=1,cpus=64,gpus=8,\
+walltime=3600,node_hours=8,software=pytorch,mem_gb_per_node=256,site=PSC
+
 # pre-join a resource for a demo and walk away
 atomic-join --broker … --name local_b --mode allocation --detach
 atomic-leave local_b
 ```
+
+## `--member NAME:key=value,…`
+
+Repeatable, login mode only, and **mutually exclusive** with the flat
+`--queue/--account/--nodes/--cpus/--gpus-per-node/--walltime/--max-pilots`
+flags (those describe exactly one member, so mixing the two would leave
+it open which member they belong to).
+
+| key | goes to | notes |
+|---|---|---|
+| `queue` | the member's batch queue | required; must not be `default` (the dispatcher's sentinel) |
+| `account` | allocation account | optional |
+| `nodes` | nodes per pilot | required, > 0 |
+| `cpus` | `cpus_per_node` | required, > 0 |
+| `gpus` | `gpus_per_node` | default 0 — **declared, not reserved** |
+| `walltime` | `walltime_sec` | required, > 0 |
+| `min_pilots` / `max_pilots` | pilot floor / ceiling | default 0 / 1 |
+| `node_hours` | `budget.node_hours` | required, > 0 |
+| `software` | the member's software list | always a list, see below |
+| `class` | the capability class | default: `gpu` if `gpus` > 0, else `cpu` |
+| `scratch` | `scratch_base` **on the member's host** | must lie under `$HOME` or `/tmp` |
+| `shared_fs` | `true`/`false` | whether broker host and member share `scratch_base` |
+| `backend` | `rhapsody_backend` | `concurrent` locally |
+| *anything else* | `attributes[key]` | free-form labels the dispatcher matches on: `site=NERSC`, `mem_gb_per_node=256` |
+
+**The one non-obvious rule.** The spec is split once on `:` into the
+member name and the rest, and the rest is split on `,`.  A fragment
+**without** `=` continues the previous key, turning its value into a
+list:
+
+```
+--member gpu:queue=GPU,software=pytorch,jax,site=PSC
+                       └──────────────────┘  one key, two values
+```
+
+so `software=pytorch,jax` is one list and `site=PSC` is still a scalar.
+A *leading* fragment without `=` has no previous key and is an error
+(`--member local_b:a,b: 'a' is not key=value`) rather than a silently
+dropped token, and `software` is **always** normalised to a list — the
+record shape never depends on how many tags were typed.  A scalar key
+handed several values (`queue=RM,GPU`) is an error too.
+
+Numbers in attributes stay numbers (`mem_gb_per_node=256` → `256`,
+`tier=1.5` → `1.5`); several values become a list of strings.
+
+`atomic-join` echoes every parsed member back on success — class, pool,
+queue, size, budget, software, attributes — so a typo is visible rather
+than silent.
 
 ## What `atomic-join` actually does
 
@@ -83,14 +173,21 @@ atomic-leave local_b
    `sysinfo` is not there, declare what matters (at least `cores`).
 4. **Joins** — `POST /broker/federation/join/default` with the resource
    record (name, endpoint, mode, site, kind, capabilities, optional
-   `budget` and `scratch_base`, and in login mode the `pool` block).  The
-   federation answers with the full record — including the pool
-   (`fed-<name>`) it created and the budget it settled on, which is what
-   the CLI prints.
+   `budget` and `scratch_base`, and in login mode either a `members`
+   list or the flat `pool` block).  With `--member` the resource-wide
+   `capabilities` are the **aggregate** of the members — `cores` =
+   Σ nodes × cpus, `gpus` = Σ nodes × gpus, `software` = the union — and
+   `budget.node_hours` is the sum of the members' budgets unless
+   `--node-hours` says otherwise.  The federation answers with the full
+   record — each member with its server-filled `member_id`, `class` and
+   `pool_name`, and the budget it settled on — which is what the CLI
+   prints.
 5. **Stays in the foreground**, reporting when the endpoint's connection
    changes.  On Ctrl-C (SIGINT) or SIGTERM it calls
-   `leave/default/<name>`, stops the endpoint, and kills pilot processes
-   that outlived their pool.  With `--detach` it instead writes
+   `leave/default/<name>` (with `{"cancel_tasks": false}` — a task this
+   resource queued can still run on another member of its class pool),
+   stops the endpoint, and kills pilot processes that outlived their
+   pool.  With `--detach` it instead writes
    `~/.radical/orbit/atomic/<name>/endpoint.pid` and exits — use
    `atomic-leave <name>` for the same teardown later.
 
@@ -119,6 +216,7 @@ never register a federation session of their own.
 
 | flag | meaning |
 |---|---|
+| `--member NAME:k=v,…` | declare one member (login mode, repeatable) — see above |
 | `--declare cores=,gpus=,mem_gb=` | override detected capabilities (comma separated) |
 | `--software a,b` | what is installed here; repeatable.  The campaign matches stage requirements against this list |
 | `--node-hours H` | the budget this join contributes (required in login mode; in allocation mode the federation derives one from the allocation if you leave it out) |
@@ -130,11 +228,21 @@ never register a federation session of their own.
 | `--log-level` | endpoint log level (`INFO` by default) |
 | `--detach` | write a pidfile and exit, leaving the endpoint up |
 
-`atomic-resources` prints one row per resource — capabilities, node-hours
-used/remaining, active pilots, running/done tasks, liveness — or the raw
-records with `--json`.  A `*` behind the node-hours means the federation
-could not refresh usage for that resource and is showing its last known
-values (`"stale": true`).
+`atomic-leave <name>` takes `--cancel-tasks`: by default leaving a class
+pool cancels **nothing**, because another member can still run what this
+resource queued; a full teardown (`demo/local/down.sh`) asks for the
+cancel explicitly.  The federation answers with `members_removed`,
+`tasks_requeued` and `tasks_failed`, which the CLI prints.
+
+`atomic-resources` prints a two-level table — one row per resource
+(site, member count, the aggregate software, node-hours, pilots, tasks,
+liveness) followed by one indented row per member with its own
+class/pool, size (`nodes x cores/node (+GPUs/node)`), software,
+node-hours, pilots and tasks — or the raw records with `--json`, which
+now carry `members`.  A resource whose federation reports no members
+renders as a single row, exactly as before.  A `*` behind the node-hours
+means the federation could not refresh usage for that row and is showing
+its last known values (`"stale": true`).
 
 ## Bootstrapping a machine
 
@@ -212,9 +320,10 @@ outbound access to the broker's host and port.
 **Leftover processes** — `atomic-leave` stops this resource's endpoint
 *and* any surviving pilot child of it.  Both are matched **by name, not
 by broker**: the endpoint is the process whose `--name` is `ep_<name>`,
-a pilot is one whose `--name` is `fed-<name>_p.<id>` (the dispatcher's
-child endpoint name; psij's `local` executor cancels only the wrapper
-job).  So `atomic-leave local` never touches `local_a`'s processes — and
+a pilot is one whose `--name` is the dispatcher's child endpoint name —
+`fed-<class>_<resource>.<member>_p.<id>` for a class pool, or
+`fed-<name>_p.<id>` for a pool that is not one (psij's `local` executor
+cancels only the wrapper job).  So `atomic-leave local` never touches `local_a`'s processes — and
 never touches endpoints of other brokers or other resources on the same
 machine.  The pid from the pidfile is only signalled after `/proc`
 confirms it really is that endpoint (pids get reused; a stale pidfile is

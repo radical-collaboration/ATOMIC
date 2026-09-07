@@ -113,24 +113,49 @@ const RESOURCES = { resources: [
     budget: { node_hours: 2.0 },
     usage: { node_hours_used: 1.9, node_hours_remaining: 0.1,
              tasks_running: 0, tasks_done: 3 },
-    liveness: 'suspect' },
+    liveness: 'suspect',
+    // two members in two capability class pools
+    members: [
+      { member: 'cpu', member_id: 'local_b.cpu', class: 'cpu',
+        pool_name: 'fed-cpu', queue: 'local', nodes: 1, cpus_per_node: 2,
+        gpus_per_node: 0, software: ['pytorch'],
+        attributes: { site: 'NERSC', mem_gb_per_node: 16 },
+        budget: { node_hours: 1.0 },
+        usage: { node_hours_used: 0.5, node_hours_remaining: 0.5,
+                 tasks_running: 0, tasks_done: 2 },
+        liveness: 'ok' },
+      { member: 'gpu', member_id: 'local_b.gpu', class: 'gpu',
+        pool_name: 'fed-gpu', queue: 'local', nodes: 1, cpus_per_node: 1,
+        gpus_per_node: 1, software: ['pytorch'],
+        attributes: { site: 'PSC' },
+        budget: { node_hours: 1.0 },
+        usage: { node_hours_used: 1.4, node_hours_remaining: 0,
+                 tasks_running: 0, tasks_done: 1 },
+        liveness: 'ok' } ] },
 ] };
 
-function wf(id, temp, s1, r1, s2, r2, reason) {
+// `m1`/`m2` are the MEMBERS the poll reported for the two stages; a null
+// resource is what the federation answers for a task the class pool has
+// not placed (or whose resource has left)
+function wf(id, temp, s1, r1, s2, r2, reason, m1, m2) {
   return { id, params: { temperature: temp },
            stages: [ { name: 'md', state: s1, resource: r1,
+                       member: m1 || null, cls: 'cpu', pool: 'fed-cpu',
                        task_id: 't.' + id + '.md',
                        exit_code: s1 === 'DONE' ? 0 : null,
                        reason: reason || null },
                      { name: 'train', state: s2, resource: r2,
+                       member: m2 || null, cls: 'gpu', pool: 'fed-gpu',
                        task_id: 't.' + id + '.train' } ] };
 }
 
 const DETAIL = {
   campaign_id: 'camp.001', name: 'vacancy-classifier', state: 'RUNNING',
   created_at: NOW - 95,
-  workflows: [ wf('wf.0', 300, 'DONE', 'local_a', 'DONE', 'local_a'),
-               wf('wf.1', 600, 'DONE', 'local_b', 'RUNNING', 'local_b'),
+  workflows: [ wf('wf.0', 300, 'DONE', 'local_a', 'DONE', 'local_a',
+                  null, 'default', 'gpu'),
+               wf('wf.1', 600, 'DONE', 'local_b', 'RUNNING', 'local_b',
+                  null, 'cpu', 'gpu'),
                wf('wf.2', 900, 'RUNNING', 'local_a', 'NEW', null),
                wf('wf.3', 1200, 'STAGING', 'local_b', 'SKIPPED', null) ],
 };
@@ -270,6 +295,24 @@ check(res.includes('ac-dot ok') && res.includes('ac-dot suspect'),
       'status dots missing');
 check(res.includes('serving endpoint: ep_local_a'),
       'endpoint name missing from the tooltip');
+
+// --- member sub-rows ------------------------------------------------------
+// local_b declares two members in two class pools; local_a declares none
+// and must render exactly as before (one row, no sub-rows)
+check((res.match(/class="ac-member"/g) || []).length === 2,
+      'expected two member sub-rows, got '
+      + (res.match(/class="ac-member"/g) || []).length);
+check(res.includes('└ cpu') && res.includes('└ gpu'),
+      'member sub-rows are not labelled with the member name');
+check(res.includes('cpu / fed-cpu') && res.includes('gpu / fed-gpu'),
+      'member sub-rows do not name the class and its pool');
+check(res.includes('PSC'), "a member's own site is not rendered");
+check(/member local_b\.gpu/.test(res),
+      'the member id is not in the sub-row tooltip');
+check(/declared GPU\(s\), not reserved/.test(res),
+      'the GPU tooltip must say declared, not reserved');
+check((res.match(/width:100\.0%/) || []).length >= 1,
+      "the gpu member's node-hour bar is not full (1.4 of 1.4 h)");
 check((res.match(/allocation/g) || []).length === 1,
       'the join mode is rendered twice (badge + Type column)');
 check(!/NaN|undefined/.test(res), 'resources HTML contains NaN/undefined');
@@ -286,6 +329,25 @@ check(camp.includes('staging') && camp.includes('skipped')
       'STAGING / SKIPPED / INTERRUPTED are not spelled out');
 check((camp.match(/local_a/g) || []).length >= 2,
       'stage chips are not labelled with their resource');
+
+// --- placement chips read resource/member off the POLLED stage -----------
+check(camp.includes('local_a/default') && camp.includes('local_b/gpu'),
+      'stage chips do not show resource/member');
+// the class is tooltip material only -- the chip is tight at 720p
+check(/title="[^"]*class gpu/.test(camp),
+      'the capability class is not in the chip tooltip');
+check(!/>\s*class gpu/.test(camp.replace(/<[^>]*>/g, m => m)),
+      'the class leaked onto the chip itself');
+// a stage the class pool has not placed carries no resource at all
+check(m._internals.placementOf({resource: null, member: null}) === '',
+      'a null resource must render as "not placed", not as text');
+check(m._internals.placementOf({resource: 'r', member: null}) === 'r',
+      'a stage with a resource and no member must show the resource');
+check(m._internals.placementOf({resource: 'r', member: 'gpu'}) === 'r/gpu',
+      'placement must read resource/member');
+check(m._internals.membersOf({}).length === 0
+      && m._internals.membersOf({members: [{member: 'x'}]}).length === 1,
+      'membersOf does not tolerate a record without members');
 check(camp.includes('stage did not finish'),
       'the stage `reason` is not in the chip tooltip');
 check(camp.includes('stopped while the service restarted'),

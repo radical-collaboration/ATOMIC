@@ -74,9 +74,10 @@ campaign : campaign_id, name, state, reason, sweep, created_at,
 workflow : id (wf-000…), name, params, state, reason, created_at,
            finished_at, stages[]
 stage    : name, type, cmd, inputs, declared_outputs, requirements,
-           state, reason, detail, task_id, resource, pool, dispatcher_sid,
-           child_endpoint, cwd, exit_code, submitted_at, started_at,
-           finished_at, outputs[{name, size, via, path, errors}]
+           state, reason, detail, task_id, resource, member, member_id,
+           cls, pool, dispatcher_sid, child_endpoint, cwd, exit_code,
+           submitted_at, started_at, finished_at,
+           outputs[{name, size, via, path, errors}]
 ```
 
 States: `PENDING → SUBMITTED → (STAGING) → RUNNING → DONE | FAILED |
@@ -94,11 +95,11 @@ dispatchers or plugins:
 | reason | when |
 |---|---|
 | `the resource federation is not available` | the federation is not hosted |
-| `no resource satisfies the stage requirements` | federation `submit` said 409 |
+| `no resource satisfies the stage requirements` | federation `submit` said 409 (no class has an eligible member) or 400 (no member satisfies the task's shape or software) |
 | `the stage could not be started` | any other submit failure |
 | `the stage failed on resource <name>` | the task ended FAILED / non-zero |
 | `the stage status could not be read` | task 404, or 10 unreadable polls |
-| `the input file could not be placed on the resource` | `stage_in` failed |
+| `the input file could not be placed on the resource` | an input could not be read out of the previous stage's outputs |
 | `output(s) not collected: …` | a declared output was nowhere to be found |
 | `stage timed out after N s (last state: …)` | the per-stage timeout |
 | `the campaign was stopped` | cancel, from the route or the driver |
@@ -137,24 +138,35 @@ further JSON ones — are listed under `files[stage]` by name and size only.
    default 8); the stages of one workflow run strictly in order.
 3. **Per stage:**
    - task id `<cid>-<wf_id>-<stage>`; `cmd` is a list of strings;
+   - **the previous stage's outputs ride in the submit body** as
+     `inputs_b64: {name: base64}`. A federation pool is a capability
+     class with several members, so nobody knows *where* the task will
+     run until the dispatcher places it — there is no directory to stage
+     into beforehand. The dispatcher spools the files and puts them
+     wherever the task lands. Failing to *read* an input fails the stage
+     with `the input file could not be placed on the resource` before the
+     task is ever submitted; failing to *place* it is the dispatcher's
+     and surfaces as a task failure;
    - `POST federation/submit/default` with the stage's `requirements` →
-     `{task, resource, pool, dispatcher_sid}`; the task's `cwd` is the
-     pool's task scratch directory;
-   - the previous stage's outputs are staged in through the dispatcher
-     (`stage_in/{dispatcher_sid}/{task_id}` with `{pool, filename,
-     content_b64, overwrite}`) — see *Limitations* for the ordering caveat;
+     `{task, pool, class, dispatcher_sid, resource, member,
+     members_eligible}`. The runner never sends a `cwd`: the dispatcher
+     assigns one when it places the task and reports it on the poll.
+     `resource` in the answer is **advisory** and `member` is `null`
+     until dispatch;
    - poll `GET federation/task/default/{task_id}` every 1 s, backing off to
      3 s, until the task state is terminal. The per-stage timeout (default
      15 min) counts **task** state only — a pilot that takes a minute to
      boot never fails a stage. A **404** fails the stage at once (the task
      is gone; waiting cannot help), and 10 consecutive unreadable polls do
      the same rather than burning the whole timeout;
-   - **if `push_inputs` is on**, once the task's `child_endpoint` is known
-     the inputs are additionally *pushed* to that pilot's own `staging`
-     plugin (best effort, logged). It is **off by default**: the put
-     overwrites, so on a shared filesystem it would rewrite the very file
-     the running task is reading. Turn it on for a cross-host setup, where
-     the dispatcher's `stage_in` wrote on the wrong host;
+   - **placement is what the poll says.** Each poll may carry
+     `member_id` (`<resource>.<member>`, split on the *last* dot),
+     `member`, `resource`, `class` and `cwd`; whatever it names
+     overwrites the advisory values from the submit. `resource: null` is
+     a legitimate answer — for a task the class pool has not placed yet,
+     and for one whose resource left the federation while it was queued —
+     and never fails a stage: the last placement that *was* named stays
+     on the record;
    - at the terminal state the declared outputs are collected
      **immediately** (before the pilot can go away) and a `manifest.json`
      is written.
@@ -191,10 +203,12 @@ Root: `~/.radical/orbit/atomic_store` (override `$ATOMIC_STORE_ROOT`).
 <root>/<campaign_id>/<workflow_id>/<stage>/manifest.json
 ```
 
-`manifest.json` records the provenance of one stage: `resource`, `pool`,
-`dispatcher_sid`, `child_endpoint`, `task_id`, `cwd`, `cmd`, `params`,
-`state`, `exit_code`, the timestamps, `collected_at`, and per output the
-`via` path plus the errors of the paths that did not work.
+`manifest.json` records the provenance of one stage: `resource`,
+`member`, `member_id`, `class`, `pool`, `dispatcher_sid`,
+`child_endpoint`, `task_id`, `cwd`, `cmd`, `params`, `state`,
+`exit_code`, the timestamps, `collected_at`, per output the `via` path
+plus the errors of the paths that did not work, and — for a stage with
+inputs — `inputs_staged: [{name, via: "submit", size}]`.
 
 ## Environment
 
@@ -219,7 +233,7 @@ too, older ones are dropped from the state file and the listing.
 
 Plugin construction knobs (broker config): `state_root`, `store_root`,
 `max_concurrent_workflows`, `stage_timeout_sec`, `poll_interval_sec`,
-`poll_max_interval_sec`, `push_inputs`. `max_concurrent_workflows` and
+`poll_max_interval_sec`. `max_concurrent_workflows` and
 `stage_timeout_sec` can also be overridden per campaign in the submit body
 (a non-positive value is a 400).
 
@@ -243,7 +257,9 @@ stay numbers. Connection flags are the shared `--broker` / `--token` /
 `$RADICAL_ORBIT_BROKER_CERT`).
 
 `status` prints one row per workflow — id, parameters, state, and the
-per-stage `stage:STATE@resource` chips. `--wait` polls until the campaign
+per-stage `stage:STATE@resource/member` chips (the placement is the one
+the last poll reported; a stage the class pool has not placed yet shows
+neither). `--wait` polls until the campaign
 is terminal; `--timeout SEC` bounds the wait so a script never hangs.
 
 Exit codes: `0` success · `1` error or a campaign that did not finish
@@ -251,20 +267,17 @@ Exit codes: `0` success · `1` error or a campaign that did not finish
 
 ## Limitations (and what to do about them on Tuesday)
 
-- **Cross-host `stage_in`.** The dispatcher's `stage_in` writes on the
-  *broker host*; it only reaches the task when broker and pilot share a
-  filesystem. For a genuinely cross-host setup turn on `push_inputs`: the
-  runner then also pushes the inputs to the target pilot's `staging`
-  plugin once its child endpoint is known — best effort, and only *after*
-  the task was submitted. It is off by default because that put
-  (`overwrite=True`) races a task that is already reading the file on a
-  shared filesystem. Keep stage inputs small either way.
-- **Submit-then-stage ordering.** `dispatcher_sid` and `pool` only exist
-  after the federation submit, so inputs are staged a moment *after* the
-  task is queued. The dispatcher's conservative policy needs seconds to
-  place a pilot, so the file is always there in time locally; a
-  fully warm pool could in principle race. The fix (staging before submit)
-  needs a federation route that reserves a placement — out of scope here.
+- **Inputs are base64 in a JSON body.** `inputs_b64` rides the broker
+  frame path at ~1.33× the file size and is capped dispatcher-side (a
+  `413` beyond it). Right for the demo's few-KB JSON, wrong for a
+  multi-MB restart file — bulk input stays a pilot-staging job. Outputs
+  are unaffected; they still come back through the pilot's own `staging`
+  plugin first.
+- **Placement is late.** The submit answer can only name an *advisory*
+  resource, so a chip may change once when the first poll reports the
+  member the dispatcher actually chose. `resource: null` is normal for a
+  queued task and for one whose resource left the federation; the runner
+  treats it as "not placed", never as a failure.
 - **Executor detection.** Pilots are submitted by the *dispatcher*, on the
   broker host (`detect_batch_system().psij_executor`). That is correct for
   localhost and for allocation mode; a login-mode resource served from a

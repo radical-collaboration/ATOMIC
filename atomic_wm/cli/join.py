@@ -37,8 +37,48 @@ TOOL = 'atomic-join'
 # resource names travel through pool names, directory names and URLs
 NAME_RE   = re.compile(r'^[a-z0-9][a-z0-9_.-]*$')
 
+# A member's short name carries NO dot: the member id the dispatcher sees is
+# '<resource>.<member>' and a resource name may contain dots, so the *last*
+# dot is the separator and the member half must not add more.
+MEMBER_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]*$')
+
+# a capability class names a pool ('fed-<class>').  A name that does not
+# match is rejected, never lower-cased: silently turning 'GPU' into 'gpu'
+# is how a second, invisible pool appears.
+CLASS_RE = re.compile(r'^[a-z0-9][a-z0-9_-]*$')
+
 # capability keys which can be declared (and their type)
 DECLARE_KEYS = {'cores': int, 'gpus': int, 'mem_gb': float}
+
+# `--member` keys which map onto a member's pool description.  Everything
+# NOT listed here becomes an entry in the member's `attributes` -- which is
+# how free-form labels (site=…, mem_gb_per_node=…) reach the dispatcher.
+MEMBER_INT_KEYS = {'nodes'     : 'nodes',
+                   'cpus'      : 'cpus_per_node',
+                   'gpus'      : 'gpus_per_node',
+                   'walltime'  : 'walltime_sec',
+                   'min_pilots': 'min_pilots',
+                   'max_pilots': 'max_pilots'}
+
+MEMBER_STR_KEYS = {'queue'  : 'queue',
+                   'account': 'account',
+                   'class'  : 'class',
+                   'scratch': 'scratch_base',
+                   'backend': 'rhapsody_backend'}
+
+# keys with a shape of their own
+MEMBER_LIST_KEYS  = {'software'}
+MEMBER_FLOAT_KEYS = {'node_hours'}
+MEMBER_BOOL_KEYS  = {'shared_fs'}
+
+MEMBER_KEYS = (set(MEMBER_INT_KEYS) | set(MEMBER_STR_KEYS)
+               | MEMBER_LIST_KEYS | MEMBER_FLOAT_KEYS | MEMBER_BOOL_KEYS)
+
+# what a member must describe before the federation can size a pilot for it
+MEMBER_REQUIRED = ['queue', 'nodes', 'cpus', 'walltime', 'node_hours']
+
+BOOL_WORDS = {'true' : True,  'yes': True,  'on' : True,  '1': True,
+              'false': False, 'no' : False, 'off': False, '0': False}
 
 # how long we wait for the endpoint to show up as connected
 CONNECT_TIMEOUT = 60.0
@@ -141,6 +181,22 @@ def build_parser() -> argparse.ArgumentParser:
                              '(must be under $HOME or /tmp)')
 
     grp = parser.add_argument_group('login mode')
+    grp.add_argument('--member', action='append', default=[],
+                     metavar='NAME:K=V,…',
+                     help='declare one member of this resource -- one shape '
+                          'of pilot it is willing to run.  Repeatable; '
+                          'mutually exclusive with the flat flags below.  '
+                          'Keys: queue, account, nodes, cpus, gpus, '
+                          'walltime, min_pilots, max_pilots, node_hours, '
+                          'software, class, scratch, shared_fs, backend; '
+                          'any other key becomes an attribute '
+                          '(site=NERSC).  A comma separated value list '
+                          'continues the previous key, so '
+                          '"software=lammps,pytorch" is one list.  '
+                          'Example: --member '
+                          'gpu:queue=gpu,nodes=1,cpus=64,gpus=8,'
+                          'walltime=3600,node_hours=8,software=pytorch,'
+                          'site=NERSC')
     grp.add_argument('--queue',   default=None,
                      help='batch queue/partition pilots are submitted to')
     grp.add_argument('--account', default=None,
@@ -210,6 +266,204 @@ def parse_declare(text: Optional[str]) -> Dict[str, Any]:
     return out
 
 
+def _member_fragments(name: str, rest: str) -> List[Tuple[str, List[str]]]:
+    """Split ``k=v,v2,k2=v3`` into ``[(key, [values]), …]``.
+
+    The one non-obvious rule of the grammar: a fragment **without** ``=``
+    continues the previous key, so ``software=a,b`` is one key with two
+    values while ``site=NERSC`` stays a single value.  A leading fragment
+    without ``=`` has no previous key and is a usage error -- never a
+    silently dropped token.
+    """
+
+    pairs: List[Tuple[str, List[str]]] = []
+
+    for item in rest.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            if not pairs:
+                raise UsageError('--member %s:%s: %r is not key=value'
+                                 % (name, rest, item))
+            pairs[-1][1].append(item)
+            continue
+        key, _, val = item.partition('=')
+        key, val    = key.strip(), val.strip()
+        if not key:
+            raise UsageError('--member %s:%s: %r has an empty key'
+                             % (name, rest, item))
+        if any(key == known for known, _ in pairs):
+            raise UsageError('--member %s: key %r given more than once'
+                             % (name, key))
+        pairs.append((key, [val] if val else []))
+
+    if not pairs:
+        raise UsageError('--member %s: expects at least one key=value '
+                         '(got %r)' % (name, rest))
+
+    return pairs
+
+
+def _member_scalar(name: str, key: str, values: List[str]) -> str:
+    """One value for a key that takes exactly one."""
+
+    if len(values) != 1:
+        raise UsageError('--member %s: %s takes a single value, got %s'
+                         % (name, key, ','.join(values) or 'none'))
+    return values[0]
+
+
+def _member_int(name: str, key: str, values: List[str]) -> int:
+    """A non-negative integer; ``min_pilots`` may be 0, the rest may not."""
+
+    text = _member_scalar(name, key, values)
+    try:
+        number = int(text)
+    except ValueError:
+        raise UsageError('--member %s: %s is not a number: %r'
+                         % (name, key, text))
+    floor = 0 if key in ('min_pilots', 'gpus') else 1
+    if number < floor:
+        raise UsageError('--member %s: %s must be >= %d, got %d'
+                         % (name, key, floor, number))
+    return number
+
+
+def _attribute_value(values: List[str]) -> Any:
+    """An attribute value: a number where it looks like one, else text.
+
+    A single value stays a scalar (``site=NERSC``); several become a list
+    (``labels=a,b``), which is what the dispatcher's matcher understands.
+    """
+
+    def one(text: str) -> Any:
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return text
+
+    if len(values) == 1:
+        return one(values[0])
+    return [str(v) for v in values]
+
+
+def parse_member(spec: str) -> Dict[str, Any]:
+    """Parse one ``--member NAME:key=value,…`` into a member record.
+
+    See ``docs/join.md``; the record is the wire shape the federation's
+    ``join`` route expects in its ``members`` list.
+    """
+
+    text = (spec or '').strip()
+
+    if ':' not in text:
+        raise UsageError('--member expects NAME:key=value,…, got %r' % spec)
+
+    name, _, rest = text.partition(':')
+    name = name.strip()
+
+    if not MEMBER_NAME_RE.match(name):
+        raise UsageError('--member name must match %s (no dots -- the dot '
+                         'separates resource and member), got: %r'
+                         % (MEMBER_NAME_RE.pattern, name))
+
+    member: Dict[str, Any] = {'member': name, 'software': [],
+                              'attributes': {}}
+
+    for key, values in _member_fragments(name, rest):
+        _member_assign(member, name, key, values)
+
+    return member
+
+
+def _member_assign(member: Dict[str, Any], name: str, key: str,
+                   values: List[str]) -> None:
+    """Put one parsed ``key=value…`` onto the member record.
+
+    Known keys land on the member's pool description; **every other key
+    becomes an attribute**, which is how free-form labels (``site=NERSC``,
+    ``mem_gb_per_node=256``) reach the dispatcher's matcher.
+    """
+
+    if key in MEMBER_INT_KEYS:
+        member[MEMBER_INT_KEYS[key]] = _member_int(name, key, values)
+
+    elif key in MEMBER_LIST_KEYS:
+        # always a list, however many tags were typed -- the record shape
+        # must not depend on that
+        member[key] = [v for v in values if v]
+
+    elif key in MEMBER_FLOAT_KEYS:
+        member.setdefault('budget', {})['node_hours'] = \
+            _member_float(name, key, values)
+
+    elif key in MEMBER_BOOL_KEYS:
+        raw = _member_scalar(name, key, values).lower()
+        if raw not in BOOL_WORDS:
+            raise UsageError('--member %s: %s must be true or false, got %r'
+                             % (name, key, raw))
+        member[key] = BOOL_WORDS[raw]
+
+    elif key in MEMBER_STR_KEYS:
+        member[MEMBER_STR_KEYS[key]] = _member_str(name, key, values)
+
+    else:
+        member['attributes'][key] = _attribute_value(values)
+
+
+def _member_float(name: str, key: str, values: List[str]) -> float:
+    """A positive float (the member's node-hour budget)."""
+
+    raw = _member_scalar(name, key, values)
+
+    try:
+        number = float(raw)
+    except ValueError:
+        raise UsageError('--member %s: %s is not a number: %r'
+                         % (name, key, raw))
+    if number <= 0:
+        raise UsageError('--member %s: %s must be > 0' % (name, key))
+
+    return number
+
+
+def _member_str(name: str, key: str, values: List[str]) -> str:
+    """A single-valued text key, with the two that validate themselves."""
+
+    value = _member_scalar(name, key, values)
+
+    if key == 'class' and not CLASS_RE.match(value):
+        raise UsageError('--member %s: class must match %s (it names the '
+                         'pool fed-<class> and is never lower-cased for '
+                         'you), got: %r' % (name, CLASS_RE.pattern, value))
+    if key == 'scratch':
+        return check_scratch(value)
+
+    return value
+
+
+def parse_members(specs: Sequence[str]) -> List[Dict[str, Any]]:
+    """Parse every ``--member`` and reject duplicate short names."""
+
+    members: List[Dict[str, Any]] = []
+    seen: Dict[str, bool] = {}
+
+    for spec in specs or []:
+        member = parse_member(spec)
+        if member['member'] in seen:
+            raise UsageError('--member %s: declared more than once'
+                             % member['member'])
+        seen[member['member']] = True
+        members.append(member)
+
+    return members
+
+
 def parse_software(values: Sequence[str]) -> List[str]:
     """Flatten repeated/comma separated ``--software`` into a unique list."""
 
@@ -243,8 +497,9 @@ def check_scratch(path: str) -> str:
 def validate(args: argparse.Namespace) -> argparse.Namespace:
     """Validate and normalise the parsed arguments.
 
-    Adds the derived attributes ``declared`` (dict), ``software`` (list)
-    and ``scratch`` (absolute or None); raises :class:`UsageError`.
+    Adds the derived attributes ``declared`` (dict), ``software`` (list),
+    ``members`` (list of member records) and ``scratch`` (absolute or
+    None); raises :class:`UsageError`.
     """
 
     if not NAME_RE.match(args.name):
@@ -253,6 +508,7 @@ def validate(args: argparse.Namespace) -> argparse.Namespace:
 
     args.declared = parse_declare(args.declare)
     args.software = parse_software(args.software)
+    args.members  = parse_members(args.member)
 
     if args.scratch:
         args.scratch = check_scratch(args.scratch)
@@ -280,8 +536,51 @@ def _login_flags(args: argparse.Namespace) -> List[Tuple[str, Any]]:
             ('--max-pilots',    args.max_pilots)]
 
 
+def _validate_members(args: argparse.Namespace) -> None:
+    """Login mode with ``--member``: the flat flags are out, members are in.
+
+    A resource declares one member per pilot *shape* it is willing to run;
+    each of them is added to its capability class pool.  The flat flags
+    describe exactly one shape, so mixing the two would leave it open
+    which of them the single implicit member is built from.
+    """
+
+    given = [flag for flag, val in _login_flags(args) if val is not None]
+
+    if given:
+        raise UsageError('--member and %s are mutually exclusive -- a '
+                         'member carries its own queue/size/budget'
+                         % ', '.join(given))
+
+    for member in args.members:
+        name    = member['member']
+        missing = [key for key in MEMBER_REQUIRED
+                   if not _member_has(member, key)]
+        if missing:
+            raise UsageError('--member %s: missing %s (a member must '
+                             'describe the pilots it runs)'
+                             % (name, ', '.join(missing)))
+        if member.get('queue') == 'default':
+            raise UsageError("--member %s: queue must not be 'default' "
+                             '(reserved by the orbit task dispatcher)' % name)
+        if member.get('min_pilots', 0) > member.get('max_pilots', 1):
+            raise UsageError('--member %s: min_pilots must not exceed '
+                             'max_pilots' % name)
+
+
+def _member_has(member: Dict[str, Any], key: str) -> bool:
+    """Was the ``--member`` key *key* given?  (Its record name may differ.)"""
+
+    if key == 'node_hours':
+        return bool((member.get('budget') or {}).get('node_hours'))
+    return MEMBER_INT_KEYS.get(key, MEMBER_STR_KEYS.get(key, key)) in member
+
+
 def _validate_login(args: argparse.Namespace) -> None:
     """In login mode nothing can be detected -- the pilot must be described."""
+
+    if args.members:
+        return _validate_members(args)
 
     required = ('--queue', '--nodes', '--cpus', '--walltime')
     missing  = [flag for flag, val in _login_flags(args)
@@ -308,6 +607,11 @@ def _validate_login(args: argparse.Namespace) -> None:
 
 def _validate_allocation(args: argparse.Namespace) -> None:
     """In allocation mode the allocation itself defines the pilot."""
+
+    if args.members:
+        raise UsageError('--member only applies to --mode login: an '
+                         'allocation is exactly one member, and the '
+                         'allocation itself describes it')
 
     given = [flag for flag, val in _login_flags(args) if val is not None]
 
@@ -375,27 +679,62 @@ def detect(client: Client, endpoint: str, mode: str,
 # the resource record
 # ---------------------------------------------------------------------------
 
+def member_capabilities(members: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The aggregate view of a resource's members.
+
+    The record keeps its resource-wide ``capabilities`` next to the member
+    list: cores and GPUs are the sum over the members' pilot shapes and
+    the software list is their union.  Every existing consumer
+    (``atomic-resources --json``, the demo UI, ``smoke.py``) keeps reading
+    the aggregate while the member view is added alongside.
+    """
+
+    cores = 0
+    gpus  = 0
+    soft: List[str] = []
+
+    for member in members:
+        nodes  = int(member.get('nodes', 1) or 0)
+        cores += nodes * int(member.get('cpus_per_node', 0) or 0)
+        gpus  += nodes * int(member.get('gpus_per_node', 0) or 0)
+        for item in member.get('software') or []:
+            if item not in soft:
+                soft.append(str(item))
+
+    return {'cores': cores, 'gpus': gpus, 'software': soft}
+
+
+def member_node_hours(members: Sequence[Dict[str, Any]]) -> float:
+    """The resource's declared budget: the sum of its members' budgets."""
+
+    return float(sum(float((m.get('budget') or {}).get('node_hours') or 0.0)
+                     for m in members))
+
+
 def pool_capabilities(args: argparse.Namespace) -> Dict[str, Any]:
     """What one login-mode pilot offers: `nodes` x the per-node numbers."""
 
     if args.mode != 'login':
         return {}
 
+    if args.members:
+        caps = member_capabilities(args.members)
+        caps.pop('software', None)
+        return caps
+
     return {'cores': (args.nodes or 0) * (args.cpus or 0),
             'gpus' : (args.nodes or 0) * (args.gpus_per_node or 0)}
 
 
-def assemble_record(args: argparse.Namespace,
-                    detected: Optional[Dict[str, Any]] = None,
-                    alloc: Optional[Dict[str, Any]] = None
-                    ) -> Dict[str, Any]:
-    """Build the federation resource record.
+def record_capabilities(args: argparse.Namespace,
+                        detected: Optional[Dict[str, Any]] = None
+                        ) -> Dict[str, Any]:
+    """The record's resource-wide capabilities (the aggregate view).
 
-    Capability precedence: ``--declare`` > detected (allocation mode) or
-    derived from the pilot description (login mode).  ``budget`` is sent
-    only when ``--node-hours`` was given; in allocation mode the
-    federation otherwise derives it from the allocation itself
-    (nodes x walltime), which it knows better than we do.
+    Precedence: ``--declare`` > detected (allocation mode) > derived from
+    the pilot description (login mode, flat flags or the sum over the
+    members).  The software list is the union of ``--software`` and every
+    member's own list.
     """
 
     caps:    Dict[str, Any] = {}
@@ -411,6 +750,28 @@ def assemble_record(args: argparse.Namespace,
 
     caps['software'] = list(args.software)
 
+    for item in member_capabilities(args.members).get('software') or []:
+        if item not in caps['software']:
+            caps['software'].append(item)
+
+    return caps
+
+
+def assemble_record(args: argparse.Namespace,
+                    detected: Optional[Dict[str, Any]] = None,
+                    alloc: Optional[Dict[str, Any]] = None
+                    ) -> Dict[str, Any]:
+    """Build the federation resource record.
+
+    Capability precedence: ``--declare`` > detected (allocation mode) or
+    derived from the pilot description (login mode).  ``budget`` is sent
+    only when ``--node-hours`` was given; in allocation mode the
+    federation otherwise derives it from the allocation itself
+    (nodes x walltime), which it knows better than we do.
+    """
+
+    caps = record_capabilities(args, detected)
+
     record: Dict[str, Any] = {
         'name'        : args.name,
         'endpoint'    : args.endpoint or endpoint_proc.endpoint_name(args.name),
@@ -422,11 +783,19 @@ def assemble_record(args: argparse.Namespace,
 
     if args.node_hours is not None:
         record['budget'] = {'node_hours': float(args.node_hours)}
+    elif args.members:
+        # the resource-level budget is the aggregate view of the members'
+        # own budgets -- the federation keeps the authoritative per-member
+        # numbers, this keeps every existing reader working
+        record['budget'] = {'node_hours': member_node_hours(args.members)}
 
     if args.scratch:
         record['scratch_base'] = args.scratch
 
-    if args.mode == 'login':
+    if args.members:
+        record['members'] = [dict(m) for m in args.members]
+
+    elif args.mode == 'login':
         record['pool'] = {
             'queue'           : args.queue,
             'account'         : args.account,
@@ -545,11 +914,17 @@ def join_error_hint(e: ClientError, name: str,
     return ''
 
 
-def do_leave(client: Client, name: str) -> None:
-    """Leave the federation; a failure is reported, never raised."""
+def do_leave(client: Client, name: str,
+             cancel_tasks: bool = False) -> None:
+    """Leave the federation; a failure is reported, never raised.
+
+    ``cancel_tasks`` is off by default: with capability class pools a task
+    this resource submitted can legitimately finish on another member, so
+    only a full teardown asks for the queue to be emptied.
+    """
 
     try:
-        client.fed_leave(name)
+        client.fed_leave(name, cancel_tasks=cancel_tasks)
         info('left the federation: %s' % name)
     except ClientError as e:
         if e.status == 404:
@@ -559,11 +934,12 @@ def do_leave(client: Client, name: str) -> None:
 
 
 def teardown(client: Optional[Client], name: str,
-             proc: Optional[EndpointProcess]) -> None:
+             proc: Optional[EndpointProcess],
+             cancel_tasks: bool = False) -> None:
     """Leave the federation, stop the endpoint, kill surviving pilots."""
 
     if client is not None:
-        do_leave(client, name)
+        do_leave(client, name, cancel_tasks=cancel_tasks)
 
     if proc is not None:
         proc.stop()
@@ -765,6 +1141,44 @@ def abort(name: str, proc: EndpointProcess) -> None:
     endpoint_proc.remove_pidfile(name)
 
 
+def member_size(member: Dict[str, Any]) -> str:
+    """``1x128c+4g`` -- what one of this member's pilots asks the batch for."""
+
+    text = '%sx%sc' % (member.get('nodes', 1),
+                       member.get('cpus_per_node', 0))
+    gpus = int(member.get('gpus_per_node') or 0)
+    if gpus:
+        text += '+%dg' % gpus
+    return text
+
+
+def member_lines(members: Sequence[Dict[str, Any]]) -> List[str]:
+    """One echo line per member -- what was parsed out of ``--member``."""
+
+    lines: List[str] = []
+
+    for member in members:
+        cls  = member.get('class') or member.get('cls') or ''
+        soft = ','.join(str(s) for s in member.get('software') or [])
+        attr = ','.join('%s=%s' % (k, v)
+                        for k, v in sorted((member.get('attributes')
+                                            or {}).items()))
+        bits = ['%s [%s]' % (member.get('member', '?'),
+                             member.get('pool_name')
+                             or ('class %s' % cls if cls else 'class derived')),
+                'queue=%s' % member.get('queue', '?'),
+                member_size(member),
+                'node-hours=%s' % (member.get('budget')
+                                   or {}).get('node_hours', '?')]
+        if soft:
+            bits.append('software=%s' % soft)
+        if attr:
+            bits.append(attr)
+        lines.append(' '.join(bits))
+
+    return lines
+
+
 def _fmt_caps(caps: Dict[str, Any]) -> str:
 
     return ', '.join('%s=%s' % (k, caps[k])
@@ -792,7 +1206,16 @@ def _report_joined(name: str, record: Dict[str, Any],
     info('  node-hours   : %s%s'
          % (budget.get('node_hours', 'derived by the federation'),
             '' if record.get('budget') else ' (derived from the allocation)'))
-    info('  pool         : %s' % full.get('pool_name', 'fed-%s' % name))
+
+    # echo the members back: a typo in a --member spec must be visible
+    members = full.get('members') or record.get('members') or []
+    if members:
+        info('  members      : %d' % len(members))
+        for line in member_lines(members):
+            info('    %s' % line)
+    else:
+        info('  pool         : %s' % full.get('pool_name', 'fed-%s' % name))
+
     if full.get('scratch_base') or record.get('scratch_base'):
         info('  scratch      : %s' % (full.get('scratch_base')
                                       or record.get('scratch_base')))

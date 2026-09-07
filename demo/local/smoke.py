@@ -7,14 +7,26 @@ demo claims on stage:
 
 1. the campaign reached ``DONE``,
 2. three workflows, all ``DONE``, every stage placed on a resource,
-3. every stage ran on a resource that advertises the software the stage
-   requires (``md`` -> ``lammps``, ``train`` -> ``pytorch``),
-4. at least two *distinct* resources were used -- the point of the
+3. every stage ran in the pool of its capability class and on a member
+   that advertises the software (and the GPU) the stage requires,
+4. at least two *distinct* members were used -- the point of the
    federation is that the campaign spreads,
-5. ``final_accuracy`` is strictly decreasing with temperature
+5. the ``train`` stages spread over at least two GPU members -- with two
+   GPU members in ``fed-gpu`` and three sweep points, everything landing
+   on one member means the class pool did not balance,
+6. ``final_accuracy`` is strictly decreasing with temperature
    (300 > 600 > 900) -- the fake trainer guarantees this by construction,
    so a violation means results got mixed up between workflows,
-6. the central store holds the six JSON outputs plus a manifest per stage.
+7. the central store holds the six JSON outputs plus a manifest per stage.
+
+**The placement this asserts against** (``demo/local/env.sh``): ``md``
+needs lammps and no GPU, so it runs in ``fed-cpu`` on ``local_a.default``
+or ``local_b.cpu`` -- never on ``local_c.cpu``, which has no lammps.
+``train`` needs pytorch and one GPU, so it runs in ``fed-gpu``, whose two
+members ``local_b.gpu`` (site NERSC) and ``local_c.gpu`` (site PSC) each
+take one task at a time -- three ``train`` tasks therefore use both.
+Which member gets which task is the *dispatcher's* choice, not the
+federation's.
 
 Run it after ``demo/local/up.sh``::
 
@@ -146,9 +158,94 @@ def stage_name_of(stage: Any) -> str:
 
 
 def resource_of(stage: Any) -> str:
-    """Resource a stage ran on (``''`` if the plugin recorded none)."""
+    """Resource a stage ran on (``''`` if the plugin recorded none).
+
+    A task waiting in a capability class pool has no resource yet, and one
+    whose resource left the federation has none any more -- both are
+    legitimately empty, and only a *finished* stage without one is a
+    failure.
+    """
 
     return str(first(stage, 'resource', 'resource_name', default='') or '')
+
+
+def member_of(stage: Any) -> str:
+    """Member a stage ran on within its resource (``''`` if unplaced)."""
+
+    return str(first(stage, 'member', default='') or '')
+
+
+def member_id_of(stage: Any) -> str:
+    """``'<resource>.<member>'`` for a stage, or the resource alone."""
+
+    resource = resource_of(stage)
+    member   = member_of(stage)
+
+    if resource and member:
+        return '%s.%s' % (resource, member)
+
+    return str(first(stage, 'member_id', default='') or resource)
+
+
+def pool_of(stage: Any) -> str:
+    """Pool (capability class pool) a stage was submitted to."""
+
+    return str(first(stage, 'pool', 'pool_name', default='') or '')
+
+
+def members_of(record: Any) -> List[Dict[str, Any]]:
+    """The members of one federation record, or none for an old broker."""
+
+    members = (record or {}).get('members')
+
+    if not isinstance(members, list):
+        return []
+
+    return [m for m in members if isinstance(m, dict)]
+
+
+def members_by_id(records: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    """``{'<resource>.<member>': member}`` over the whole federation.
+
+    Every member carries its own software list and pilot shape, which is
+    what the placement assertions are made against -- the resource-wide
+    capabilities are the *aggregate* and would happily accept a task on a
+    member that cannot run it.
+    """
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get('name') or '')
+        if not name:
+            continue
+        for member in members_of(rec):
+            short = str(member.get('member') or '')
+            mid   = str(member.get('member_id') or '')
+            if not mid and short:
+                mid = '%s.%s' % (name, short)
+            if not mid:
+                continue
+            entry = dict(member)
+            entry['resource'] = name
+            entry.setdefault('site', (member.get('attributes') or {}).get(
+                                     'site') or rec.get('site') or '')
+            out[mid] = entry
+
+    return out
+
+
+def gpus_of_member(member: Any) -> int:
+    """GPUs per node the member *declares* (nothing reserves them)."""
+
+    value = (member or {}).get('gpus_per_node')
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+
+    return int(value)
 
 
 def params_of(obj: Any) -> Dict[str, Any]:
@@ -216,6 +313,38 @@ def stage_requirements(spec: Dict[str, Any]) -> Dict[str, List[str]]:
     return out
 
 
+def stage_gpus(spec: Dict[str, Any]) -> Dict[str, int]:
+    """``{stage name: GPUs the stage requires}`` from the spec."""
+
+    out: Dict[str, int] = {}
+
+    for stage in spec.get('stages') or []:
+        if not isinstance(stage, dict):
+            continue
+        name = str(stage.get('name') or '')
+        if not name:
+            continue
+        reqs  = stage.get('requirements')
+        value = (reqs or {}).get('gpus') if isinstance(reqs, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            value = 0
+        out[name] = int(value)
+
+    return out
+
+
+def expected_class(gpus: int) -> str:
+    """The capability class a stage with *gpus* GPUs belongs in."""
+
+    return 'gpu' if gpus > 0 else 'cpu'
+
+
+def expected_pool(gpus: int) -> str:
+    """The pool name a stage with *gpus* GPUs must have run in."""
+
+    return 'fed-%s' % expected_class(gpus)
+
+
 def stage_outputs(spec: Dict[str, Any]) -> Dict[str, List[str]]:
     """``{stage name: [declared output file, ...]}`` from the spec."""
 
@@ -281,20 +410,37 @@ def _number(text: str) -> Any:
 # ---------------------------------------------------------------------------
 
 class Placement:
-    """One stage of one workflow, and where it ran."""
+    """One stage of one workflow, and where it ran.
+
+    ``resource``/``member`` are what the *poll* reported: a class pool
+    picks the member at dispatch, so this is the only authority on where
+    a stage actually ran.
+    """
 
     def __init__(self, wf_id: str, params: Dict[str, Any], stage: str,
-                 state: str, resource: str, task_id: str):
+                 state: str, resource: str, task_id: str,
+                 member: str = '', pool: str = ''):
         self.wf_id = wf_id
         self.params = params
         self.stage = stage
         self.state = state
         self.resource = resource
+        self.member = member
+        self.pool = pool
         self.task_id = task_id
+
+    @property
+    def member_id(self) -> str:
+        """``'<resource>.<member>'``, or the resource when unpartitioned."""
+
+        if self.resource and self.member:
+            return '%s.%s' % (self.resource, self.member)
+
+        return self.resource
 
     def __repr__(self) -> str:                              # pragma: no cover
         return ('Placement(%s, %s, %s, %s)'
-                % (self.wf_id, self.stage, self.state, self.resource))
+                % (self.wf_id, self.stage, self.state, self.member_id))
 
 
 def placements_of(campaign: Any) -> List[Placement]:
@@ -312,6 +458,8 @@ def placements_of(campaign: Any) -> List[Placement]:
                 stage=stage_name_of(stage),
                 state=state_of(stage),
                 resource=resource_of(stage),
+                member=member_of(stage),
+                pool=pool_of(stage),
                 task_id=str(first(stage, 'task_id', 'task',
                                   default='') or '')))
 
@@ -322,8 +470,9 @@ def render_placements(places: Sequence[Placement],
                       sweep_key: str = 'temperature') -> str:
     """A compact `workflow / param / stage / resource` table."""
 
-    head = ('workflow', sweep_key, 'stage', 'state', 'resource', 'task')
-    rows = [head]
+    head = ('workflow', sweep_key, 'stage', 'state', 'resource', 'member',
+            'pool', 'task')
+    rows: List[Tuple[str, ...]] = [head]
 
     for pl in places:
         rows.append((pl.wf_id or '-',
@@ -331,6 +480,8 @@ def render_placements(places: Sequence[Placement],
                      pl.stage or '-',
                      pl.state or '-',
                      pl.resource or '-',
+                     pl.member or '-',
+                     pl.pool or '-',
                      pl.task_id or '-'))
 
     widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
@@ -448,11 +599,24 @@ def check_workflows(campaign: Any, expected: int,
 def check_placement(places: Sequence[Placement],
                     software: Dict[str, List[str]],
                     requirements: Dict[str, List[str]],
-                    min_resources: int = 2) -> List[str]:
-    """Every stage on a capable resource, and the campaign spread out."""
+                    min_resources: int = 2,
+                    members: Optional[Dict[str, Dict[str, Any]]] = None,
+                    gpus: Optional[Dict[str, int]] = None,
+                    min_members: int = 2) -> List[str]:
+    """Every stage in the right pool, on a capable member, and spread out.
+
+    The software check is made against the **member** the stage ran on --
+    the resource-wide list is the aggregate of its members and would
+    accept a task on a member that cannot run it.  Where the federation
+    reports no members (a broker that predates class pools) the check
+    falls back to the resource, and the pool/GPU assertions are skipped.
+    """
 
     fails: List[str] = []
-    used = set()
+    members = members or {}
+    gpus    = gpus or {}
+    used_resources = set()
+    used_members   = set()
 
     for pl in places:
 
@@ -461,8 +625,24 @@ def check_placement(places: Sequence[Placement],
                          % (pl.wf_id or '<unnamed>', pl.stage or '<unnamed>'))
             continue
 
-        used.add(pl.resource)
+        used_resources.add(pl.resource)
+        used_members.add(pl.member_id)
 
+        need   = set(requirements.get(pl.stage, []))
+        member = members.get(pl.member_id)
+
+        if members and member is None:
+            fails.append('workflow %s stage %s ran on %r, which the '
+                         'federation does not list (known: %s)'
+                         % (pl.wf_id, pl.stage, pl.member_id,
+                            ', '.join(sorted(members)) or 'none'))
+            continue
+
+        if member is not None:
+            fails += _check_member(pl, member, need, gpus.get(pl.stage, 0))
+            continue
+
+        # no member view at all: fall back to the resource
         if pl.resource not in software:
             fails.append('workflow %s stage %s ran on %r, which the '
                          'federation does not list (known: %s)'
@@ -470,8 +650,7 @@ def check_placement(places: Sequence[Placement],
                             ', '.join(sorted(software)) or 'none'))
             continue
 
-        have = set(software[pl.resource])
-        need = set(requirements.get(pl.stage, []))
+        have    = set(software[pl.resource])
         missing = sorted(need - have)
 
         if missing:
@@ -481,11 +660,80 @@ def check_placement(places: Sequence[Placement],
                             ', '.join(missing),
                             ', '.join(sorted(have)) or 'nothing'))
 
-    if len(used) < min_resources:
+    if len(used_resources) < min_resources:
         fails.append('the campaign used %d resource(s) (%s), expected at '
                      'least %d -- it did not spread across the federation'
-                     % (len(used), ', '.join(sorted(used)) or 'none',
+                     % (len(used_resources),
+                        ', '.join(sorted(used_resources)) or 'none',
                         min_resources))
+
+    if members and len(used_members) < min_members:
+        fails.append('the campaign used %d member(s) (%s), expected at '
+                     'least %d -- it did not spread across the class pools'
+                     % (len(used_members),
+                        ', '.join(sorted(used_members)) or 'none',
+                        min_members))
+
+    return fails
+
+
+def _check_member(pl: Placement, member: Dict[str, Any],
+                  need: Iterable[str], gpus: int) -> List[str]:
+    """One stage against the member it ran on: pool, software, GPU."""
+
+    fails: List[str] = []
+    want = expected_pool(gpus)
+
+    if pl.pool and pl.pool != want:
+        fails.append('stage %s of workflow %s ran in pool %r, expected %r'
+                     % (pl.stage, pl.wf_id, pl.pool, want))
+
+    have    = set(str(s) for s in member.get('software') or [])
+    missing = sorted(set(need) - have)
+
+    if missing:
+        fails.append('stage %s of workflow %s ran on %r, which does not '
+                     'advertise %s (it has: %s)'
+                     % (pl.stage, pl.wf_id, pl.member_id,
+                        ', '.join(missing),
+                        ', '.join(sorted(have)) or 'nothing'))
+
+    if gpus > 0 and gpus_of_member(member) < gpus:
+        fails.append('stage %s ran on member %r, which declares no GPU'
+                     % (pl.stage, pl.member_id))
+
+    return fails
+
+
+def check_gpu_spread(places: Sequence[Placement],
+                     members: Dict[str, Dict[str, Any]],
+                     gpus: Dict[str, int],
+                     min_gpu_members: int = 2) -> List[str]:
+    """GPU work must spread over several GPU members.
+
+    ``fed-gpu`` has two members at two "sites" and the sweep has three
+    points, so all three GPU stages landing on one member means the class
+    pool did not balance -- which is the one thing this whole
+    re-architecture is for.  ``--min-gpu-members 1`` switches the check
+    off for a federation that really has one GPU member.
+    """
+
+    fails: List[str] = []
+
+    if min_gpu_members < 2 or not members:
+        return fails
+
+    for stage in sorted({pl.stage for pl in places
+                         if gpus.get(pl.stage, 0) > 0}):
+        runs = [pl for pl in places if pl.stage == stage]
+        seen = sorted({pl.member_id for pl in runs
+                       if gpus_of_member(members.get(pl.member_id)) > 0})
+        if len(seen) < min_gpu_members:
+            fails.append('the %d %s stage(s) used %d GPU member(s) (%s), '
+                         'expected at least %d -- the class pool did not '
+                         'spread across sites'
+                         % (len(runs), stage, len(seen),
+                            ', '.join(seen) or 'none', min_gpu_members))
 
     return fails
 
@@ -714,6 +962,28 @@ def wait_for_campaign(client: Any, cid: str, timeout: float,
         time.sleep(poll)
 
 
+def log_federation(software: Dict[str, List[str]],
+                   members: Dict[str, Dict[str, Any]]) -> None:
+    """Print what the federation offers -- resources, then their members."""
+
+    log('resources: %s'
+        % '; '.join('%s [%s]' % (name, ','.join(software[name]) or '-')
+                    for name in sorted(software)))
+
+    if not members:
+        warn('the federation reports no members -- pool and GPU assertions '
+             'are skipped (is this broker running the class-pool '
+             'federation?)')
+        return
+
+    log('members  : %s'
+        % '; '.join('%s %s [%s]'
+                    % (mid, expected_pool(gpus_of_member(members[mid])),
+                       ','.join(str(x) for x in
+                                members[mid].get('software') or []) or '-')
+                    for mid in sorted(members)))
+
+
 def store_root_of(args: argparse.Namespace, client: Any) -> str:
     """Where the campaign plugin copies collected outputs to."""
 
@@ -780,6 +1050,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--min-resources', type=int, default=2, metavar='N',
                         help='distinct resources the campaign must use '
                              '(default: %(default)s)')
+    parser.add_argument('--min-members', type=int, default=2, metavar='N',
+                        help='distinct members the campaign must use '
+                             '(default: %(default)s)')
+    parser.add_argument('--min-gpu-members', type=int, default=2,
+                        metavar='N',
+                        help='distinct GPU members the GPU stages must '
+                             'spread over; 1 switches the check off for a '
+                             'federation with a single GPU member '
+                             '(default: %(default)s)')
     parser.add_argument('--store-root', default=None, metavar='DIR',
                         help='central store (default $ATOMIC_STORE_ROOT, '
                              'else the plugin is asked)')
@@ -808,6 +1087,7 @@ def run(args: argparse.Namespace) -> int:
         expected *= len(values)
 
     requirements = stage_requirements(spec)
+    gpus = stage_gpus(spec)
     outputs = stage_outputs(spec)
     stages = list(requirements)
 
@@ -837,14 +1117,13 @@ def run(args: argparse.Namespace) -> int:
 
     resources = client.fed_resources()
     software = software_by_resource(resources)
+    members = members_by_id(resources)
 
     if not software:
         raise SmokeError('the federation lists no resources -- did '
                          'demo/local/up.sh finish?')
 
-    log('resources: %s'
-        % '; '.join('%s [%s]' % (name, ','.join(software[name]) or '-')
-                    for name in sorted(software)))
+    log_federation(software, members)
 
     submitted = client.campaign_submit(spec, sweep)
     cid = campaign_id_of(submitted)
@@ -860,7 +1139,9 @@ def run(args: argparse.Namespace) -> int:
 
     # refresh: usage counters only settle once the tasks are done
     try:
-        software = software_by_resource(client.fed_resources()) or software
+        resources = client.fed_resources()
+        software = software_by_resource(resources) or software
+        members = members_by_id(resources) or members
     except Exception as e:                          # noqa: BLE001 - advisory
         warn('could not refresh the resource list: %s' % e)
 
@@ -884,7 +1165,10 @@ def run(args: argparse.Namespace) -> int:
                             requirements=requirements, stages=stages,
                             metric_stage=metric_stage, expected=expected,
                             sweep_key=sweep_key,
-                            min_resources=args.min_resources)
+                            min_resources=args.min_resources,
+                            members=members, gpus=gpus,
+                            min_members=args.min_members,
+                            min_gpu_members=args.min_gpu_members)
 
     fails += store_failures(args, client, cid, campaign, outputs)
 
@@ -894,8 +1178,10 @@ def run(args: argparse.Namespace) -> int:
         return report_failures(fails, run_dir, elapsed)
 
     log('OK       : campaign %s, %d workflows, %d stages, %d resources, '
-        '%.0fs' % (cid, expected, len(places),
-                   len({p.resource for p in places if p.resource}), elapsed))
+        '%d members, %.0fs'
+        % (cid, expected, len(places),
+           len({p.resource for p in places if p.resource}),
+           len({p.member_id for p in places if p.resource}), elapsed))
 
     return EXIT_OK
 
@@ -907,14 +1193,23 @@ def gather_failures(campaign: Any, results: Any,
                     requirements: Dict[str, List[str]],
                     stages: Sequence[str], metric_stage: str,
                     expected: int, sweep_key: str,
-                    min_resources: int) -> List[str]:
+                    min_resources: int,
+                    members: Optional[Dict[str, Dict[str, Any]]] = None,
+                    gpus: Optional[Dict[str, int]] = None,
+                    min_members: int = 2,
+                    min_gpu_members: int = 2) -> List[str]:
     """Every assertion the demo makes, as a flat list of descriptions."""
 
     fails: List[str] = []
+    members = members or {}
+    gpus    = gpus or {}
 
     fails += check_campaign_done(campaign)
     fails += check_workflows(campaign, expected, stages)
-    fails += check_placement(places, software, requirements, min_resources)
+    fails += check_placement(places, software, requirements, min_resources,
+                             members=members, gpus=gpus,
+                             min_members=min_members)
+    fails += check_gpu_spread(places, members, gpus, min_gpu_members)
     fails += check_accuracy(results, metric_stage, expected, sweep_key)
 
     return fails

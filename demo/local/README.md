@@ -17,24 +17,47 @@ machines is the *same code* with different `atomic-join` arguments — see
 ## What comes up
 
 One broker hosting three plugins (`task_dispatcher`, `federation`,
-`atomic_campaign`) plus three endpoints joined as federated resources:
+`atomic_campaign`) plus three endpoints joined as federated resources —
+**five members in two capability class pools**:
 
-| resource  | mode         | site    | cores/gpus | software        | node-hours |
-|-----------|--------------|---------|-----------:|-----------------|-----------:|
-| `local_a` | `allocation` | Rutgers | 4 / 0      | lammps          | derived    |
-| `local_b` | `allocation` | NERSC   | 4 / 1      | lammps, pytorch | derived    |
-| `local_c` | `login`      | PSC     | 2 / 0      | pytorch         | 2          |
+| pool      | member            | site    | size        | software        | node-hours |
+|-----------|-------------------|---------|-------------|-----------------|-----------:|
+| `fed-cpu` | `local_a.default` | Rutgers | 1 × 4c      | lammps          | derived    |
+| `fed-cpu` | `local_b.cpu`     | NERSC   | 1 × 2c      | lammps, pytorch | 2          |
+| `fed-cpu` | `local_c.cpu`     | PSC     | 1 × 2c      | pytorch         | 2          |
+| `fed-gpu` | `local_b.gpu`     | NERSC   | 1 × 1c + 1g | pytorch         | 1          |
+| `fed-gpu` | `local_c.gpu`     | PSC     | 1 × 1c + 1g | pytorch         | 1          |
 
-The declared software is what makes the demo interesting: `local_a` can
-only run the `md` stage, `local_c` can only run `train`, `local_b` can run
-both. The federation therefore *has* to spread a campaign over at least
-two resources — and the smoke test asserts exactly that.
+A dispatcher pool is a **capability class**, not a site: a resource
+declares one *member* per shape of pilot it is willing to run, and each
+member joins the pool for its class. `local_a` joins in `allocation`
+mode and therefore has exactly one implicit member; `local_b` and
+`local_c` join in `login` mode with two members each
+(`atomic-join --member NAME:key=value,…`, see `docs/join.md`).
+
+**The routing story.** `md` requires lammps and no GPU, so it goes to
+`fed-cpu` and can only land on `local_a.default` or `local_b.cpu` —
+`local_c.cpu` has no lammps. `train` requires pytorch and one GPU, so it
+goes to `fed-gpu`, whose two members sit at two different "sites". The
+**dispatcher**, not the federation, decides which of them each task gets:
+the federation picks a *class*, the dispatcher picks the member.
+
+The two GPU members declare one core and `max_pilots=1`, so each of them
+runs one `train` task at a time. With three sweep points the class pool
+therefore has to use both — which is what `smoke.py --min-gpu-members`
+asserts, and what would silently not happen if `fed-gpu` had a single
+member.
+
+The "GPU" is fake (psij `local`, rhapsody backend `concurrent`) and
+nothing reserves it: a declared GPU is a *routing* statement this round,
+not an exclusivity guarantee. Only the declaration matters for placement.
 
 `allocation` mode means "this endpoint is the resource": the whole
 allocation is one pool with one pilot, started at join time. `login` mode
-means "this endpoint sits on a login node": it declares a queue, an
-account, a pilot size and a node-hour budget, and pilots are submitted on
-demand (locally through psij's `local` executor).
+means "this endpoint sits on a login node": each member declares a queue,
+an account, a pilot size and a node-hour budget, and pilots are submitted
+on demand (locally through psij's `local` executor) when work arrives —
+so only `local_a` has a pilot before the campaign starts.
 
 ## What you should see
 
@@ -46,7 +69,7 @@ demand (locally through psij's `local` executor).
 [00:12:32] broker  : up (pid 41234), GET /endpoints answers 200
 [00:12:33] join    : local_a (log: demo/local/run/join-local_a.log)
 …
-[00:13:02] wait    : 3 resources federated, pilots up on local_a, local_b
+[00:13:02] wait    : 3 resources federated, pilots up on local_a
 [00:13:02] Explorer : https://127.0.0.1:8010/
 ```
 
@@ -59,32 +82,42 @@ runs, the campaign filling in live.
 table plus the accuracies:
 
 ```
-workflow  temperature  stage  state  resource  task
---------  -----------  -----  -----  --------  -------------------------
-wf-000    300          md     DONE   local_a   cmp-b6b15c84-wf-000-md
-wf-000    300          train  DONE   local_c   cmp-b6b15c84-wf-000-train
+workflow  temperature  stage  state  resource  member   pool     task
+--------  -----------  -----  -----  --------  -------  -------  ----------------------
+wf-000    300          md     DONE   local_a   default  fed-cpu  cmp-b6b15c84-wf-000-md
+wf-000    300          train  DONE   local_c   gpu      fed-gpu  cmp-b6b15c84-wf-000-train
+wf-001    600          train  DONE   local_b   gpu      fed-gpu  cmp-b6b15c84-wf-001-train
 …
 [01:19:31] accuracy : temperature=300    wf-000  final_accuracy=0.965761
 [01:19:31] accuracy : temperature=600    wf-001  final_accuracy=0.907226
 [01:19:31] accuracy : temperature=900    wf-002  final_accuracy=0.828262
-[01:19:31] OK       : campaign cmp-b6b15c84, 3 workflows, 6 stages, 2 resources, 24s
+[01:19:31] OK       : campaign cmp-b6b15c84, 3 workflows, 6 stages, 3 resources, 4 members, 24s
 ```
 
-Measured on this laptop: `up.sh` ~14 s including both pip installs, pilots
-live before the first readiness poll, campaign wall time ~24 s, `down.sh`
-~3 s. The accuracies are deterministic — the same three numbers come back
-on every run, because the workload seeds itself from its own parameters.
+Measured on this laptop before the class-pool change: `up.sh` ~14 s
+including both pip installs, campaign wall time ~24 s, `down.sh` ~3 s.
+Five members mean up to five pilots on one laptop and the GPU members
+serialise the three `train` tasks two at a time, so the campaign now
+takes longer — watch that number.  The accuracies are deterministic —
+the same three numbers come back on every run, because the workload seeds
+itself from its own parameters.
 
 It asserts, and exits 1 naming the assertion if any of it is untrue:
 
 1. the campaign reached `DONE`,
 2. three workflows, all `DONE`, every stage `DONE` and placed,
-3. every stage ran on a resource advertising the software it requires
-   (`md` → `lammps`, `train` → `pytorch`),
-4. at least two distinct resources were used,
-5. `final_accuracy` strictly decreases with temperature (the fake trainer
+3. every stage ran in the pool of its class (`md` → `fed-cpu`,
+   `train` → `fed-gpu`) on a member advertising the software it requires
+   (`md` → `lammps`, `train` → `pytorch`) and, for `train`, declaring a
+   GPU,
+4. at least two distinct resources and two distinct members were used
+   (`--min-resources`, `--min-members`),
+5. the three `train` stages spread over at least two GPU members
+   (`--min-gpu-members`, default 2) — one member taking all of them means
+   the class pool did not balance,
+6. `final_accuracy` strictly decreases with temperature (the fake trainer
    guarantees this, so a violation means results were mixed up),
-6. the central store holds all six JSON outputs and a `manifest.json` per
+7. the central store holds all six JSON outputs and a `manifest.json` per
    stage.
 
 Budget: the whole smoke run should stay under five minutes.
@@ -129,7 +162,10 @@ up.sh   --skip-install   skip the two pip installs (fast iteration)
 smoke.py --timeout SEC   campaign budget (default 600)
          --sweep K=V,V   parameter sweep (default temperature=300,600,900)
          --spec FILE     workflow spec (default examples/workflow_vacancy.json)
-         --min-resources N  distinct resources required (default 2)
+         --min-resources N     distinct resources required (default 2)
+         --min-members N       distinct members required (default 2)
+         --min-gpu-members N   GPU members the GPU stages must spread
+                               over (default 2; 1 disables the check)
          --no-store-check   skip the store assertions (broker on another host)
 
 down.sh --all-endpoints  kill every radical-orbit-endpoint process, not
@@ -180,7 +216,9 @@ reach for `verify=False`.
 
 **Resources never report `pilots_active >= 1`.** A pilot needs 60–90 s to
 warm up on a cold broker; `up.sh` budgets 90 s. Beyond that, look for the
-pilot's own endpoint (`fed-<name>_<pid>`) in the endpoint log and in
+pilot's own endpoint (`fed-<class>_<resource>.<member>_<pid>`, or
+`fed-<name>_<pid>` for a pool that is not a class pool) in the endpoint
+log and in
 `pgrep -af radical-orbit`. Never time out on *pilot* state in your own
 scripts — only on task state.
 
@@ -222,18 +260,25 @@ cores=…,gpus=…,mem_gb=…` only to override what is detected, and
 
 **Bridges-2 (or any second site), from the login node** — pilots are
 submitted on demand, so the queue, account, pilot size and budget are
-declared:
+declared, one `--member` per shape of pilot the site should run:
 
 ```bash
 atomic-join --broker https://<broker>:8010 --name bridges_login \
             --mode login --site PSC --kind hpc \
-            --queue RM --account <account> \
-            --nodes 1 --cpus 128 --walltime 3600 --node-hours 20 \
-            --software lammps \
+            --member cpu:queue=RM,account=<acct>,nodes=1,cpus=128,\
+walltime=3600,node_hours=20,software=lammps,site=PSC \
+            --member gpu:queue=GPU,account=<acct>,nodes=1,cpus=64,gpus=8,\
+walltime=3600,node_hours=8,software=pytorch,site=PSC \
             --scratch $PROJECT/atomic-demo/bridges --detach
 ```
 
-**radical.3 (the workstation)** — same shape as `local_a`/`local_b`:
+The `cpu` member joins `fed-cpu`, the `gpu` member joins `fed-gpu`
+alongside every other site's GPU member — that is the whole point of the
+class pools. The flat `--queue/--nodes/--cpus/…` flags still describe a
+single-member resource and cannot be combined with `--member`.
+
+**radical.3 (the workstation)** — same shape as `local_a` (allocation
+mode, one implicit member):
 
 ```bash
 atomic-join --broker https://<broker>:8010 --name radical3 \
@@ -256,6 +301,9 @@ Two known gaps for a cross-host run, both recorded in the plans:
   joins only work if the broker host can reach that batch system; on
   Tuesday the broker sits on a machine without Slurm, so prefer
   `allocation` mode for the remote sites,
-- input staging for stage *k+1* writes on the broker host, which assumes a
-  shared filesystem; output collection already goes through the pilot's
-  own `staging` plugin first, so results come back either way.
+- inputs for stage *k+1* now travel **in the submit body** (`inputs_b64`)
+  and the dispatcher places them wherever the task lands, so they no
+  longer assume a shared filesystem — but base64 in a JSON body is ~1.33×
+  the file size, which is right for the demo's few-KB JSON and wrong for
+  a multi-MB restart file; output collection goes through the pilot's own
+  `staging` plugin first, so results come back either way.

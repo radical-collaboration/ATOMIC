@@ -449,6 +449,273 @@ def test_store_without_campaign_dir(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# capability class pools: members, pools and the GPU spread
+# ---------------------------------------------------------------------------
+#
+# The federation demo/local builds: three resources, five members, two
+# class pools -- `md` (lammps, no GPU) can only run on local_a.default or
+# local_b.cpu, `train` (pytorch, 1 GPU) only in fed-gpu, whose two members
+# sit at two "sites".
+
+GPU_SPEC = {
+    'name': 'vacancy-classifier',
+    'params': {'temperature': 300},
+    'stages': [
+        {'name': 'md', 'type': 'simulation', 'cmd': ['atomic-fake-md'],
+         'requirements': {'cores': 2, 'software': ['lammps']},
+         'inputs': [], 'outputs': ['md.json']},
+        {'name': 'train', 'type': 'ml_training',
+         'cmd': ['atomic-fake-train'],
+         'requirements': {'cores': 1, 'gpus': 1, 'software': ['pytorch']},
+         'inputs': ['md.json'], 'outputs': ['model.json']},
+    ],
+}
+
+
+def _mem(name, resource, cls, cpus, gpus, software, site):
+
+    return {'member'       : name,
+            'member_id'    : '%s.%s' % (resource, name),
+            'class'        : cls,
+            'pool_name'    : 'fed-%s' % cls,
+            'nodes'        : 1,
+            'cpus_per_node': cpus,
+            'gpus_per_node': gpus,
+            'software'     : list(software),
+            'attributes'   : {'site': site},
+            'usage'        : {'pilots_active': 0},
+            'liveness'     : 'ok'}
+
+
+MEMBER_RESOURCES = [
+    {'name': 'local_a', 'mode': 'allocation', 'site': 'Rutgers',
+     'capabilities': {'cores': 4, 'gpus': 0, 'software': ['lammps']},
+     'usage': {'pilots_active': 1},
+     'members': [_mem('default', 'local_a', 'cpu', 4, 0, ['lammps'],
+                      'Rutgers')]},
+    {'name': 'local_b', 'mode': 'login', 'site': 'NERSC',
+     'capabilities': {'cores': 3, 'gpus': 1,
+                      'software': ['lammps', 'pytorch']},
+     'usage': {'pilots_active': 0},
+     'members': [_mem('cpu', 'local_b', 'cpu', 2, 0, ['lammps', 'pytorch'],
+                      'NERSC'),
+                 _mem('gpu', 'local_b', 'gpu', 1, 1, ['pytorch'], 'NERSC')]},
+    {'name': 'local_c', 'mode': 'login', 'site': 'PSC',
+     'capabilities': {'cores': 3, 'gpus': 1, 'software': ['pytorch']},
+     'usage': {'pilots_active': 0},
+     'members': [_mem('cpu', 'local_c', 'cpu', 2, 0, ['pytorch'], 'PSC'),
+                 _mem('gpu', 'local_c', 'gpu', 1, 1, ['pytorch'], 'PSC')]},
+]
+
+# where the three train tasks landed, workflow by workflow
+TRAIN_PLACEMENT = [('local_b', 'gpu'), ('local_c', 'gpu'),
+                   ('local_b', 'gpu')]
+
+
+def _class_campaign(md=('local_a', 'default'), train=None,
+                    md_pool='fed-cpu', train_pool='fed-gpu'):
+    """A campaign whose stages carry the placement the polls reported."""
+
+    train = train or TRAIN_PLACEMENT
+    workflows = []
+
+    for idx, temp in enumerate(TEMPS):
+        t_res, t_mem = train[idx]
+        workflows.append({
+            'id': 'wf-%d' % idx,
+            'params': {'temperature': temp},
+            'state': 'DONE',
+            'stages': [
+                {'name': 'md', 'state': 'DONE', 'resource': md[0],
+                 'member': md[1], 'cls': 'cpu', 'pool': md_pool,
+                 'task_id': 'c1-wf-%d-md' % idx, 'exit_code': 0},
+                {'name': 'train', 'state': 'DONE', 'resource': t_res,
+                 'member': t_mem, 'cls': 'gpu', 'pool': train_pool,
+                 'task_id': 'c1-wf-%d-train' % idx, 'exit_code': 0},
+            ],
+        })
+
+    return {'campaign_id': 'c1', 'state': 'DONE', 'workflows': workflows}
+
+
+def _check(campaign, **kw):
+
+    return smoke.check_placement(
+        smoke.placements_of(campaign),
+        smoke.software_by_resource(MEMBER_RESOURCES),
+        smoke.stage_requirements(GPU_SPEC),
+        members=smoke.members_by_id(MEMBER_RESOURCES),
+        gpus=smoke.stage_gpus(GPU_SPEC), **kw)
+
+
+def test_members_by_id_keys_on_the_member_id():
+
+    members = smoke.members_by_id(MEMBER_RESOURCES)
+
+    assert sorted(members) == ['local_a.default', 'local_b.cpu',
+                               'local_b.gpu', 'local_c.cpu', 'local_c.gpu']
+    assert members['local_b.gpu']['resource'] == 'local_b'
+    assert members['local_c.gpu']['site']     == 'PSC'
+    assert smoke.gpus_of_member(members['local_b.gpu']) == 1
+    assert smoke.gpus_of_member(members['local_b.cpu']) == 0
+    # a federation without members yields nothing rather than guessing
+    assert smoke.members_by_id(RESOURCES) == {}
+
+
+def test_stage_gpus_and_the_expected_pool():
+
+    assert smoke.stage_gpus(GPU_SPEC) == {'md': 0, 'train': 1}
+    assert smoke.expected_pool(0) == 'fed-cpu'
+    assert smoke.expected_pool(1) == 'fed-gpu'
+    assert smoke.expected_class(1) == 'gpu'
+
+
+def test_a_healthy_class_pool_run_passes_every_check():
+
+    campaign = _class_campaign()
+    members  = smoke.members_by_id(MEMBER_RESOURCES)
+    gpus     = smoke.stage_gpus(GPU_SPEC)
+
+    assert _check(campaign) == []
+    assert smoke.check_gpu_spread(smoke.placements_of(campaign),
+                                  members, gpus) == []
+
+
+def test_a_stage_in_the_wrong_pool_is_caught():
+
+    campaign = _class_campaign(train_pool='fed-cpu')
+    fails    = _check(campaign)
+
+    assert len(fails) == 3
+    assert all("ran in pool 'fed-cpu', expected 'fed-gpu'" in f
+               for f in fails)
+
+
+def test_a_gpu_stage_on_a_member_without_a_gpu_is_caught():
+
+    campaign = _class_campaign(train=[('local_b', 'cpu')] * 3)
+    fails    = _check(campaign)
+
+    # the member has pytorch but declares no GPU
+    assert any("ran on member 'local_b.cpu', which declares no GPU" in f
+               for f in fails)
+
+
+def test_the_software_check_is_made_against_the_member():
+
+    # local_c's aggregate capabilities do NOT list lammps either, but the
+    # point is that the *member* is what is checked -- local_c.cpu has
+    # pytorch only, so md must not land there
+    campaign = _class_campaign(md=('local_c', 'cpu'))
+    fails    = _check(campaign)
+
+    assert any("'local_c.cpu'" in f and 'lammps' in f for f in fails)
+
+
+def test_a_member_the_federation_does_not_list_is_caught():
+
+    campaign = _class_campaign(md=('local_b', 'surprise'))
+    fails    = _check(campaign)
+
+    assert any('does not list' in f for f in fails)
+
+
+def test_too_few_members_is_caught():
+
+    # everything on local_b: two members, but three were asked for
+    campaign = _class_campaign(md=('local_b', 'cpu'),
+                               train=[('local_b', 'gpu')] * 3)
+    fails    = _check(campaign, min_resources=1, min_members=3)
+
+    assert len(fails) == 1
+    assert 'member(s)' in fails[0] and 'at least 3' in fails[0]
+    assert 'local_b.cpu, local_b.gpu' in fails[0]
+
+
+def test_gpu_work_on_a_single_member_is_caught():
+
+    campaign = _class_campaign(train=[('local_b', 'gpu')] * 3)
+    fails    = smoke.check_gpu_spread(smoke.placements_of(campaign),
+                                      smoke.members_by_id(MEMBER_RESOURCES),
+                                      smoke.stage_gpus(GPU_SPEC))
+
+    assert len(fails) == 1
+    assert 'the 3 train stage(s) used 1 GPU member(s)' in fails[0]
+    assert 'did not spread across sites' in fails[0]
+
+
+def test_the_gpu_spread_check_can_be_switched_off():
+
+    campaign = _class_campaign(train=[('local_b', 'gpu')] * 3)
+    places   = smoke.placements_of(campaign)
+    members  = smoke.members_by_id(MEMBER_RESOURCES)
+
+    assert smoke.check_gpu_spread(places, members,
+                                  smoke.stage_gpus(GPU_SPEC),
+                                  min_gpu_members=1) == []
+
+
+def test_the_gpu_spread_check_is_skipped_without_a_member_view():
+
+    campaign = _class_campaign()
+
+    assert smoke.check_gpu_spread(smoke.placements_of(campaign), {},
+                                  smoke.stage_gpus(GPU_SPEC)) == []
+
+
+def test_an_old_federation_still_passes_the_resource_level_checks():
+
+    # no members reported anywhere: the software check falls back to the
+    # resource and the pool/GPU assertions are skipped rather than failing
+    campaign = _campaign(md_on='local_a', train_on='local_c')
+
+    assert smoke.check_placement(smoke.placements_of(campaign),
+                                 smoke.software_by_resource(RESOURCES),
+                                 smoke.stage_requirements(SPEC),
+                                 members={},
+                                 gpus=smoke.stage_gpus(SPEC)) == []
+
+
+def test_gather_failures_runs_the_class_pool_checks(tmp_path):
+
+    campaign = _class_campaign(train=[('local_b', 'gpu')] * 3)
+    fails    = smoke.gather_failures(
+        campaign=campaign, results=_results(),
+        places=smoke.placements_of(campaign),
+        software=smoke.software_by_resource(MEMBER_RESOURCES),
+        requirements=smoke.stage_requirements(GPU_SPEC),
+        stages=['md', 'train'], metric_stage='train', expected=3,
+        sweep_key='temperature', min_resources=2,
+        members=smoke.members_by_id(MEMBER_RESOURCES),
+        gpus=smoke.stage_gpus(GPU_SPEC))
+
+    assert any('GPU member(s)' in f for f in fails)
+
+
+def test_the_placement_table_names_the_member_and_the_pool():
+
+    text = smoke.render_placements(smoke.placements_of(_class_campaign()))
+
+    assert 'member' in text.splitlines()[0]
+    assert 'fed-gpu' in text
+    assert 'local_c' in text
+
+
+def test_the_shipped_spec_routes_train_to_the_gpu_pool():
+
+    # examples/workflow_vacancy.json is what the demo submits: `train`
+    # must ask for a GPU, or the class-pool story is untested
+    spec = smoke.load_spec(smoke.DEFAULT_SPEC)
+    gpus = smoke.stage_gpus(spec)
+
+    assert gpus['train'] >= 1
+    assert gpus['md'] == 0
+    assert smoke.expected_pool(gpus['train']) == 'fed-gpu'
+    # ... and one core, so it fits the demo's one-core GPU members
+    assert spec['stages'][1]['requirements']['cores'] == 1
+
+
+# ---------------------------------------------------------------------------
 # rendering + argument parsing
 # ---------------------------------------------------------------------------
 
@@ -458,7 +725,7 @@ def test_placement_table_lines_up():
     lines = text.splitlines()
 
     assert lines[0].split() == ['workflow', 'temperature', 'stage', 'state',
-                                'resource', 'task']
+                                'resource', 'member', 'pool', 'task']
     assert len(lines) == 8                       # header + rule + 6 stages
     assert 'local_a' in lines[2]
 
@@ -471,6 +738,8 @@ def test_argument_defaults():
     assert args.sweep == smoke.DEFAULT_SWEEP
     assert args.timeout == 600.0
     assert args.min_resources == 2
+    assert args.min_members == 2
+    assert args.min_gpu_members == 2
     assert args.broker is None
 
 
@@ -484,6 +753,11 @@ def test_arguments_can_be_overridden():
     assert args.timeout == 30.0
     assert args.min_resources == 3
     assert args.no_store_check is True
+
+    args = smoke.build_parser().parse_args(['--min-gpu-members', '1',
+                                            '--min-members', '5'])
+    assert args.min_gpu_members == 1
+    assert args.min_members == 5
 
 
 # ---------------------------------------------------------------------------

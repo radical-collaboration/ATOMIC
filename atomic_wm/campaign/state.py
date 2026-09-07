@@ -108,8 +108,15 @@ class StageRun:
 
     # filled in as the stage progresses
     task_id:         Optional[str]  = None
+    # Placement.  The submit response can only name an *advisory* resource
+    # -- the dispatcher picks the member of the class pool when it actually
+    # dispatches -- so these are overwritten by what the polls report, and
+    # any of them may legitimately be None while a task waits.
     resource:        Optional[str]  = None
-    pool:            Optional[str]  = None
+    member:          Optional[str]  = None   # short name within `resource`
+    member_id:       Optional[str]  = None   # '<resource>.<member>'
+    cls:             Optional[str]  = None   # capability class, 'cpu'/'gpu'
+    pool:            Optional[str]  = None   # 'fed-<class>'
     dispatcher_sid:  Optional[str]  = None
     child_endpoint:  Optional[str]  = None
     cwd:             Optional[str]  = None
@@ -141,6 +148,8 @@ class StageRun:
         return {'name'    : self.name,
                 'state'   : self.state,
                 'resource': self.resource,
+                'member'  : self.member,
+                'cls'     : self.cls,
                 'task_id' : self.task_id,
                 'reason'  : self.reason,
                 'error'   : self.reason}

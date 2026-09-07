@@ -8,6 +8,7 @@ fallback order is exercised for real.
 """
 
 import asyncio
+import base64
 import json
 
 from pathlib import Path
@@ -20,7 +21,7 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationUnavailable, StageRunner,
                                         TaskNotFound, MAX_POLL_FAILURES,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS,
-                                        REASON_STOPPED)
+                                        REASON_STAGE_IN, REASON_STOPPED)
 from atomic_wm.campaign.state   import (Campaign, load_campaigns,
                                         save_campaigns)
 from atomic_wm.campaign.store   import ResultStore
@@ -67,8 +68,6 @@ class FakeFederation(FederationAPI):
         self.unavailable = unavailable
 
         self.submits    = []                  # [(task, requirements)]
-        self.stage_ins  = []                  # [(sid, pool, task, name, data)]
-        self.puts       = []                  # [(endpoint, path, len)]
         self.cancels    = []                  # [(sid, task_id)]
         self.polls      = {}                  # task_id -> n polls
 
@@ -106,6 +105,11 @@ class FakeFederation(FederationAPI):
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
 
+        # the dispatcher spools `inputs_b64` and places it with the task;
+        # here that means writing it into the task's working directory
+        for name, blob in (task.get('inputs_b64') or {}).items():
+            (cwd / name).write_bytes(base64.b64decode(blob))
+
         # publish this stage's outputs through the configured channel
         for name, data in (plan.get('outputs') or {}).items():
             channel = plan.get('channel', 'stage_out')
@@ -117,10 +121,15 @@ class FakeFederation(FederationAPI):
             elif channel == 'local':
                 (cwd / name).write_bytes(data)
 
+        # the submit answer names an ADVISORY resource and no member:
+        # the class pool binds one only when it dispatches
         return {'task': dict(task, cwd=str(cwd), state='QUEUED'),
                 'resource': plan.get('resource', 'res-a'),
-                'pool': plan.get('pool', 'fed-a'),
-                'dispatcher_sid': plan.get('dispatcher_sid', 'sid-a')}
+                'member': plan.get('submit_member'),
+                'class': plan.get('cls', 'cpu'),
+                'pool': plan.get('pool', 'fed-cpu'),
+                'dispatcher_sid': plan.get('dispatcher_sid', 'sid-a'),
+                'members_eligible': plan.get('members_eligible', [])}
 
     async def task(self, task_id):
         if self.unavailable:
@@ -135,7 +144,8 @@ class FakeFederation(FederationAPI):
         polls = plan.get('polls') or [{'state': 'DONE', 'exit_code': 0}]
         entry = dict(polls[min(n, len(polls) - 1)])
         entry.setdefault('cwd', self._cwd.get(task_id))
-        entry.setdefault('resource', plan.get('resource', 'res-a'))
+        if 'resource' not in entry and 'member_id' not in entry:
+            entry['resource'] = plan.get('resource', 'res-a')
         if entry.get('state') in ('DONE', 'FAILED', 'CANCELED'):
             self.in_flight = max(0, self.in_flight - 1)
         return entry
@@ -143,23 +153,11 @@ class FakeFederation(FederationAPI):
     async def resources(self):
         return [{'name': 'res-a'}, {'name': 'res-b'}]
 
-    async def stage_in(self, dispatcher_sid, pool, task_id, filename, data):
-        self.stage_ins.append((dispatcher_sid, pool, task_id, filename, data))
-        cwd = Path(self._cwd.get(task_id, self.root / task_id))
-        cwd.mkdir(parents=True, exist_ok=True)
-        (cwd / filename).write_bytes(data)
-        return {'cwd': str(cwd), 'size': len(data)}
-
     async def stage_out(self, dispatcher_sid, task_id, filename):
         return self._scratch.get((task_id, filename))
 
     async def staging_get(self, endpoint, path):
         return self._pilot.get((endpoint, path))
-
-    async def staging_put(self, endpoint, path, data):
-        self.puts.append((endpoint, path, len(data)))
-        self._pilot[(endpoint, path)] = data
-        return True
 
     async def cancel_task(self, dispatcher_sid, task_id):
         self.cancels.append((dispatcher_sid, task_id))
@@ -209,8 +207,11 @@ class TestHappyPath:
         assert (base / 'train' / 'model.json').is_file()
         assert (base / 'md' / 'manifest.json').is_file()
 
-    def test_outputs_of_stage_k_are_staged_into_stage_k_plus_1(self,
-                                                               tmp_path):
+    def test_outputs_of_stage_k_ride_in_the_submit_of_stage_k_plus_1(
+            self, tmp_path):
+        # inputs travel WITH the submit: with a class pool nobody knows
+        # where the task will run until the dispatcher places it, so
+        # there is no directory to stage into beforehand
         payload = _envelope('simulation', 7)
         fed = FakeFederation(tmp_path, plans={
             'md'   : {'outputs': {'md.json': payload}},
@@ -218,11 +219,14 @@ class TestHappyPath:
         camp = _campaign(tmp_path)
         _run(fed, camp, _store(tmp_path))
 
-        assert len(fed.stage_ins) == 1
-        sid, pool, task_id, name, data = fed.stage_ins[0]
-        assert (sid, pool, name) == ('sid-a', 'fed-a', 'md.json')
-        assert task_id == 'cmp-test-wf-000-train'
-        assert data    == payload
+        md_task, train_task = [t for t, _ in fed.submits]
+        assert 'inputs_b64' not in md_task            # md declares no input
+        assert set(train_task['inputs_b64']) == {'md.json'}
+        assert base64.b64decode(train_task['inputs_b64']['md.json']) == payload
+        assert train_task['inputs'] == ['md.json']
+        # and the runner never names a working directory itself
+        assert 'cwd' not in md_task and 'cwd' not in train_task
+        assert not hasattr(fed, 'stage_ins')
 
     def test_manifest_records_provenance(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
@@ -315,6 +319,7 @@ class TestCollectionFallback:
     def test_child_endpoint_is_derived_from_pool_and_pilot_id(self, tmp_path):
         plan = {'outputs': {'md.json': _envelope('simulation', 1)},
                 'channel': 'pilot', 'child_endpoint': 'fed-a_p7',
+                'pool'   : 'fed-a',
                 'polls'  : [{'state': 'DONE', 'exit_code': 0,
                              'pilot_id': 'p7'}]}
         fed   = FakeFederation(tmp_path, plans={'md': plan})
@@ -326,52 +331,118 @@ class TestCollectionFallback:
 
 
 # ---------------------------------------------------------------------------
-class TestInputPush:
+class TestClassPoolPlacement:
+    """Placement is what the POLL says, never what the submit said."""
 
-    def test_inputs_are_pushed_to_the_pilot_best_effort(self, tmp_path):
+    def test_the_poll_overwrites_the_advisory_resource(self, tmp_path):
+        # submit answers an advisory 'res-a' and no member; the dispatcher
+        # then places the task on res-b's gpu member
         fed = FakeFederation(tmp_path, plans={
-            'md'   : {'outputs': {'md.json': _envelope('simulation', 1)}},
-            'train': {'outputs': {'model.json': _envelope('ml_training', 2)},
-                      'polls': [{'state': 'RUNNING',
-                                 'child_endpoint': 'fed-a_p1'},
-                                {'state': 'DONE', 'exit_code': 0,
-                                 'child_endpoint': 'fed-a_p1'}]}})
-        camp = _campaign(tmp_path)
-        _run(fed, camp, _store(tmp_path), push_inputs=True)
-
-        assert len(fed.puts) == 1
-        endpoint, path, size = fed.puts[0]
-        assert endpoint == 'fed-a_p1'
-        assert path.endswith('cmp-test-wf-000-train/md.json')
-        assert size > 0
-
-    def test_a_failing_push_does_not_fail_the_stage(self, tmp_path):
-        fed = FakeFederation(tmp_path, plans={
-            'md'   : {'outputs': {'md.json': _envelope('simulation', 1)}},
-            'train': {'outputs': {'model.json': _envelope('ml_training', 2)},
-                      'polls': [{'state': 'DONE', 'exit_code': 0,
-                                 'child_endpoint': 'fed-a_p1'}]}})
-
-        async def _boom(endpoint, path, data):
-            raise RuntimeError('no route to pilot')
-        fed.staging_put = _boom                        # type: ignore[method-assign]
-
-        camp = _campaign(tmp_path)
-        _run(fed, camp, _store(tmp_path), push_inputs=True)
-        assert camp.state == 'DONE'
-
-    def test_pushing_inputs_is_off_by_default(self, tmp_path):
-        # the put overwrites: on a shared filesystem it would rewrite the
-        # very file the running task is reading
-        fed = FakeFederation(tmp_path, plans={
-            'md'   : {'outputs': {'md.json': _envelope('simulation', 1)}},
-            'train': {'outputs': {'model.json': _envelope('ml_training', 2)},
-                      'polls': [{'state': 'DONE', 'exit_code': 0,
-                                 'child_endpoint': 'fed-a_p1'}]}})
-        camp = _campaign(tmp_path)
+            'md': {'outputs': {'md.json': b'{}'},
+                   'resource': 'res-a', 'pool': 'fed-gpu', 'cls': 'gpu',
+                   'polls': [{'state': 'RUNNING', 'member_id': 'res-b.gpu'},
+                             {'state': 'DONE', 'exit_code': 0,
+                              'member_id': 'res-b.gpu'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
         _run(fed, camp, _store(tmp_path))
-        assert camp.state == 'DONE'
-        assert fed.puts == []
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.state     == 'DONE'
+        assert stage.resource  == 'res-b'
+        assert stage.member    == 'gpu'
+        assert stage.member_id == 'res-b.gpu'
+        assert stage.cls       == 'gpu'
+        assert stage.pool      == 'fed-gpu'
+
+    def test_a_member_id_splits_on_the_last_dot(self, tmp_path):
+        # a resource name may carry dots, a member short name may not
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'DONE', 'exit_code': 0,
+                              'member_id': 'site.a.res.gpu'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+
+        stage = camp.workflows[0].stages[0]
+        assert (stage.resource, stage.member) == ('site.a.res', 'gpu')
+
+    def test_a_null_resource_does_not_fail_or_wipe_the_placement(self,
+                                                                 tmp_path):
+        # a task queued in a class pool -- or one whose resource left the
+        # federation -- legitimately reports resource: null
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'QUEUED', 'resource': None},
+                             {'state': 'RUNNING', 'member_id': 'res-b.cpu'},
+                             {'state': 'QUEUED', 'resource': None,
+                              'member_id': None},
+                             {'state': 'DONE', 'exit_code': 0,
+                              'resource': None}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.state    == 'DONE'
+        assert stage.resource == 'res-b'          # the last poll that knew
+        assert stage.member   == 'cpu'
+
+    def test_the_child_endpoint_fallback_carries_the_member(self, tmp_path):
+        # the dispatcher names a class pool's pilot
+        # '<pool>_<member_id>_<pid>'; this only matters when the task dict
+        # reports no child_endpoint (the pilot finished between two polls)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'}, 'pool': 'fed-gpu',
+                   'polls': [{'state': 'DONE', 'exit_code': 0,
+                              'member_id': 'res-b.gpu',
+                              'pilot_id': 'p.abc123'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.child_endpoint == 'fed-gpu_res-b.gpu_p.abc123'
+
+    def test_without_a_member_the_fallback_stays_two_part(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'}, 'pool': 'fed-a',
+                   'polls': [{'state': 'DONE', 'exit_code': 0,
+                              'pilot_id': 'p.abc123'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+
+        assert camp.workflows[0].stages[0].child_endpoint == 'fed-a_p.abc123'
+
+    def test_the_manifest_records_the_member_and_class(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'pool': 'fed-gpu', 'cls': 'gpu',
+                   'polls': [{'state': 'DONE', 'exit_code': 0,
+                              'member_id': 'res-b.gpu'}]}})
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+        _run(fed, camp, store)
+
+        man = json.loads((store.root / 'cmp-test' / 'wf-000' / 'md'
+                          / 'manifest.json').read_text())
+        assert man['resource']  == 'res-b'
+        assert man['member']    == 'gpu'
+        assert man['member_id'] == 'res-b.gpu'
+        assert man['class']     == 'gpu'
+
+    def test_the_input_manifest_says_the_inputs_came_with_the_submit(
+            self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md'   : {'outputs': {'md.json': _envelope('simulation', 1)}},
+            'train': {'outputs': {'model.json': _envelope('ml_training', 2)}}})
+        camp  = _campaign(tmp_path)
+        store = _store(tmp_path)
+        _run(fed, camp, store)
+
+        man = json.loads((store.root / 'cmp-test' / 'wf-000' / 'train'
+                          / 'manifest.json').read_text())
+        assert man['inputs_staged'] == [{'name': 'md.json', 'via': 'submit',
+                                         'size': man['inputs_staged'][0]
+                                                    ['size']}]
+        assert man['inputs_staged'][0]['size'] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +601,13 @@ class TestFailures:
         _run(fed, camp, _store(tmp_path))
         train = camp.workflows[0].stages[1]
         assert train.state == 'FAILED'
-        assert 'not produced' in (train.reason or '')
+        # the on-screen phrase is the fixed one; what actually happened
+        # goes to `detail`
+        assert train.reason == REASON_STAGE_IN
+        assert 'not produced' in (train.detail or '')
+        # the task was never submitted -- the input is read before that
+        assert [t['task_id'] for t, _ in fed.submits] == \
+               ['cmp-test-wf-000-md']
 
 
 # ---------------------------------------------------------------------------

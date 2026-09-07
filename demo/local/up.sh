@@ -10,9 +10,10 @@
 #      dir is backed up and cleared (down.sh restores it),
 #   3. start the broker (background, log + pidfile) and wait for
 #      GET /endpoints,
-#   4. join three local resources with `atomic-join --detach`,
-#   5. wait until all three are federated and the two allocation-mode ones
-#      report a live pilot, then print the Explorer URL and the table.
+#   4. join three local resources (five members in two capability class
+#      pools) with `atomic-join --detach`,
+#   5. wait until all three are federated and the allocation-mode one
+#      reports a live pilot, then print the Explorer URL and the table.
 #
 # Then:  ve3/bin/python demo/local/smoke.py  and  demo/local/down.sh
 #

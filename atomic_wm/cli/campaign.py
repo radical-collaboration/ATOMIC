@@ -93,10 +93,22 @@ def _params_label(params: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 def _stage_cell(stage: Dict[str, Any]) -> str:
+    """``md:DONE@local_b/cpu`` -- the placement the last poll reported.
+
+    A capability class pool binds a member only when it dispatches, so a
+    stage may legitimately carry no resource at all (queued, or its
+    resource left the federation) -- then only name and state are shown.
+    """
+
     state = str(stage.get('state') or '?')
     res   = stage.get('resource')
+    mem   = stage.get('member')
     label = '%s:%s' % (stage.get('name') or '?', state)
-    return '%s@%s' % (label, res) if res else label
+
+    if not res:
+        return label
+
+    return '%s@%s%s' % (label, res, '/%s' % mem if mem else '')
 
 
 # ---------------------------------------------------------------------------

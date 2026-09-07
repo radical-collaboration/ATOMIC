@@ -19,7 +19,7 @@ resource is worse than a noisy teardown.
 import argparse
 import sys
 
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from .. import endpoint_proc
 from ..client import Client, ClientError, add_connection_args
@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_connection_args(parser)
 
     parser.add_argument('name', help='resource name, as given to atomic-join')
+    parser.add_argument('--cancel-tasks', action='store_true',
+                        help='also cancel this resource\'s tasks which have '
+                             'not finished.  Off by default: a capability '
+                             'class pool has other members, so a queued '
+                             'task can still run elsewhere -- ask for this '
+                             'only when the whole federation goes down')
     parser.add_argument('--keep-endpoint', action='store_true',
                         help='leave the federation but keep the endpoint '
                              'process (and its pilots) running')
@@ -74,8 +80,9 @@ def leave_federation(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        client.fed_leave(args.name)
-        info('left the federation: %s' % args.name)
+        report_left(args.name, client.fed_leave(
+                                   args.name,
+                                   cancel_tasks=args.cancel_tasks))
         return 0
 
     except ClientError as e:
@@ -90,6 +97,30 @@ def leave_federation(args: argparse.Namespace) -> int:
             warn("the broker does not host the 'federation' plugin")
 
         return 1
+
+
+def report_left(name: str, result: Any) -> None:
+    """Say what leaving did -- members removed, tasks re-queued or failed.
+
+    Removing a member re-queues the tasks it was running; the class pool's
+    other members pick them up, and a task no remaining member can satisfy
+    is failed by the dispatcher.  Both numbers matter to whoever is
+    watching a demo teardown.
+    """
+
+    info('left the federation: %s' % name)
+
+    if not isinstance(result, dict):
+        return
+
+    bits = [('%s member(s) removed', result.get('members_removed')),
+            ('%s task(s) re-queued', result.get('tasks_requeued')),
+            ('%s task(s) failed',    result.get('tasks_failed'))]
+    text = ', '.join(label % value for label, value in bits
+                     if isinstance(value, int) and value)
+
+    if text:
+        info('  %s' % text)
 
 
 def endpoint_pid(args: argparse.Namespace) -> Optional[int]:

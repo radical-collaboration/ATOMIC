@@ -1036,6 +1036,233 @@ def test_pidfile_tolerates_a_plain_pid(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# --member: the class-pool member grammar
+# ---------------------------------------------------------------------------
+
+def test_parse_member_maps_the_known_keys():
+
+    member = join.parse_member(
+        'gpu:queue=GPU,account=abc123,nodes=2,cpus=64,gpus=8,walltime=3600,'
+        'min_pilots=1,max_pilots=3,node_hours=8,class=gpu,backend=concurrent,'
+        'shared_fs=false')
+
+    assert member['member']           == 'gpu'
+    assert member['queue']            == 'GPU'
+    assert member['account']          == 'abc123'
+    assert member['nodes']            == 2
+    assert member['cpus_per_node']    == 64
+    assert member['gpus_per_node']    == 8
+    assert member['walltime_sec']     == 3600
+    assert member['min_pilots']       == 1
+    assert member['max_pilots']       == 3
+    assert member['budget']           == {'node_hours': 8.0}
+    assert member['class']            == 'gpu'
+    assert member['rhapsody_backend'] == 'concurrent'
+    assert member['shared_fs']        is False
+
+
+def test_parse_member_software_is_always_a_list():
+
+    # the record shape must not depend on how many tags were typed: a
+    # fragment without '=' continues the previous key
+    one  = join.parse_member('cpu:queue=RM,software=lammps')
+    many = join.parse_member('cpu:queue=RM,software=lammps,pytorch,vasp')
+
+    assert one['software']  == ['lammps']
+    assert many['software'] == ['lammps', 'pytorch', 'vasp']
+    # ... and a scalar key after a list is a key of its own again
+    assert join.parse_member('cpu:software=a,b,site=NERSC') == {
+        'member': 'cpu', 'software': ['a', 'b'],
+        'attributes': {'site': 'NERSC'}}
+
+
+def test_parse_member_unknown_keys_become_attributes():
+
+    member = join.parse_member('cpu:queue=RM,site=NERSC,mem_gb_per_node=256,'
+                               'tier=1.5,zones=a,b')
+
+    assert member['attributes'] == {'site': 'NERSC', 'mem_gb_per_node': 256,
+                                    'tier': 1.5, 'zones': ['a', 'b']}
+    assert 'site' not in member
+
+
+def test_parse_member_rejects_a_leading_fragment_without_equals():
+
+    with pytest.raises(join.UsageError) as exc:
+        join.parse_member('local_b:a,b')
+
+    # the exact message the plan asks for -- a dropped token would be worse
+    assert "'a' is not key=value" in str(exc.value)
+
+
+@pytest.mark.parametrize('spec', [
+    'cpu',                      # no ':' at all
+    'cpu:',                     # nothing after it
+    'CPU:queue=RM',             # upper case
+    'c.pu:queue=RM',            # a dot -- that is the member id separator
+    '_cpu:queue=RM',            # leading underscore
+    ':queue=RM',                # no name
+    'cpu:queue=RM,queue=GPU',   # the same key twice
+    'cpu:queue=RM,nodes=many',  # not a number
+    'cpu:queue=RM,nodes=0',     # not positive
+    'cpu:queue=RM,node_hours=0',
+    'cpu:queue=RM,shared_fs=maybe',
+    'cpu:queue=RM,class=GPU',   # never lower-cased for you
+    'cpu:queue=RM,queue2=a,b,walltime=x',
+    'cpu:nodes=1,nodes2=,=oops',
+])
+def test_parse_member_rejects_junk(spec):
+
+    with pytest.raises(join.UsageError):
+        join.parse_member(spec)
+
+
+def test_parse_member_rejects_a_scalar_key_given_a_list():
+
+    with pytest.raises(join.UsageError) as exc:
+        join.parse_member('cpu:queue=RM,GPU')
+
+    assert 'queue' in str(exc.value)
+
+
+def test_members_must_be_uniquely_named():
+
+    with pytest.raises(join.UsageError):
+        join.parse_members(['cpu:queue=RM', 'cpu:queue=GPU'])
+
+
+MEMBER_CPU = ('cpu:queue=local,nodes=1,cpus=2,walltime=1800,node_hours=2,'
+              'software=lammps,pytorch,site=NERSC')
+MEMBER_GPU = ('gpu:queue=local,nodes=1,cpus=1,gpus=1,walltime=1800,'
+              'node_hours=1,max_pilots=1,software=pytorch,site=NERSC')
+
+
+def _member_args(*extra):
+
+    return parsed(['--broker', 'https://x', '--name', 'local_b',
+                   '--mode', 'login', '--site', 'NERSC', '--kind', 'hpc',
+                   '--member', MEMBER_CPU, '--member', MEMBER_GPU] +
+                  list(extra))
+
+
+def test_member_and_the_flat_login_flags_are_mutually_exclusive():
+
+    with pytest.raises(join.UsageError) as exc:
+        _member_args('--queue', 'RM')
+
+    assert '--queue' in str(exc.value)
+    assert 'mutually exclusive' in str(exc.value)
+
+
+def test_member_is_rejected_in_allocation_mode():
+
+    with pytest.raises(join.UsageError) as exc:
+        parsed(['--broker', 'https://x', '--name', 'a', '--mode',
+                'allocation', '--member', MEMBER_CPU])
+
+    assert '--member' in str(exc.value)
+
+
+@pytest.mark.parametrize('spec,missing', [
+    ('cpu:nodes=1,cpus=2,walltime=60,node_hours=1',      'queue'),
+    ('cpu:queue=local,cpus=2,walltime=60,node_hours=1',  'nodes'),
+    ('cpu:queue=local,nodes=1,walltime=60,node_hours=1', 'cpus'),
+    ('cpu:queue=local,nodes=1,cpus=2,node_hours=1',      'walltime'),
+    ('cpu:queue=local,nodes=1,cpus=2,walltime=60',       'node_hours'),
+])
+def test_a_member_must_describe_its_pilots(spec, missing):
+
+    with pytest.raises(join.UsageError) as exc:
+        parsed(['--broker', 'https://x', '--name', 'a', '--mode', 'login',
+                '--member', spec])
+
+    assert missing in str(exc.value)
+
+
+def test_a_member_queue_must_not_be_the_dispatcher_sentinel():
+
+    with pytest.raises(join.UsageError):
+        parsed(['--broker', 'https://x', '--name', 'a', '--mode', 'login',
+                '--member', 'cpu:queue=default,nodes=1,cpus=2,walltime=60,'
+                            'node_hours=1'])
+
+
+def test_a_member_min_pilots_must_not_exceed_max_pilots():
+
+    with pytest.raises(join.UsageError):
+        parsed(['--broker', 'https://x', '--name', 'a', '--mode', 'login',
+                '--member', 'cpu:queue=local,nodes=1,cpus=2,walltime=60,'
+                            'node_hours=1,min_pilots=3,max_pilots=1'])
+
+
+def test_the_record_carries_the_members_and_no_flat_pool():
+
+    record = join.assemble_record(_member_args())
+
+    assert [m['member'] for m in record['members']] == ['cpu', 'gpu']
+    assert 'pool' not in record                  # the flat block is out
+    assert record['members'][1]['gpus_per_node'] == 1
+    assert record['members'][1]['attributes']    == {'site': 'NERSC'}
+    assert record['members'][0]['budget']        == {'node_hours': 2.0}
+
+
+def test_the_record_capabilities_are_the_member_aggregate():
+
+    record = join.assemble_record(_member_args())
+    caps   = record['capabilities']
+
+    # cores = sum(nodes x cpus_per_node), gpus likewise, software = union
+    assert caps['cores']    == 1 * 2 + 1 * 1
+    assert caps['gpus']     == 1
+    assert caps['software'] == ['lammps', 'pytorch']
+    # and the budget is the sum of the members' own budgets
+    assert record['budget'] == {'node_hours': 3.0}
+
+
+def test_an_explicit_node_hours_wins_over_the_member_sum():
+
+    record = join.assemble_record(_member_args('--node-hours', '9'))
+
+    assert record['budget'] == {'node_hours': 9.0}
+
+
+def test_declared_capabilities_still_win():
+
+    record = join.assemble_record(_member_args('--declare', 'cores=99'))
+
+    assert record['capabilities']['cores'] == 99
+
+
+def test_joined_members_are_echoed_back(capsys):
+
+    args   = _member_args()
+    record = join.assemble_record(args)
+
+    join._report_joined('local_b', record, dict(record, members=[
+        dict(record['members'][0], member_id='local_b.cpu',
+             pool_name='fed-cpu', **{'class': 'cpu'})]))
+
+    out = capsys.readouterr().out
+    assert 'members' in out
+    assert 'cpu [fed-cpu]' in out
+    assert '1x2c' in out
+    assert 'software=lammps,pytorch' in out
+
+
+def test_pilot_pids_matches_a_class_pool_pilot():
+
+    # a class pool names its pilots '<pool>_<member_id>_<pid>'
+    procs = [(20, 'radical-orbit-endpoint --name fed-gpu_local_a.gpu_'
+                  'p.a1b2c3d4e5 --plugins default'),
+             (21, 'radical-orbit-endpoint --name fed-cpu_local.cpu_'
+                  'p.a1b2c3d4e5 --plugins default')]
+
+    assert endpoint_proc.pilot_pids('local_a', procs) == [20]
+    assert endpoint_proc.pilot_pids('local',   procs) == [21]
+    assert endpoint_proc.pilot_pids('local_a.gpu', procs) == []
+
+
+# ---------------------------------------------------------------------------
 # atomic-resources
 # ---------------------------------------------------------------------------
 
@@ -1062,7 +1289,7 @@ def test_resources_table(broker, capsys):
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert 'NAME' in out and 'NODE-H' in out and 'LIVENESS' in out
+    assert 'RESOURCE' in out and 'NODE-H' in out and 'LIVENESS' in out
     assert 'local_a' in out
     assert '1.25/2.75' in out                    # node-hours used/remaining
     assert '3/12' in out                         # tasks running/done

@@ -1,11 +1,18 @@
 """Executor seam: run workflow instances through the federation.
 
-``StageRunner`` drives ONE stage: submit the task through the federation,
-stage the previous stage's outputs into its working directory, poll the task
+``StageRunner`` drives ONE stage: submit the task through the federation
+**with the previous stage's outputs in the submit body**, poll the task
 until it is terminal, collect the declared outputs immediately, write a
 manifest.  ``CampaignRunner`` drives a whole campaign: stages sequentially
 within a workflow, workflows concurrently (bounded by a semaphore), with
 failure isolated to the workflow it happened in.
+
+Placement is what the **poll** says.  A federation pool is a capability
+class (``fed-cpu``, ``fed-gpu``) with several members, and the member --
+i.e. the actual resource -- is only chosen when the task is dispatched.
+The submit response therefore names an advisory resource, and every poll
+may correct it; ``resource: null`` is a legitimate answer for a task that
+is not placed (yet, or any more) and never fails a stage.
 
 Everything the runner needs from the outside world is behind
 :class:`FederationAPI` -- the plugin implements it with in-process calls to
@@ -16,6 +23,7 @@ pilot's ``staging`` plugin; the tests implement it with a scripted fake.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -113,23 +121,26 @@ class FederationAPI:
 
     async def submit(self, task: Dict[str, Any],
                      requirements: Dict[str, Any]) -> Dict[str, Any]:
-        """``POST federation/submit/default`` -> ``{task, resource, pool,
-        dispatcher_sid}``.  Raises :class:`FederationUnavailable`."""
+        """``POST federation/submit/default`` -> ``{task, pool, class,
+        dispatcher_sid, resource, member, members_eligible}``.
+
+        The task body carries this stage's inputs as ``inputs_b64``; it
+        never carries a ``cwd`` -- the dispatcher assigns one when it
+        places the task.  ``resource`` in the response is **advisory** and
+        ``member`` is ``None`` until dispatch.  Raises
+        :class:`FederationUnavailable`.
+        """
         raise NotImplementedError
 
     async def task(self, task_id: str) -> Dict[str, Any]:
         """``GET federation/task/default/<task_id>`` -> dispatcher task dict
-        plus ``resource`` (and ``child_endpoint`` while the pilot lives)."""
+        plus ``resource`` / ``member`` / ``member_id`` (and
+        ``child_endpoint`` while the pilot lives).  ``resource`` may be
+        ``None`` for a task which is not placed."""
         raise NotImplementedError
 
     async def resources(self) -> List[Dict[str, Any]]:
         """``GET federation/resources/default`` -> the resource records."""
-        raise NotImplementedError
-
-    async def stage_in(self, dispatcher_sid: str, pool: str, task_id: str,
-                       filename: str, data: bytes) -> Dict[str, Any]:
-        """Dispatcher ``stage_in`` -- writes into the task scratch dir on the
-        broker host.  Returns ``{'cwd', 'size'}``."""
         raise NotImplementedError
 
     async def stage_out(self, dispatcher_sid: str, task_id: str,
@@ -141,11 +152,6 @@ class FederationAPI:
     async def staging_get(self, endpoint: str,
                           path: str) -> Optional[bytes]:
         """Pilot-side ``staging get`` (no shared filesystem needed)."""
-        raise NotImplementedError
-
-    async def staging_put(self, endpoint: str, path: str,
-                          data: bytes) -> bool:
-        """Pilot-side ``staging put``; best effort, returns success."""
         raise NotImplementedError
 
     async def cancel_task(self, dispatcher_sid: str, task_id: str) -> bool:
@@ -162,7 +168,6 @@ class StageRunner:
                  poll_max_interval: float = 3.0,
                  stage_timeout:     float = 900.0,
                  tool_prefix:       Optional[str] = None,
-                 push_inputs:       bool = False,
                  on_change:         Optional[Callable[[], None]] = None,
                  sleep:             Callable[[float], Any] = asyncio.sleep,
                  clock:             Callable[[], float] = time.time) -> None:
@@ -174,7 +179,6 @@ class StageRunner:
         self._timeout      = float(stage_timeout)
         self._tool_prefix  = tool_prefix if tool_prefix is not None \
                              else os.environ.get(_TOOL_PREFIX_ENV)
-        self._push         = bool(push_inputs)
         self._on_change    = on_change
         self._sleep        = sleep
         self._clock        = clock
@@ -316,34 +320,50 @@ class StageRunner:
     async def _run_stage(self, campaign: Campaign, wf: WorkflowInstance,
                          stage: StageRun, produced: Dict[str, bytes],
                          cancel: Optional[asyncio.Event]) -> None:
-        """Submit, stage in, poll, collect, manifest.  Raises on failure."""
+        """Submit (inputs included), poll, collect, manifest.
+
+        The inputs ride **in** the submit body: with capability class pools
+        nobody knows where the task will run until the dispatcher places
+        it, so there is no directory to stage into beforehand.  Raises on
+        failure.
+        """
 
         cid          = campaign.campaign_id
         stage.task_id = '%s-%s-%s' % (cid, wf.id, stage.name)
-        stage.state   = SUBMITTED
+        stage.state   = STAGING if stage.inputs else SUBMITTED
         stage.submitted_at = self._clock()
         self._changed()
 
+        inputs = self._encode_inputs(stage, produced)
+
         task = {'task_id' : stage.task_id,
                 'cmd'     : self.resolve_cmd(stage.cmd),
-                'inputs'  : [],
+                'inputs'  : list(stage.inputs),
                 'outputs' : list(stage.declared_outputs),
                 'priority': 0}
+        # deliberately no `cwd`: the dispatcher assigns one when it places
+        # the task, and reports it back on the first poll
+        if inputs:
+            task['inputs_b64'] = inputs
 
+        stage.state = SUBMITTED
         resp = await self._fed.submit(task, dict(stage.requirements))
         self._record_submit(stage, resp)
         self._changed()
 
-        pushed = await self._stage_inputs(stage, produced)
-
         try:
-            task_dict = await self._poll_task(stage, cancel, produced)
+            task_dict = await self._poll_task(stage, cancel)
         finally:
             self._changed()
 
         # collect FIRST -- the pilot may vanish moments after the task ends
         collected = await self._collect(campaign, wf, stage)
-        extra = {'inputs_staged': pushed} if pushed else None
+        extra: Optional[Dict[str, Any]] = None
+        if inputs:
+            extra = {'inputs_staged':
+                     [{'name': name, 'via': 'submit',
+                       'size': len(produced.get(name) or b'')}
+                      for name in stage.inputs]}
         self._finish_stage(stage, task_dict)
         try:
             self._store.write_manifest(
@@ -371,11 +391,19 @@ class StageRunner:
     # ----------------------------------------------------------------------
     @staticmethod
     def _record_submit(stage: StageRun, resp: Dict[str, Any]) -> None:
-        """Copy the federation submit response onto the stage record."""
+        """Copy the federation submit response onto the stage record.
+
+        ``resource`` is **advisory** here -- the class pool has several
+        members and the binding choice is made at dispatch -- so it is
+        recorded to have something on screen straight away and overwritten
+        by the first poll that names a member.
+        """
 
         resp = resp or {}
         task = resp.get('task') or {}
         stage.resource       = resp.get('resource')
+        stage.member         = resp.get('member')
+        stage.cls            = resp.get('class')
         stage.pool           = resp.get('pool')
         stage.dispatcher_sid = resp.get('dispatcher_sid')
         if task.get('cwd'):
@@ -384,86 +412,41 @@ class StageRunner:
             stage.task_id = task['task_id']
 
     # ----------------------------------------------------------------------
-    async def _stage_inputs(self, stage: StageRun,
-                            produced: Dict[str, bytes]) -> List[Dict[str, Any]]:
-        """Stage this stage's inputs into the task working directory.
+    def _encode_inputs(self, stage: StageRun,
+                       produced: Dict[str, bytes]) -> Dict[str, str]:
+        """This stage's inputs, base64 encoded, for the submit body.
 
-        Path: the dispatcher's ``stage_in`` (broker host, shared filesystem).
-        A cross-host pilot additionally gets a best-effort ``put`` through its
-        own staging plugin once its child endpoint is known (see
-        :meth:`_push_inputs`).
+        The dispatcher spools them and places them wherever the task lands
+        (there is exactly one path, executed before the task exists,
+        instead of two racing ones executed after it does).  Failing to
+        *read* an input is a stage failure with the same on-screen text a
+        failed stage-in had; failing to *place* it is the dispatcher's and
+        surfaces as a task failure.
         """
 
-        if not stage.inputs:
-            return []
+        out: Dict[str, str] = {}
 
-        stage.state = STAGING
-        self._changed()
-        staged: List[Dict[str, Any]] = []
         for name in stage.inputs:
             data = produced.get(name)
             if data is None:
                 stage.state  = FAILED
-                stage.reason = ('input %r was not produced by an earlier '
+                stage.reason = REASON_STAGE_IN
+                stage.detail = ('input %r was not produced by an earlier '
                                 'stage' % name)
                 raise StageFailed(stage.reason)
             try:
-                res = await self._fed.stage_in(
-                    stage.dispatcher_sid or '', stage.pool or '',
-                    stage.task_id or '', name, data)
-            except FederationCallError as exc:
-                stage.state  = FAILED
-                stage.reason = exc.reason
-                stage.detail = exc.detail or None
-                raise StageFailed(stage.reason) from exc
-            except Exception as exc:                          # noqa: BLE001
+                out[name] = base64.b64encode(data).decode('ascii')
+            except (TypeError, ValueError) as exc:
                 stage.state  = FAILED
                 stage.reason = REASON_STAGE_IN
                 stage.detail = 'input %r: %s' % (name, exc)
                 raise StageFailed(stage.reason) from exc
-            if isinstance(res, dict) and res.get('cwd'):
-                stage.cwd = res['cwd']
-            staged.append({'name': name, 'via': 'dispatcher_stage_in',
-                           'size': len(data)})
 
-        stage.state = SUBMITTED
-        self._changed()
-        return staged
-
-    # ----------------------------------------------------------------------
-    async def _push_inputs(self, stage: StageRun,
-                           produced: Dict[str, bytes]) -> None:
-        """Best-effort ``put`` of the inputs onto the resource running the task.
-
-        Only useful when the two hosts do NOT share a filesystem -- there the
-        dispatcher's ``stage_in`` wrote the file on the wrong host.  It is
-        OFF by default (``push_inputs``): the put uses ``overwrite=True``, so
-        on a shared filesystem it would rewrite the very file the running
-        task is reading.  Failures are logged and ignored.
-        """
-
-        if not self._push:
-            return
-        if not stage.inputs or not stage.child_endpoint or not stage.cwd:
-            return
-        for name in stage.inputs:
-            data = produced.get(name)
-            if data is None:
-                continue
-            try:
-                ok = await self._fed.staging_put(
-                    stage.child_endpoint, str(Path(stage.cwd) / name), data)
-            except Exception as exc:                          # noqa: BLE001
-                log.info('[atomic_campaign] input push %s -> %s failed: %s',
-                         name, stage.child_endpoint, exc)
-                continue
-            log.info('[atomic_campaign] input push %s -> %s: %s',
-                     name, stage.child_endpoint, 'ok' if ok else 'skipped')
+        return out
 
     # ----------------------------------------------------------------------
     async def _poll_task(self, stage: StageRun,
-                         cancel: Optional[asyncio.Event],
-                         produced: Dict[str, bytes]) -> Dict[str, Any]:
+                         cancel: Optional[asyncio.Event]) -> Dict[str, Any]:
         """Poll until the task is terminal; 1 s, backing off to 3 s.
 
         The timeout is counted on the TASK state only -- a pilot that takes a
@@ -473,7 +456,6 @@ class StageRunner:
         deadline = self._clock() + self._timeout
         interval = self._poll
         task_dict: Dict[str, Any] = {}
-        pushed   = False
         failures = 0
 
         while True:
@@ -489,9 +471,6 @@ class StageRunner:
             task_dict, failures = await self._poll_once(stage, failures)
 
             self._observe(stage, task_dict)
-            if not pushed and stage.child_endpoint:
-                pushed = True
-                await self._push_inputs(stage, produced)
 
             state = str(task_dict.get('state') or '')
             if state in TASK_TERMINAL:
@@ -538,13 +517,29 @@ class StageRunner:
 
     # ----------------------------------------------------------------------
     def _observe(self, stage: StageRun, task_dict: Dict[str, Any]) -> None:
-        """Fold one task-dict poll into the stage record."""
+        """Fold one task-dict poll into the stage record.
+
+        This is where placement comes from: the class pool's member is
+        chosen at dispatch, so the poll -- not the submit -- says where the
+        stage runs.  A poll that names no resource leaves the last known
+        placement alone: an unplaced task is not a failed one.
+        """
 
         state = str(task_dict.get('state') or '')
+
+        self._observe_placement(stage, task_dict)
+
         child = task_dict.get('child_endpoint')
         if not child and task_dict.get('pilot_id') and stage.pool:
-            # the dispatcher names a pilot's child endpoint '<pool>_<pid>'
-            child = '%s_%s' % (stage.pool, task_dict['pilot_id'])
+            # the dispatcher names a pilot's child endpoint
+            # '<pool>_<pid>', and '<pool>_<member_id>_<pid>' in a class
+            # pool -- this is the fallback for a pilot that finished
+            # between two polls, the reported field is the primary path
+            if stage.member_id:
+                child = '%s_%s_%s' % (stage.pool, stage.member_id,
+                                      task_dict['pilot_id'])
+            else:
+                child = '%s_%s' % (stage.pool, task_dict['pilot_id'])
         if child and child != stage.child_endpoint:
             stage.child_endpoint = child
             self._changed()
@@ -554,6 +549,42 @@ class StageRunner:
             stage.state = RUNNING
             if stage.started_at is None:
                 stage.started_at = self._clock()
+            self._changed()
+
+    # ----------------------------------------------------------------------
+    def _observe_placement(self, stage: StageRun,
+                           task_dict: Dict[str, Any]) -> None:
+        """Take resource / member / class off one poll.
+
+        ``member_id`` is authoritative: it is ``'<resource>.<member>'`` and
+        the resource name may itself contain dots, so it splits on the
+        **last** one.  Anything the poll does not name is left as it was --
+        ``resource: null`` happens for a task that has not been dispatched
+        (or whose resource left the federation) and must not wipe a
+        placement we already knew.
+        """
+
+        changed = False
+        mid     = task_dict.get('member_id')
+
+        resource = task_dict.get('resource')
+        member   = task_dict.get('member')
+
+        if mid:
+            split_res, _, split_mem = str(mid).rpartition('.')
+            resource = resource or split_res or None
+            member   = member   or split_mem or None
+            if mid != stage.member_id:
+                stage.member_id = str(mid)
+                changed = True
+
+        for attr, value in (('resource', resource), ('member', member),
+                            ('cls', task_dict.get('class'))):
+            if value and value != getattr(stage, attr):
+                setattr(stage, attr, value)
+                changed = True
+
+        if changed:
             self._changed()
 
     # ----------------------------------------------------------------------

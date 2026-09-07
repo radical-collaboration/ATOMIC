@@ -21,8 +21,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
 from atomic_wm.campaign.runner  import (FederationCallError, TaskNotFound,
-                                        REASON_NO_RESOURCE, REASON_NO_STATUS,
-                                        REASON_STAGE_IN)
+                                        REASON_NO_RESOURCE, REASON_NO_STATUS)
 from atomic_wm.campaign.state   import REASON_INTERRUPTED
 from atomic_wm.plugins.campaign import PluginAtomicCampaign, _FederationAPI
 
@@ -339,18 +338,23 @@ class TestFederationAPICalls:
         assert asyncio.run(api.task('t1'))['state'] == 'DONE'
         assert host.calls[0][1] == '/federation/task/default/t1'
 
-    def test_stage_in_sends_pool_filename_and_content(self, tmp_path):
-        api, host = self._api(tmp_path, {
-            ('POST', '/task_dispatcher/stage_in/sid-a/t1'): {'cwd': '/tmp/x'}})
-        out = asyncio.run(api.stage_in('sid-a', 'fed-a', 't1', 'md.json',
-                                       b'hello'))
-        assert out['cwd'] == '/tmp/x'
-        body = json.loads(host.calls[0][2])
-        assert body['pool']        == 'fed-a'
-        assert body['filename']    == 'md.json'
-        assert body['overwrite']   is True
+    def test_the_submit_carries_the_inputs_and_no_dispatcher_staging(
+            self, tmp_path):
+        # inputs ride in the submit body; the dispatcher's stage_in route
+        # is not part of the campaign path any more
         import base64
-        assert base64.b64decode(body['content_b64']) == b'hello'
+        api, host = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                {'task': {'task_id': 't1'}, 'pool': 'fed-cpu'}})
+        task = {'task_id': 't1',
+                'inputs_b64': {'md.json': base64.b64encode(b'hi').decode()}}
+        asyncio.run(api.submit(task, {'cores': 2}))
+
+        assert not hasattr(api, 'stage_in')
+        assert [c[1] for c in host.calls] == ['/federation/submit/default']
+        body = json.loads(host.calls[0][2])
+        assert base64.b64decode(body['task']['inputs_b64']['md.json']) == b'hi'
+        assert 'cwd' not in body['task']
 
     def test_stage_out_decodes_content_b64(self, tmp_path):
         import base64
@@ -366,7 +370,8 @@ class TestFederationAPICalls:
     def test_staging_needs_a_broker_caller(self, tmp_path):
         api, _ = self._api(tmp_path, {})
         assert asyncio.run(api.staging_get('child', '/tmp/x')) is None
-        assert asyncio.run(api.staging_put('child', '/tmp/x', b'y')) is False
+        # the campaign never pushes any more -- only pulls results back
+        assert not hasattr(api, 'staging_put')
 
     def test_resources_unwraps_the_list(self, tmp_path):
         api, _ = self._api(tmp_path, {
@@ -424,14 +429,18 @@ class TestErrorMapping:
         assert not isinstance(exc.value, TaskNotFound)
         assert exc.value.reason == REASON_NO_STATUS
 
-    def test_stage_in_failure_is_mapped(self, tmp_path):
+    def test_400_no_member_satisfies_is_also_no_resource(self, tmp_path):
+        # the dispatcher answers 400 when no member of the class can
+        # satisfy the shape or the software; to somebody watching the demo
+        # that is the same thing as the federation's own 409
         api, _ = self._api(tmp_path, {
-            ('POST', '/task_dispatcher/stage_in/sid-a/t1'):
-                (404, {'detail': 'unknown pool: fed-a'})})
+            ('POST', '/federation/submit/default'):
+                (400, {'detail': 'no member satisfies task requirements: '
+                                 'software missing: lammps'})})
         with pytest.raises(FederationCallError) as exc:
-            asyncio.run(api.stage_in('sid-a', 'fed-a', 't1', 'md.json', b'x'))
-        assert exc.value.reason == REASON_STAGE_IN
-        assert 'pool' in exc.value.detail
+            asyncio.run(api.submit({'task_id': 't1'}, {'gpus': 1}))
+        assert exc.value.reason == REASON_NO_RESOURCE
+        assert 'software missing' in exc.value.detail
 
     def test_a_campaign_reason_never_carries_orbit_words(self, tmp_path):
         host = FakeHost(plugins={'federation': object()}, responses={
@@ -492,30 +501,6 @@ class TestStagingOverTheCaller:
         assert '/staging/get/st.1' in paths
         assert any(p.startswith('/staging/unregister_session') for p in paths)
 
-    def test_put_sends_the_file(self, tmp_path):
-        sent = {}
-
-        class _Caller:
-            def call_threadsafe(self, dst, method, path, *, body=b'',
-                                headers=None, timeout=None):
-                import concurrent.futures
-                fut = concurrent.futures.Future()
-                if '/staging/put/' in path:
-                    sent.update(json.loads(body))
-                payload = {'sid': 'st.1'} if path.endswith('register_session') \
-                          else {'path': sent.get('filename'), 'size': 3}
-                fut.set_result({'status': 200, 'headers': {},
-                                'body': json.dumps(payload).encode()})
-                return fut
-
-        api = self._api_with_caller(tmp_path, _Caller())
-        assert asyncio.run(api.staging_put('fed-a_p1', '/tmp/x/md.json',
-                                           b'abc')) is True
-        import base64
-        assert sent['filename'] == '/tmp/x/md.json'
-        assert base64.b64decode(sent['content']) == b'abc'
-        assert sent['overwrite'] is True
-
     def test_a_failing_caller_is_not_fatal(self, tmp_path):
         class _Caller:
             def call_threadsafe(self, *args, **kwargs):
@@ -523,7 +508,6 @@ class TestStagingOverTheCaller:
 
         api = self._api_with_caller(tmp_path, _Caller())
         assert asyncio.run(api.staging_get('fed-a_p1', '/tmp/x')) is None
-        assert asyncio.run(api.staging_put('fed-a_p1', '/tmp/x', b'y')) is False
 
 
 # ---------------------------------------------------------------------------

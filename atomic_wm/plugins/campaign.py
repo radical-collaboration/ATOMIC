@@ -43,7 +43,7 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationUnavailable, TaskNotFound,
                                         REASON_INCOMPLETE, REASON_NOT_STARTED,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS,
-                                        REASON_STAGE_IN, REASON_STOPPED)
+                                        REASON_STOPPED)
 from atomic_wm.campaign.state   import (Campaign, CANCELED, FAILED,
                                         STATE_FILE,
                                         TERMINAL_STATES, default_state_root,
@@ -166,8 +166,11 @@ class _FederationAPI(FederationAPI):
             '/%s/submit/%s' % (FEDERATION_PLUGIN, DEFAULT_SID),
             {'task': task, 'requirements': requirements})
         if status >= 400:
-            # 409 is the federation's "nothing satisfies these requirements"
-            reason = REASON_NO_RESOURCE if status == 409 \
+            # 409 is the federation's "no class has an eligible member";
+            # 400 is the dispatcher's "no member satisfies the task
+            # requirements" (shape or software) coming back through it --
+            # both mean the same thing to somebody watching the demo
+            reason = REASON_NO_RESOURCE if status in (400, 409) \
                      else REASON_NOT_STARTED
             raise FederationCallError(
                 reason, self._detail(data) or 'HTTP %d' % status)
@@ -193,22 +196,6 @@ class _FederationAPI(FederationAPI):
         if status >= 400:
             return []
         return list((data or {}).get('resources') or [])
-
-    async def stage_in(self, dispatcher_sid: str, pool: str, task_id: str,
-                       filename: str, data: bytes) -> Dict[str, Any]:
-
-        status, out = await self._call(
-            DISPATCHER_PLUGIN, 'POST',
-            '/%s/stage_in/%s/%s' % (DISPATCHER_PLUGIN, dispatcher_sid,
-                                    task_id),
-            {'pool'       : pool,
-             'filename'   : filename,
-             'content_b64': base64.b64encode(data).decode('ascii'),
-             'overwrite'  : True})
-        if status >= 400:
-            raise FederationCallError(
-                REASON_STAGE_IN, self._detail(out) or 'HTTP %d' % status)
-        return out if isinstance(out, dict) else {}
 
     async def stage_out(self, dispatcher_sid: str, task_id: str,
                         filename: str) -> Optional[bytes]:
@@ -276,33 +263,6 @@ class _FederationAPI(FederationAPI):
                      endpoint, path, exc)
             return None
 
-    async def staging_put(self, endpoint: str, path: str,
-                          data: bytes) -> bool:
-
-        if getattr(self._app.state, 'broker_caller', None) is None:
-            return False
-
-        def _work() -> bool:
-            client = self._staging_client(endpoint)
-            if client is None:
-                return False
-            try:
-                with tempfile.TemporaryDirectory() as tmp:
-                    src = os.path.join(tmp, os.path.basename(path))
-                    with open(src, 'wb') as fd:
-                        fd.write(data)
-                    client.put(src, path, overwrite=True)
-                return True
-            finally:
-                client.close()
-
-        try:
-            return await asyncio.to_thread(_work)
-        except Exception as exc:                              # noqa: BLE001
-            log.info('[atomic_campaign] staging put %s:%s failed: %s',
-                     endpoint, path, exc)
-            return False
-
 
 # --------------------------------------------------------------------------
 class PluginAtomicCampaign(Plugin):
@@ -340,8 +300,7 @@ class PluginAtomicCampaign(Plugin):
                  max_concurrent_workflows: int = 8,
                  stage_timeout_sec: float = 900.0,
                  poll_interval_sec: float = 1.0,
-                 poll_max_interval_sec: float = 3.0,
-                 push_inputs: bool = False) -> None:
+                 poll_max_interval_sec: float = 3.0) -> None:
 
         super().__init__(app, instance_name)
 
@@ -357,10 +316,6 @@ class PluginAtomicCampaign(Plugin):
         self._timeout    = float(stage_timeout_sec)
         self._poll       = float(poll_interval_sec)
         self._poll_max   = float(poll_max_interval_sec)
-        # pushing a stage's inputs to the resource that got the task is only
-        # right without a shared filesystem: the put overwrites, and on a
-        # shared filesystem it would rewrite the file the task is reading.
-        self._push       = bool(push_inputs)
 
         self._campaigns: Dict[str, Campaign]       = {}
         self._runners:   Dict[str, CampaignRunner] = {}
@@ -475,7 +430,6 @@ class PluginAtomicCampaign(Plugin):
             max_concurrent_workflows=int(max_wf),
             on_change=self._persist,
             stage_timeout=float(timeout),
-            push_inputs=self._push,
             poll_interval=self._poll, poll_max_interval=self._poll_max)
         self._runners[camp.campaign_id] = runner
         self._drivers[camp.campaign_id] = asyncio.create_task(

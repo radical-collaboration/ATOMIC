@@ -40,9 +40,11 @@ def _campaign(state='DONE'):
                 {'id': 'wf-000', 'params': {'temperature': 300},
                  'state': state,
                  'stages': [{'name': 'md', 'state': state,
-                             'resource': 'res-a', 'task_id': 't1'},
+                             'resource': 'res-a', 'member': 'cpu',
+                             'task_id': 't1'},
                             {'name': 'train', 'state': state,
-                             'resource': 'res-b', 'task_id': 't2'}]}]}
+                             'resource': 'res-b', 'member': None,
+                             'task_id': 't2'}]}]}
 
 
 def _results():
@@ -201,8 +203,21 @@ class TestStatus:
         out = capsys.readouterr().out
         assert 'WORKFLOW' in out and 'PARAMS' in out and 'STAGES' in out
         assert 'temperature=300' in out
-        assert 'md:DONE@res-a' in out
+        # the placement chip names the member once the class pool bound
+        # one, and just the resource before that
+        assert 'md:DONE@res-a/cpu' in out
         assert 'train:DONE@res-b' in out
+
+    def test_an_unplaced_stage_shows_no_resource(self, client, capsys):
+        # a task queued in a capability class pool has no member yet, and
+        # may have no resource either -- that is not an error
+        camp = _campaign('RUNNING')
+        camp['workflows'][0]['stages'][0].update(resource=None, member=None)
+        client.campaign.return_value = camp
+
+        cli.main(['--broker', 'https://x', 'status', 'cmp-1234'])
+        out = capsys.readouterr().out
+        assert 'md:RUNNING' in out and 'md:RUNNING@' not in out
 
     def test_status_json(self, client, capsys):
         client.campaign.return_value = _campaign('DONE')

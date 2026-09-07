@@ -2,6 +2,7 @@
 
 import pytest
 
+from atomic_wm import client
 from atomic_wm import client as _client
 from atomic_wm.client import Client, ClientError
 
@@ -285,6 +286,63 @@ def test_federation_routes_use_the_default_sid(broker):
     c.fed_leave('a')
     assert broker.calls[-1]['path'] == '/broker/federation/leave/default/a'
     assert broker.left == ['a']
+    # leaving a class pool cancels nothing unless it is asked to: another
+    # member can still run the tasks this resource queued
+    assert broker.calls[-1]['json'] == {'cancel_tasks': False}
+
+
+def test_leave_can_ask_for_the_tasks_to_be_cancelled(broker):
+
+    broker.resources.append({'name': 'b', 'pool_name': 'fed-cpu'})
+    make_client().fed_leave('b', cancel_tasks=True)
+
+    assert broker.calls[-1]['json'] == {'cancel_tasks': True}
+
+
+def test_members_of_returns_the_reported_members(broker):
+
+    record = {'name': 'local_b',
+              'members': [{'member': 'cpu', 'member_id': 'local_b.cpu'},
+                          {'member': 'gpu', 'member_id': 'local_b.gpu'}]}
+
+    assert [m['member_id'] for m in client.members_of(record)] \
+        == ['local_b.cpu', 'local_b.gpu']
+    assert not any(m.get('derived') for m in client.members_of(record))
+
+
+def test_members_of_derives_one_member_for_an_old_record():
+
+    # a broker that predates class pools reports no members at all; the
+    # single derived one keeps every reader working
+    record = {'name': 'local_a', 'mode': 'allocation',
+              'site': 'Rutgers', 'kind': 'workstation',
+              'pool_name': 'fed-local_a',
+              'capabilities': {'cores': 4, 'gpus': 0, 'mem_gb': 8.0,
+                               'software': ['lammps']},
+              'budget': {'node_hours': 4.0},
+              'usage': {'pilots_active': 1},
+              'liveness': 'ok'}
+
+    member, = client.members_of(record)
+
+    assert member['member']        == 'default'
+    assert member['member_id']     == 'local_a.default'
+    assert member['class']         == 'cpu'
+    assert member['software']      == ['lammps']
+    assert member['budget']        == {'node_hours': 4.0}
+    assert member['shared_fs']     is True
+    assert member['derived']       is True
+    assert member['attributes']['site']            == 'Rutgers'
+    assert member['attributes']['mem_gb_per_node'] == 8.0
+
+
+def test_split_member_id_splits_on_the_last_dot():
+
+    # a resource name may contain dots, a member short name may not
+    assert client.split_member_id('local_b.gpu')   == ('local_b', 'gpu')
+    assert client.split_member_id('a.b.c.gpu')     == ('a.b.c', 'gpu')
+    assert client.split_member_id('local_b')       == ('local_b', '')
+    assert client.member_id('a.b', 'gpu')          == 'a.b.gpu'
 
 
 def test_campaign_routes_use_the_default_sid(broker):

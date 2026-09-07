@@ -92,11 +92,16 @@ step_leave() {
         demo_log "leave   : $name"
 
         # atomic-leave talks to the broker, stops the endpoint child and
-        # kills pilots carrying this resource's pool prefix.  A broker
-        # that is already gone is not an error here -- the process
-        # teardown below still has to happen.
+        # kills the pilots of this resource's members.  A broker that is
+        # already gone is not an error here -- the process teardown below
+        # still has to happen.
+        #
+        # --cancel-tasks: leaving a class pool does NOT cancel the
+        # resource's queued tasks by default (another member could still
+        # run them).  This is a full teardown, so nothing should be left
+        # queued for a federation that is about to disappear.
         if ! timeout "$ATOMIC_DEMO_STOP_WAIT" \
-                 "$VE/bin/atomic-leave" "$name" \
+                 "$VE/bin/atomic-leave" "$name" --cancel-tasks \
                  >> "$RUN_DIR/leave.log" 2>&1; then
             demo_warn "atomic-leave $name reported a problem" \
                       "(see $RUN_DIR/leave.log)"

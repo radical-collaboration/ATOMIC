@@ -1,9 +1,15 @@
 """``atomic-resources`` -- list the resources in the ATOMIC federation.
 
-Reads ``GET /broker/federation/resources/default`` and renders one row per
-resource: what it is, what it offers, how much of its node-hour budget is
-gone, and what it is doing right now.  ``--json`` prints the records as
-they came from the broker (for scripts and the demo's own checks).
+Reads ``GET /broker/federation/resources/default`` and renders a two-level
+table: one row per resource, then one indented row per **member** -- one
+shape of pilot the resource is willing to run, each of which sits in the
+capability class pool for its class (``fed-cpu``, ``fed-gpu``).  The
+resource row is the aggregate of its members.  ``--json`` prints the
+records as they came from the broker (for scripts and the demo's own
+checks).
+
+A GPU in a member's size is what the operator **declared**, not a
+reservation: nothing pins a GPU to a task this round.
 
 Usage figures are refreshed by the federation on every call; when that
 refresh fails the record keeps its last values and is flagged
@@ -17,24 +23,26 @@ import sys
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from ..client import Client, ClientError, add_connection_args
+from ..client import Client, ClientError, add_connection_args, members_of
 
 TOOL = 'atomic-resources'
 
-# column header, and how wide it is at least
-COLUMNS = [('NAME',     'name'),
-           ('SITE',     'site'),
-           ('MODE',     'mode'),
-           ('CORES',    'cores'),
-           ('GPUS',     'gpus'),
-           ('MEM_GB',   'mem_gb'),
-           ('SOFTWARE', 'software'),
-           ('NODE-H',   'node_hours'),
-           ('PILOTS',   'pilots'),
-           ('TASKS',    'tasks'),
-           ('LIVENESS', 'liveness')]
+# column header, and the row key it renders
+COLUMNS = [('RESOURCE',   'resource'),
+           ('MEMBER',     'member'),
+           ('CLASS/POOL', 'class_pool'),
+           ('SITE',       'site'),
+           ('SIZE',       'size'),
+           ('SOFTWARE',   'software'),
+           ('NODE-H',     'node_hours'),
+           ('PILOTS',     'pilots'),
+           ('TASKS',      'tasks'),
+           ('LIVENESS',   'liveness')]
 
 DASH = '-'
+
+# what an indented member row is prefixed with
+BRANCH = '  └ '
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +85,12 @@ def _num(value: Any, digits: int = 1) -> str:
 
 
 def node_hours(record: Dict[str, Any]) -> str:
-    """``used/remaining`` node-hours of a resource.
+    """``used/remaining`` node-hours of a resource or of one member.
 
     ``remaining`` is what the federation reports; if it does not (yet)
-    report one we derive it from the declared budget.
+    report one we derive it from the declared budget.  Both record shapes
+    carry ``usage`` and ``budget`` under the same keys, so one function
+    serves the resource row and the member rows.
     """
 
     usage = record.get('usage') or {}
@@ -102,27 +112,108 @@ def node_hours(record: Dict[str, Any]) -> str:
     return text
 
 
-def row(record: Dict[str, Any]) -> Dict[str, str]:
-    """One table row from a resource record."""
+def size_of(member: Dict[str, Any]) -> str:
+    """``1x128c+4g`` -- one pilot of this member: nodes x cores (+ GPUs)."""
+
+    nodes = member.get('nodes')
+    cpus  = member.get('cpus_per_node')
+
+    if nodes is None and cpus is None:
+        return DASH
+
+    text = '%sx%sc' % (_num(nodes), _num(cpus))
+    gpus = member.get('gpus_per_node') or 0
+
+    if isinstance(gpus, (int, float)) and gpus:
+        text += '+%sg' % _num(gpus)
+
+    return text
+
+
+def class_pool(member: Dict[str, Any]) -> str:
+    """``gpu/fed-gpu`` -- the member's capability class and its pool."""
+
+    cls  = str(member.get('class') or member.get('cls') or '')
+    pool = str(member.get('pool_name') or '')
+
+    if cls and pool:
+        return '%s/%s' % (cls, pool)
+
+    return cls or pool or DASH
+
+
+def _tasks(usage: Dict[str, Any]) -> str:
+
+    return '%s/%s' % (_num(usage.get('tasks_running')),
+                      _num(usage.get('tasks_done')))
+
+
+def row(record: Dict[str, Any], members: Sequence[Dict[str, Any]]
+        ) -> Dict[str, str]:
+    """The aggregate row of one resource.
+
+    ``SIZE`` names the member count -- the sizes themselves differ per
+    member and are shown on the member rows below.  A resource whose
+    members had to be derived (a broker without class pools) has exactly
+    one, and shows its size here instead.
+    """
 
     caps  = record.get('capabilities') or {}
     usage = record.get('usage') or {}
     soft  = caps.get('software') or []
+    lone  = len(members) == 1 and members[0].get('derived')
 
     return {
-        'name'      : str(record.get('name', DASH)),
+        'resource'  : str(record.get('name', DASH)),
+        'member'    : '' if not lone else str(members[0].get('member') or ''),
+        'class_pool': '' if not lone else class_pool(members[0]),
         'site'      : str(record.get('site') or DASH),
-        'mode'      : str(record.get('mode') or DASH),
-        'cores'     : _num(caps.get('cores')),
-        'gpus'      : _num(caps.get('gpus')),
-        'mem_gb'    : _num(caps.get('mem_gb')),
+        'size'      : size_of(members[0]) if lone else
+                      '%d member%s' % (len(members),
+                                       '' if len(members) == 1 else 's'),
         'software'  : ','.join(str(s) for s in soft) if soft else DASH,
         'node_hours': node_hours(record),
         'pilots'    : _num(usage.get('pilots_active')),
-        'tasks'     : '%s/%s' % (_num(usage.get('tasks_running')),
-                                 _num(usage.get('tasks_done'))),
+        'tasks'     : _tasks(usage),
         'liveness'  : str(record.get('liveness') or DASH),
     }
+
+
+def member_row(record: Dict[str, Any],
+               member: Dict[str, Any]) -> Dict[str, str]:
+    """One indented row per member of a resource."""
+
+    usage = member.get('usage') or {}
+    attrs = member.get('attributes') or {}
+    soft  = member.get('software') or []
+    name  = str(member.get('member') or DASH)
+
+    return {
+        'resource'  : BRANCH + name,
+        'member'    : name,
+        'class_pool': class_pool(member),
+        'site'      : str(attrs.get('site') or record.get('site') or DASH),
+        'size'      : size_of(member),
+        'software'  : ','.join(str(s) for s in soft) if soft else DASH,
+        'node_hours': node_hours(member),
+        'pilots'    : _num(usage.get('pilots_active')),
+        'tasks'     : _tasks(usage),
+        'liveness'  : str(member.get('liveness') or record.get('liveness')
+                          or DASH),
+    }
+
+
+def rows_for(record: Dict[str, Any]) -> List[Dict[str, str]]:
+    """The rows one resource contributes: itself, then its members."""
+
+    members = members_of(record)
+    out     = [row(record, members)]
+
+    if len(members) == 1 and members[0].get('derived'):
+        # nothing was grouped -- the resource row IS the member row
+        return out
+
+    return out + [member_row(record, m) for m in members]
 
 
 def render(records: Sequence[Dict[str, Any]]) -> str:
@@ -132,7 +223,10 @@ def render(records: Sequence[Dict[str, Any]]) -> str:
         return ('no resources in the federation -- join one with '
                 '`atomic-join --name … --mode …`')
 
-    rows   = [row(r) for r in records]
+    rows: List[Dict[str, str]] = []
+    for record in records:
+        rows += rows_for(record)
+
     widths = {key: max([len(head)] + [len(r[key]) for r in rows])
               for head, key in COLUMNS}
 
@@ -143,6 +237,8 @@ def render(records: Sequence[Dict[str, Any]]) -> str:
                                for _, key in COLUMNS).rstrip())
 
     lines.append('')
+    lines.append('SIZE: nodes x cores/node (+GPUs/node, declared -- not '
+                 'reserved)')
     lines.append('NODE-H: used/remaining   TASKS: running/done')
 
     if any('*' in r['node_hours'] for r in rows):

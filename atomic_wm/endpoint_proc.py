@@ -481,6 +481,11 @@ def is_endpoint_cmdline(cmdline: str, endpoint: str) -> bool:
     return bool(_named_endpoint_re(endpoint).search(cmdline))
 
 
+# a capability class / member short name, as `atomic-join --member`
+# validates them: lowercase, no dots
+_NAME_PAT = r'[a-z0-9][a-z0-9_-]*'
+
+
 def pilot_pids(name: str,
                procs: Optional[Iterable[Tuple[int, str]]] = None
                ) -> List[int]:
@@ -488,19 +493,31 @@ def pilot_pids(name: str,
 
     psij's ``local`` executor cancels only the wrapper job, so a pilot's
     endpoint can outlive its pool.  A pilot is an orbit endpoint whose
-    ``--name`` is the dispatcher's child endpoint name for this
-    resource's pool: ``fed-<name>_p.<hex>`` (``plugin_task_dispatcher``
-    builds it as ``f'{pool}_{pid}'`` with ``pid = f'p.{uuid4().hex[:10]}'``).
-    Matching the whole argument matters: a plain prefix test would let
-    the resource ``local`` kill the pilots of ``local_a``.
+    ``--name`` is the dispatcher's child endpoint name, and there are two
+    shapes of those:
+
+    * ``fed-<name>_p.<hex>`` -- one pool per resource (``f'{pool}_{pid}'``);
+    * ``fed-<class>_<name>.<member>_p.<hex>`` -- a capability class pool,
+      where the pool is named after the class and the member id carries
+      the resource name (``f'{pool}_{member_id}_{pid}'``).
+
+    Both are matched, and the whole argument is: a plain prefix test would
+    let the resource ``local`` kill the pilots of ``local_a``.
     """
 
     if procs is None:
         procs = iter_processes()
 
-    mine    = os.getpid()
-    pattern = re.compile(r'(?:^|\s)(?:-n|--name)\s+%sp\.[0-9a-f]+(?:\s|$)'
-                         % re.escape(pool_prefix(name)))
+    mine = os.getpid()
+
+    # 'fed-<name>_'                     -- one pool per resource
+    per_resource = re.escape(pool_prefix(name))
+    # 'fed-<class>_<name>.<member>_'    -- a capability class pool
+    per_class    = '%s%s_%s\\.%s_' % (re.escape(POOL_PREFIX), _NAME_PAT,
+                                      re.escape(name), _NAME_PAT)
+
+    pattern = re.compile(r'(?:^|\s)(?:-n|--name)\s+(?:%s|%s)p\.[0-9a-f]+'
+                         r'(?:\s|$)' % (per_resource, per_class))
     found   = []
 
     for pid, cmdline in procs:

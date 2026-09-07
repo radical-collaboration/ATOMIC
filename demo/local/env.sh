@@ -205,19 +205,31 @@ ATOMIC_DEMO_STATE_BAK="$RUN_DIR/state.bak.latest"
 : "${ATOMIC_DEMO_DISPATCHER_STATE:=$HOME/.radical/orbit/task_dispatcher/state}"
 
 # --------------------------------------------------------------------------
-# the three local resources
+# the three local resources and their five members
 # --------------------------------------------------------------------------
 #
-# local_a / local_b join in `allocation` mode (this process *is* the
-# resource, one pilot right away), local_c in `login` mode (pilots are
-# submitted on demand through psij's `local` executor).  Capabilities are
-# declared so the federation has something to route on:
+# A dispatcher pool is a *capability class*, not a site: every member of
+# every resource joins the pool for its class, `fed-cpu` or `fed-gpu`.
+# local_a joins in `allocation` mode (this process *is* the resource, one
+# pilot right away, exactly one implicit member); local_b and local_c join
+# in `login` mode with two members each (pilots submitted on demand
+# through psij's `local` executor).
 #
-#   local_a  lammps only            -> can run `md`,    not `train`
-#   local_b  lammps + pytorch       -> can run both
-#   local_c  pytorch only           -> can run `train`, not `md`
+#   fed-cpu   local_a.default  lammps            2 cores
+#             local_b.cpu      lammps + pytorch  2 cores
+#             local_c.cpu      pytorch           2 cores
+#   fed-gpu   local_b.gpu      pytorch           1 core + 1 GPU   site NERSC
+#             local_c.gpu      pytorch           1 core + 1 GPU   site PSC
 #
-# ... which is what forces the campaign across at least two resources.
+# So `md` (lammps, no GPU) can only run on local_a.default or local_b.cpu,
+# and `train` (pytorch, 1 GPU) only in fed-gpu -- whose two members sit at
+# two different "sites", which is the point of the whole class-pool
+# arrangement.  The GPU members declare ONE core and max_pilots=1, so one
+# of them runs one train task at a time and three sweep points cannot fit
+# on a single member.
+#
+# The "GPU" is fake (psij `local`, rhapsody backend `concurrent`): only
+# the *declaration* matters for routing, and nothing reserves a GPU.
 
 ATOMIC_DEMO_RESOURCES=(local_a local_b local_c)
 
@@ -239,11 +251,12 @@ demo_join_args() {
 
         local_b) DEMO_JOIN_ARGS=(
                      --name       local_b
-                     --mode       allocation
+                     --mode       login
                      --site       NERSC
                      --kind       hpc
-                     --declare    cores=4,gpus=1,mem_gb=16
-                     --software   lammps,pytorch
+                     --declare    mem_gb=16
+                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=lammps,pytorch,site=NERSC'
+                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=NERSC'
                      --scratch    "$ATOMIC_DEMO_TMP/local_b") ;;
 
         local_c) DEMO_JOIN_ARGS=(
@@ -251,13 +264,9 @@ demo_join_args() {
                      --mode       login
                      --site       PSC
                      --kind       hpc
-                     --queue      local
-                     --account    demo
-                     --nodes      1
-                     --cpus       2
-                     --walltime   1800
-                     --node-hours 2
-                     --software   pytorch
+                     --declare    mem_gb=16
+                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=pytorch,site=PSC'
+                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=PSC'
                      --scratch    "$ATOMIC_DEMO_TMP/local_c") ;;
 
         *)       demo_warn "no join arguments known for '$name'"
@@ -267,9 +276,10 @@ demo_join_args() {
 }
 
 # resources that must show a live pilot before the smoke test starts
-# (allocation mode starts its pilot at join time; login mode only when
-# the first task arrives, so local_c is not waited for)
-ATOMIC_DEMO_PILOT_RESOURCES=(local_a local_b)
+# (allocation mode starts its pilot at join time; a login-mode member has
+# min_pilots=0 and only starts one when the first task arrives, so
+# local_b and local_c are not waited for)
+ATOMIC_DEMO_PILOT_RESOURCES=(local_a)
 
 # --------------------------------------------------------------------------
 # timeouts (seconds) -- every wait loop in up.sh/down.sh uses one of these

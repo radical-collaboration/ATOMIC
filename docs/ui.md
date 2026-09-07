@@ -50,6 +50,19 @@ A table of the federation's resources, one row each:
 | Active work | `usage.tasks_running` / `usage.tasks_done` |
 | Status | `liveness` → green (online) / amber (unsteady) / red (offline) |
 
+Underneath each resource sit its **members**, one indented `└ name`
+sub-row per entry in `members[]` — a resource declares one member per
+shape of pilot it runs, and each member lives in the pool for its
+capability class (`fed-cpu`, `fed-gpu`). The sub-row reuses the same ten
+columns: the *Type* cell becomes `class / pool_name`, *Cores*/*GPUs* are
+`nodes × cpus_per_node` / `nodes × gpus_per_node`, *Memory* is
+`attributes.mem_gb_per_node`, and *Software*, *Node-hours* and *Active
+work* come from the member's own `software`, `budget` and `usage`. The
+member id and queue are tooltip material, and a member declaring GPUs
+says so as *declared, not reserved* — nothing pins a GPU to a task this
+round. A record with no `members` (a federation that predates class
+pools) renders exactly as before: one row, no sub-rows.
+
 The allowance is `budget.node_hours` where declared, otherwise
 `node_hours_used + node_hours_remaining`. The bar turns amber→red past
 85 % of the allowance. Rows appear and disappear as resources join and
@@ -88,12 +101,19 @@ One card per campaign, newest first (at most six are detailed per poll).
   INTERRUPTED or CANCELED shows its `reason` under the header.
 - **one row per workflow** — the sweep params (`temperature=600`) with
   the workflow's series colour, then the stage chips `md ▸ train`.
-  Each chip is coloured by stage state and **labelled with the resource
-  the stage ran on** — that is demo step 3: the same campaign, visibly
-  spread across different resources. Where colour alone would not be
-  honest (a failed, skipped or staging chip) the state is spelled out
-  next to the resource. The chip's tooltip carries the task id, state,
-  exit code and the stage's `reason`.
+  Each chip is coloured by stage state and **labelled with the placement
+  the stage's last poll reported** — `resource/member` once the class
+  pool bound a member, `resource` before that. That is demo step 3: the
+  same campaign, visibly spread across different resources *and* across
+  the members of one class pool. The label is read from the polled stage
+  record (`resource`, `member`), never from the submit answer, which can
+  only name an advisory resource; a stage with no resource at all —
+  queued in a class pool, or one whose resource left the federation —
+  shows its state word instead and is not an error. Where colour alone
+  would not be honest (a failed, skipped or staging chip) the state is
+  spelled out next to the placement. The chip's tooltip carries the task
+  id, state, capability class, exit code and the stage's `reason` — the
+  class stays out of the chip itself, which is already tight at 720p.
 
   | state | style | word |
   |---|---|---|
@@ -218,8 +238,9 @@ Everything is sized for **1280×720 on a screen share**:
 - `node --check` on the module;
 - a fake-Explorer drive: a minimal `page`/`api` pair with canned JSON in
   the contract's shapes is handed to `init()`, and the HTML the module
-  writes is asserted on — the resource rows and node-hour bar, the stage
-  chips with their resource labels and the STAGING/SKIPPED/INTERRUPTED
+  writes is asserted on — the resource rows, their member sub-rows and
+  the node-hour bar, the stage chips with their `resource/member` labels
+  and the STAGING/SKIPPED/INTERRUPTED
   vocabulary, the stage and campaign `reason`, both SVG charts and the
   terminal "no data" placeholder, the results drawer (files, sizes,
   per-file errors, store path, and that it closes again), the submit

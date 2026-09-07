@@ -71,8 +71,8 @@ const EXAMPLES = [{
        inputs: [], outputs: ['md.json']},
       {name: 'train', type: 'ml_training',
        cmd: ['atomic-fake-train', '--in', 'md.json',
-             '--epochs', '20', '--out', 'model.json'],
-       requirements: {cores: 2, gpus: 0, software: ['pytorch']},
+             '--epochs', '20', '--duration-sec', '10', '--out', 'model.json'],
+       requirements: {cores: 1, gpus: 1, software: ['pytorch']},
        inputs: ['md.json'], outputs: ['model.json']}
     ]
   }
@@ -355,6 +355,8 @@ export function css() {
       font-size: .82rem;
     }
     .ac-res-name { font-weight: 600; color: var(--text); }
+    /* one indented row per member of a resource */
+    .ac-member td { padding-left: 18px; color: var(--muted); }
     .ac-soft {
       display: inline-block;
       margin: 1px 4px 1px 0;
@@ -833,7 +835,9 @@ function renderResources(page, st) {
     count.textContent = `· ${fmtNum(nh, 2)} node-hours used`;
   }
 
-  const rows = st.resources.map(renderResourceRow).join('');
+  const rows = st.resources.map(r => renderResourceRow(r)
+                                   + membersOf(r).map(m => renderMemberRow(r, m))
+                                                 .join('')).join('');
   body.innerHTML = `${stale}
     <div style="overflow-x:auto">
       <table class="ac-table">
@@ -848,12 +852,18 @@ function renderResources(page, st) {
     </div>`;
 }
 
-function renderResourceRow(r) {
-  r = r || {};
-  const caps  = r.capabilities || {};
-  const usage = r.usage || {};
-  const bud   = r.budget || {};
+// A resource declares one MEMBER per shape of pilot it is willing to run,
+// and each member sits in the pool for its capability class (fed-cpu,
+// fed-gpu).  A federation that predates class pools reports none, and then
+// the resource row is the whole story -- exactly as before.
+function membersOf(r) {
+  const members = (r && r.members) || [];
+  return isArr(members) ? members.filter(m => m && typeof m === 'object') : [];
+}
 
+// The node-hour cell: `used / total h` plus a bar, or just what was used
+// when nothing declared a budget.  Shared by resource and member rows.
+function nodeHourCell(usage, bud) {
   const used  = num(usage.node_hours_used, 0);
   const left  = num(usage.node_hours_remaining, NaN);
   let   total = num(bud.node_hours, NaN);
@@ -863,15 +873,59 @@ function renderResourceRow(r) {
   const frac = (Number.isFinite(total) && total > 0)
              ? Math.max(0, Math.min(1, used / total)) : 0;
 
-  const nh = Number.isFinite(total)
+  return Number.isFinite(total)
     ? `${fmtNum(used, 2)} / ${fmtNum(total, 1)} h
        <div class="ac-bar${frac > 0.85 ? ' ac-hot' : ''}">
          <i style="width:${(frac * 100).toFixed(1)}%"></i></div>`
     : `${fmtNum(used, 2)} h <span style="color:var(--muted)">used</span>`;
+}
 
-  const soft = isArr(caps.software) && caps.software.length
-    ? caps.software.map(s => `<span class="ac-soft">${esc(s)}</span>`).join('')
+function softwareCell(list) {
+  return isArr(list) && list.length
+    ? list.map(s => `<span class="ac-soft">${esc(s)}</span>`).join('')
     : '<span style="color:var(--muted)">–</span>';
+}
+
+function renderMemberRow(r, m) {
+  const attrs = m.attributes || {};
+  const nodes = num(m.nodes, 1);
+  const cores = nodes * num(m.cpus_per_node, 0);
+  const gpus  = nodes * num(m.gpus_per_node, 0);
+  const cls   = m['class'] || m.cls || '';
+  const pool  = m.pool_name || '';
+  const mem   = num(attrs.mem_gb_per_node, NaN);
+  const usage = m.usage || {};
+
+  // GPUs here are DECLARED, not reserved -- nothing pins one to a task.
+  const tip = [m.member_id ? `member ${m.member_id}` : '',
+               m.queue ? `queue ${m.queue}` : '',
+               gpus ? `${gpus} declared GPU(s), not reserved` : '']
+              .filter(Boolean).join(' · ');
+
+  return `<tr class="ac-member">
+    <td><span title="${esc(tip)}">└ ${esc(m.member || '?')}</span></td>
+    <td>${esc(attrs.site || r.site || '–')}</td>
+    <td>${esc([cls, pool].filter(Boolean).join(' / ') || '–')}</td>
+    <td class="ac-mono">${cores}</td>
+    <td class="ac-mono">${gpus}</td>
+    <td class="ac-mono">${Number.isFinite(mem) ? esc(mem) + ' GB' : '–'}</td>
+    <td>${softwareCell(m.software)}</td>
+    <td class="ac-mono" style="min-width:150px">${
+      nodeHourCell(usage, m.budget || {})}</td>
+    <td class="ac-mono">${num(usage.tasks_running, 0)} running
+        · ${num(usage.tasks_done, 0)} done</td>
+    <td>${esc(m.liveness || r.liveness || '')}</td>
+  </tr>`;
+}
+
+function renderResourceRow(r) {
+  r = r || {};
+  const caps  = r.capabilities || {};
+  const usage = r.usage || {};
+  const bud   = r.budget || {};
+
+  const nh   = nodeHourCell(usage, bud);
+  const soft = softwareCell(caps.software);
 
   const live = String(r.liveness || '').toLowerCase();
   const dot  = live === 'ok' ? 'ok'
@@ -1120,6 +1174,17 @@ function workflowName(wfs) {
   return null;
 }
 
+// Where a stage ran: `resource/member` once the pool picked a member,
+// `resource` before that, '' when it is not placed (the federation
+// answers `resource: null` for a task waiting in a class pool, and for
+// one whose resource left while it was queued).
+function placementOf(s) {
+  const res = (s && s.resource) || '';
+  const mem = (s && s.member)   || '';
+  if (!res) return '';
+  return mem ? `${res}/${mem}` : res;
+}
+
 function renderWorkflowRow(w, colour) {
   w = w || {};
   const stages = isArr(w.stages) ? w.stages : [];
@@ -1128,10 +1193,15 @@ function renderWorkflowRow(w, colour) {
   const chips = stages.map((s, i) => {
     const state = String((s && s.state) || '').toUpperCase();
     const cls   = stateClass(state);
-    const res   = (s && s.resource) || '';
+    // Placement comes from the POLL, never from the submit answer: a
+    // capability class pool picks the member when it dispatches, so
+    // `resource` starts out advisory and may be absent altogether.
+    const res   = placementOf(s);
     const bits  = [];
     if (s && s.task_id) bits.push('task ' + s.task_id);
     if (state) bits.push('state ' + state);
+    // the class is tooltip material: the chip is already tight at 720p
+    if (s && (s.cls || s.class)) bits.push('class ' + (s.cls || s.class));
     if (s && s.exit_code !== undefined && s.exit_code !== null) {
       bits.push('exit ' + s.exit_code);
     }
@@ -1523,6 +1593,7 @@ export const _internals = {
   EXAMPLES, esc, scalar, fmtNum, fmtBytes, fmtDuration, toEpoch,
   parseSweepValues, stateClass, stateBadge, stateWord, stateLabel,
   varyingKeys, legendLabel, paramsLabel, niceTicks, downsample,
-  renderPlot, renderFiles, renderResourceRow, pickMetrics,
+  renderPlot, renderFiles, renderResourceRow, renderMemberRow, membersOf,
+  placementOf, pickMetrics,
   PLOT_GEOMETRY: {PW, PH, PAD}
 };
