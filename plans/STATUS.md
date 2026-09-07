@@ -67,3 +67,4 @@ Branches: radical.orbit `feature/atomic-federation`, atomic `feature/demo-wm`. N
 - 2026-09-07 18:09 PRs opened: #124 feature/class-pools -> feature/task-requirements; #125 feature/atomic-federation -> feature/class-pools (stacked on #123). Watches armed. Merge-resolution review running.
 - 2026-09-07 18:15 merge-resolution review: PR-ready; 2 cleanups committed + pushed (#125 updated). Tuesday prerequisites recorded in demo/local/README: remote members need shared_fs=false + explicit scratch_base; use allocation mode (psij executor detected on the broker host). PR watches armed (#123 #124 #125).
 - 2026-09-07 21:14 PR watches: no review activity on #123/#124/#125 all evening; letting the watches expire overnight instead of re-arming (re-arm on the next "continue").
+- 2026-09-08 00:35 demo/local split into broker.sh / join.sh / submit.sh (+ up.sh orchestrator); automated + manual paths verified.
