@@ -213,10 +213,29 @@ Steps (order matters — nothing that can be rejected touches the dispatcher):
      `400` (the allocation *is* the resource).
    - Duplicate member names, or an empty `members` list → `400`.
 3. Assign `member_id` and `cls`/`pool_name` per §2.
-4. `register_session('fed', pools=[<class pool decl> for each distinct class
-   not yet known to us])` — the class pool declaration is 121's
-   `multi_member` form with the member list; re-registering `fed` with an
-   already-materialised pool is a no-op (`plugin_task_dispatcher.py:584-587`).
+4. `register_session('fed', pools=_class_pool_decls())` — **always the FULL
+   list**, never a delta: `parse_pools` rejects an empty `pools` list
+   (`task_dispatcher_config.py:113-114`) and `_materialise_pool` is
+   idempotent by name (`plugin_task_dispatcher.py:584-587`), so re-sending
+   every pool is both required and free.
+   `_class_pool_decls()` is **one helper**, used by `join`,
+   `_replay_attachments` and `_sync_attachments` (§6) — three callers, one
+   declaration shape, no drift. It emits, per distinct class across all
+   stored resources plus the one being joined:
+
+   ```python
+   {'name'           : f'fed-{cls}',
+    'pool_class'     : cls,
+    'multi_member'   : True,
+    'members'        : [<121 member decl>, ...],   # every member of that class
+    'strategy'       : 'conservative',
+    'strategy_config': dict(_STRATEGY_CONFIG)}     # :132
+   ```
+
+   `members` is carried in the declaration for the fresh-dispatcher case;
+   step 5 is what actually reconciles membership against a dispatcher that
+   already has the pool (a re-declaration of an existing pool is ignored,
+   `:584-587` — that is the whole reason the member routes exist).
 5. For **every** member: `add_member('fed', pool_name, <121 member decl>)`.
    Idempotent by 121 §4.1; this is the single code path used by join *and*
    by restart replay, so there is one thing to get right.
@@ -238,10 +257,15 @@ connected (`:796-799`); `503` no dispatcher (`_DispatcherAPI._host
 Body (optional) `{"cancel_tasks": false}`.
 
 1. For each member of the resource: `del_member('fed', m.pool_name,
-   m.member_id, cancel_tasks=<flag>, force=True)`. 121 cancels that member's
-   pilots and re-queues their RUNNING tasks **once**; a re-queued task that
-   no remaining member can satisfy is failed by the dispatcher with
-   `no member satisfies task requirements` (121 §7).
+   m.member_id, cancel_tasks=<flag>, force=True,
+   fail_unsatisfiable=True)`. 121 cancels that member's pilots and re-queues
+   their RUNNING tasks **once**; a re-queued task that no remaining member
+   can satisfy is failed by the dispatcher with
+   `no member satisfies task requirements` (121 §7). `fail_unsatisfiable`
+   is left at its default here — an explicit `leave` means the resource is
+   gone, so a task only it could run should fail now rather than wait
+   forever. (The liveness path in §6 passes `false`; that is the difference
+   between "gone" and "blinked".)
 2. **Do not** blanket-cancel the ledger any more (`:869-880`). That was
    correct when a pool served exactly one resource; with class pools a queued
    task can legitimately run elsewhere. `cancel_tasks: true` restores the old
@@ -260,16 +284,29 @@ Body (optional) `{"cancel_tasks": false}`.
    `entry.member_id = None`, keeping `pool` and `dispatcher_sid` (both still
    valid — the class pool and the `fed` session outlive the resource). The
    next poll fills the real placement back in from the dispatcher's
-   `member_id`. With `cancel_tasks: true` the entries are terminal anyway
-   and are dropped. Add `drop_resource(name, keep_active=True)` rather than
-   a second code path.
+   `member_id`. Add `drop_resource(name, keep_active=True)` rather than a
+   second code path.
+
+   Precisely, per ledger entry of the leaving resource:
+   - already terminal → dropped, as today;
+   - `cancel_tasks: true` → 121 cancelled or failed it, so it is terminal by
+     the time this step runs → dropped;
+   - RUNNING on one of this resource's pilots → 121 re-queued it; the entry
+     stays with `resource = None`;
+   - QUEUED, merely *attributed* to this resource by the advisory value the
+     submit returned → it was never bound to a member at all and may run
+     anywhere in the class pool; the entry stays with `resource = None`.
+
+   The response key for tasks the dispatcher failed is 121's own name,
+   `tasks_failed` — do not invent a second vocabulary for the same number.
 5. Drop the record, drop the detail-cache entries for the affected pools,
    persist.
 6. An emptied class pool is left in place (inert: no members ⇒ no scale-up,
    no pilots ⇒ no dispatch) and is reused by the next join of that class.
 
 Return `{"resource": name, "ok": true, "members_removed": n,
-"tasks_requeued": n, "tasks_canceled": n}`.
+"tasks_requeued": n, "tasks_failed": n}` — the last two summed over the
+per-member `del_member` responses (121 §4.2).
 
 ### `GET resources/{sid}` / `GET resource/{sid}/{name}`
 
@@ -278,7 +315,13 @@ Refresh (`_refresh_usage :1109-1136`) becomes:
 
 - one `pool_detail('fed', pool_name)` per **distinct class pool** (cached 2 s
   as today, `_detail_cache :413`, `_USAGE_CACHE_SEC :126`) — with N resources
-  in 2 classes this is 2 dispatcher round-trips instead of N;
+  in 2 classes this is 2 dispatcher round-trips instead of N. The plugin's
+  own helper `_pool_detail(rec: ResourceRecord)` (`:1085-1107`) therefore
+  becomes **`_pool_detail(pool_name: str)`**: a pool is no longer a property
+  of one resource, and every caller (`_refresh_usage`, the `child_endpoint`
+  lookup in `_route_task :1038`) already has, or can trivially get, the pool
+  name. `_detail_cache` stays keyed by pool name — which it already is
+  (`:1094`), it was simply reached through a record;
 - per member: read the matching entry from 121's `summary['members']`
   (§9 of 121) → `node_hours_used`, `node_hours_remaining`, `pilots_active`
   straight off the dispatcher, no arithmetic here;
@@ -327,10 +370,16 @@ is now keyed by `member_id`.
    against a pilot's member attributes (121 §1.1, amendment 2).
 2. Choose the class (§5). `409 + reasons` when no class has an eligible
    member.
-3. `cwd`: omitted (121 §8 assigns it at dispatch) **unless** every member of
-   the chosen class has `shared_fs: true`, in which case keep today's
-   behaviour (`:965-983` — create `<scratch_base>/<task_id>` broker-side and
-   send it) so the demo's `stage_in` path is untouched.
+3. `cwd`: **always omitted.** 121 §8 assigns it at dispatch from the actual
+   member's `scratch_base`, which is the only correct answer once a class
+   pool can mix members. The round-1 "keep the old broker-side cwd when every
+   member is shared" branch is dropped: it is a second code path that is
+   wrong the moment a non-shared member joins that class, and it buys
+   nothing — with inputs riding the submit (§4 step 4) no client needs the
+   cwd before dispatch, and `stage_out` still works because it resolves
+   `Path(rec.cwd)` from the record the poll reports. The `cwd` validation and
+   `mkdir` at `:965-983` go away with it (a client-supplied `task.cwd` is now
+   refused with `400`, since the federation cannot honour it across members).
 4. **`inputs_b64` rides through.** A submit body may carry
    `{"task": {..., "inputs_b64": {"md.json": "<b64>"}}}`; the federation
    forwards it verbatim into the dispatcher payload (121 §4.3), which
@@ -438,24 +487,33 @@ not call `register_session`.
 `_replay_attachments` (`:1175-1208`) becomes, once, at first topology or
 first route (`_require_session :450-470` — keep that trigger):
 
-1. **Upgrade path from pre-08 state** (BLOCKING-adjacent, do it first):
+1. **Upgrade path from pre-08 state** (do it first, and in this order):
    - every stored resource carries a per-resource `dispatcher_sid`
-     (`fed-<name>`) and, if the broker is being upgraded in place, the
-     dispatcher has replayed those old sessions' pools off disk. For each
-     distinct non-`fed` `dispatcher_sid` found in the loaded state, call
-     `unregister_session(sid)` **before** anything else, so the old
-     `fed-<name>` pools and their pilots are torn down
+     (`fed-<name>`). If the broker is being upgraded in place, the dispatcher
+     has replayed those old pools off disk — but **owner-less**: a replayed
+     pool has no session, and `_housekeeping` skips it
+     (`plugin_task_dispatcher.py:707-711`) while `unregister_session` on a
+     sid the dispatcher does not know is a `404`, tearing down nothing.
+     So for each distinct non-`fed` `dispatcher_sid`, do what
+     `_replay_attachments` already does today (`:1200-1203`):
+     **`register_session(old_sid, [rec.pool_config])` FIRST, then
+     `unregister_session(old_sid)`** — re-own the pool, then release it
+     through the ordinary teardown so its pilots are actually cancelled
      (`_teardown_session_pools:2151-2179`) instead of lingering as orphans
-     that hold a psij job and a child endpoint;
-   - re-point every non-terminal ledger entry whose `dispatcher_sid` is not
-     `fed`: the task cannot be recovered (its pool is gone), so mark it
-     `FAILED` with `detail = 'the federation was upgraded'` and let the
-     campaign layer report it through its existing vocabulary. Terminal
-     entries keep their history.
+     holding a psij job and a child endpoint. This is exactly the
+     register-then-release dance the current code uses for a resource whose
+     endpoint is gone; the upgrade is the same shape, applied to every
+     resource at once.
+   - then fail every non-terminal ledger entry whose `dispatcher_sid` is not
+     `fed`: its pool has just been torn down, so the task cannot be
+     recovered — mark it `FAILED` with
+     `detail = 'the federation was upgraded'` and let the campaign layer
+     report it through its existing vocabulary. Terminal entries keep their
+     history.
    - the member records themselves are derived from the stored record
      (§3), so nothing else is lost.
-2. `register_session('fed', pools=[<class pool decl> for every distinct class
-   across all stored records])`. The dispatcher has already replayed those
+2. `register_session('fed', pools=_class_pool_decls())` — the same helper as
+   `join` step 4, the full list. The dispatcher has already replayed those
    pools with their persisted members (121 §10) and returns them as-is.
 3. For **every** member of **every** stored record: `add_member(...)`.
    Idempotent when the dispatcher still has it; it is the recovery path when
@@ -472,9 +530,9 @@ while the other succeeds).
 
 | endpoint liveness | action |
 |---|---|
-| `present`, member not attached | `add_member(...)`, mark `ok` |
+| `present`, member not attached | `add_member(...)` (via the same declaration `_class_pool_decls()` builds), mark `ok`. If its class pool no longer exists — every member of that class left while the endpoint was down — re-`register_session('fed', _class_pool_decls())` first |
 | `suspect` | mark `suspect`, **do nothing else**. The federation policy already refuses to route to a non-`ok` member (`federation_policy.py:131-132`), which is the whole point of `suspect`; a blip must not touch the dispatcher |
-| `lost`, member attached | `del_member(..., cancel_tasks=False, force=True)`; mark `lost`. Its pilots are gone with the endpoint anyway; its RUNNING tasks are re-queued once by the dispatcher and can land on another member |
+| `lost`, member attached | `del_member(..., cancel_tasks=False, force=True, **fail_unsatisfiable=False**)`; mark `lost`. Its pilots are gone with the endpoint anyway; its RUNNING tasks are re-queued once by the dispatcher and can land on another member — and a task only *this* member could run stays QUEUED instead of being failed, because a lost endpoint is very often back in a minute and `_sync_attachments` will re-`add_member` it (121 §4.2) |
 
 There is **no quiesce mechanism** and no partial member update: 121's
 "identical re-POST = no-op, differing = 409" stands, member `max_pilots`
@@ -531,8 +589,15 @@ New repeatable flag, added to the "login mode" group (`:143-160`):
   `software` = union) so `connect_and_join`'s `'cores' in capabilities`
   guard (`:657-660`) and every existing consumer still work.
 
-`atomic-leave` unchanged (`client.fed_leave`, `join.py:548-558`), except
-`--cancel-tasks` is passed through in the body.
+**`atomic-leave --cancel-tasks`** is a three-line chain, listed so nobody
+half-wires it: `atomic_wm/cli/leave.py` adds the flag →
+`do_leave(client, name, cancel_tasks=False)` (`join.py:548-558`, shared by
+`atomic-leave` and `atomic-join`'s own teardown at `:561-577`) →
+`Client.fed_leave(name, cancel_tasks=False)` (`client.py:269-272`) posts the
+body. `demo/local/down.sh` passes `--cancel-tasks` (a teardown wants the
+work stopped, not re-queued onto a resource that is about to leave too);
+`atomic-join`'s SIGINT path does **not** (a single resource leaving a live
+federation should let its work migrate).
 
 ### `atomic-resources` (`atomic_wm/cli/resources.py`)
 
@@ -651,16 +716,17 @@ Small, and enumerated so nobody re-derives them:
     ```
     --member cpu:queue=local,nodes=1,cpus=2,walltime=1800,node_hours=2,
                  software=lammps,pytorch,site=NERSC
-    --member gpu:queue=local,nodes=1,cpus=2,gpus=1,walltime=1800,node_hours=1,
-                 software=pytorch,site=NERSC
+    --member gpu:queue=local,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,
+                 max_pilots=1,software=pytorch,site=NERSC
     ```
     The "GPU" is fake (psij `local`, `rhapsody_backend: concurrent`); only
-    the *declaration* matters for routing.
+    the *declaration* matters for routing. Note `cpus=1` and
+    `max_pilots=1` — see the determinism note below.
   - `local_c` — login, now **two** members as well: its existing CPU one
     (`software pytorch`) plus
     ```
-    --member gpu:queue=local,nodes=1,cpus=2,gpus=1,walltime=1800,node_hours=1,
-                 software=pytorch,site=PSC
+    --member gpu:queue=local,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,
+                 max_pilots=1,software=pytorch,site=PSC
     ```
     so `fed-gpu` has **two members from two "sites"** and the demo actually
     shows a class pool spreading work across sites — the point of the whole
@@ -669,11 +735,30 @@ Small, and enumerated so nobody re-derives them:
   - Result: `fed-cpu` has 3 members (`local_a.default`, `local_b.cpu`,
     `local_c.cpu`), `fed-gpu` has 2 (`local_b.gpu`, `local_c.gpu`).
 - `examples/workflow_vacancy.json` — the `train` stage's requirements become
-  `{"cores": 2, "gpus": 1, "software": ["pytorch"]}` so the campaign
-  actually exercises class routing; `md` stays `{"cores": 2,
-  "software": ["lammps"]}`.
-- `env.sh:272` `ATOMIC_DEMO_PILOT_RESOURCES` — `local_a` only
-  (`local_b`'s members are login-mode, `min_pilots=0`).
+  `{"cores": 1, "gpus": 1, "software": ["pytorch"]}` so the campaign actually
+  exercises class routing (`cores: 1` because a GPU member declares
+  `cpus_per_node: 1`, see below); `md` stays `{"cores": 2, "software":
+  ["lammps"]}`. `train`'s cmd gains `--duration-sec 10`.
+
+**Making the two-GPU-member spread deterministic** (supervisor decision,
+review round 2). "Three tasks, two members, expect ≥2 used" is a race unless
+the pool is *forced* to use both: with a fat GPU member all three `train`
+tasks fit one pilot and a correct scheduler would put them there. So the
+demo declares each GPU member with `cpus=1` → pilot `capacity = nodes ×
+cpus_per_node = 1` (`plugin_task_dispatcher.py:1424`) → **one concurrent
+task per GPU pilot** — and `max_pilots=1`, so a member cannot answer the
+backlog by growing instead of sharing. Three concurrent `train` tasks then
+*need* both members: one runs on `local_b.gpu`, one on `local_c.gpu`, the
+third waits. `--duration-sec 10` on the train stage keeps each task alive
+well past the ~5 s pilot spin-up measured in the spike
+(`00-overview.md:337-344`), so the second member's pilot is genuinely
+started rather than the queue draining serially onto the first. The
+`--min-gpu-members` default stays 2. Write this reasoning into `env.sh`
+next to the member lines and into the README — it is the kind of parameter
+choice that looks arbitrary and gets "tidied" away six months later.
+- `env.sh:272` `ATOMIC_DEMO_PILOT_RESOURCES` — `local_a` only (every other
+  member is login-mode with `min_pilots=0`, so no pilot exists before the
+  first task).
 - `smoke.py` new/changed assertions (next to `check_placement :448-490`):
   - every stage's `pool` equals `fed-<expected class>` for its requirements
     (`gpus>0 → fed-gpu`), message
@@ -685,9 +770,10 @@ Small, and enumerated so nobody re-derives them:
   - `--min-resources` (default 2, `:780-782`) is joined by
     `--min-members` (default 2) and the ≥2-distinct check (`:485-488`) runs
     over members;
-  - **the `train` stages spread over ≥2 GPU members** — with a 3-point sweep
-    and two GPU members, all three `train` tasks landing on one member means
-    the class pool is not load-balancing. Message: `'the %d train stage(s)
+  - **the `train` stages spread over ≥2 GPU members** — with a 3-point sweep,
+    two GPU members of capacity 1 and `max_pilots=1`, three concurrent
+    `train` tasks cannot all run on one member, so this is a deterministic
+    assertion rather than a timing hope. Message: `'the %d train stage(s)
     used %d GPU member(s) (%s), expected at least 2 — the class pool did not
     spread across sites'`. Guard it with `--min-gpu-members` (default 2) so a
     single-GPU-member federation can still run the smoke test;
@@ -740,14 +826,18 @@ Small, and enumerated so nobody re-derives them:
   non-terminal ledger entries with `resource=None`** (then a poll re-points
   them); `resources` reports per-member usage from a canned 121 summary;
   `pick` returns class + eligible members; `submit` targets `fed-<class>`,
-  omits `cwd` for a non-shared class, strips `node_hours` and forwards
-  `software`/`inputs_b64`; a dispatcher `400` maps to `REASON_NO_RESOURCE`;
+  **never** sends `cwd`, rejects a client-supplied `task.cwd` with `400`,
+  strips `node_hours` and forwards `software`/`labels`/`inputs_b64`; a
+  dispatcher `400` maps to `REASON_NO_RESOURCE`;
   `task` rewrites `resource` from the dispatcher's `member_id` via
   `rpartition`; restart replay re-registers `fed` once with the **full**
   pool list and re-POSTs every member; a pre-08 state file makes replay
   unregister the legacy `fed-<name>` sessions and FAIL their live ledger
-  entries; a `suspect` endpoint changes liveness only — **no** dispatcher
-  call.
+  entries — **asserting the order: `register_session(old_sid, …)` then
+  `unregister_session(old_sid)`**, since the reverse is a 404 that tears
+  down nothing; a `suspect` endpoint changes liveness only — **no**
+  dispatcher call; a `lost` endpoint calls `del_member` with
+  `fail_unsatisfiable=False`.
 - **Existing tests in `test_plugin_federation.py` that must change** (they
   assert the per-resource sid or the old cancel order): `:297-298`, `:302`,
   `:335`, `:589-590`, `:651-657`, `:690-691` (all `dispatcher_sid ==
@@ -762,18 +852,23 @@ Small, and enumerated so nobody re-derives them:
 
 **atomic** (`tests/`):
 
-- `test_cli_join.py`: `parse_member` (list-append rule, `software` always a
-  list, a leading fragment without `=` → `UsageError`, unknown key →
-  attribute, bad member name, bad `NAME:`), `--member` + flat login flags →
-  error, `--member` in allocation mode → error, record assembly with two
-  members, aggregate capabilities.
-- `test_cli_resources.py`: two-level rendering, a record without `members`
+- `tests/test_cli_join.py` (exists): `parse_member` (list-append rule,
+  `software` always a list, a leading fragment without `=` → `UsageError`,
+  unknown key → attribute, bad member name, bad `NAME:`), `--member` + flat
+  login flags → error, `--member` in allocation mode → error, record
+  assembly with two members, aggregate capabilities, `--cancel-tasks` on
+  `atomic-leave`.
+- `tests/test_cli_resources.py` (**new file** — the resources CLI has no
+  test module today): two-level rendering, a record without `members`
   renders one row, `--json` passthrough.
-- `test_campaign_runner.py`: `_observe` overwrites the advisory resource with
-  the polled member; a poll with `resource: null` does not fail the stage;
-  the `child_endpoint` 3-part fallback; inputs ride in the submit body as
-  `inputs_b64` and neither `stage_in` nor `staging_put` is called; an
-  unreadable input still yields `REASON_STAGE_IN`.
+- `tests/test_runner.py` (exists — this is the runner's module, there is no
+  `test_campaign_runner.py`): `_observe` overwrites the advisory resource
+  with the polled member; a poll with `resource: null` does not fail the
+  stage; the `child_endpoint` 3-part fallback; inputs ride in the submit
+  body as `inputs_b64` and neither `stage_in` nor `staging_put` is called;
+  an unreadable input still yields `REASON_STAGE_IN`.
+- `tests/test_client.py` (exists): `fed_leave(name, cancel_tasks=True)`
+  sends the body.
 - `demo/local/test_smoke_helpers.py`: the new class/GPU assertions over
   canned campaign + resource payloads.
 
@@ -790,30 +885,32 @@ and `ve3/bin/flake8 src/ bin/`; atomic `pytest tests/ -q` (284 today) and
 | P1 | `MemberRecord`, aggregate views, single-member derivation, ledger `member_id`, state tests | — | 3 h |
 | P2 | `FederationPolicy` v2 + tests | P1, 121-B (`task_dispatcher_match`) | 3 h |
 | P3 | `_DispatcherAPI` member verbs + join/leave against them, incl. the ledger-keeping leave | P1, **121 §4 contract** (fake API is enough) | 5 h |
-| P4 | resources/pick/submit/task + per-member usage + `inputs_b64` passthrough | P1, P3 | 4 h |
+| P4 | resources/pick/submit/task + per-member usage + `inputs_b64` passthrough + 120's federation projection (§14 rule 6) | P1, P3 | 5 h |
 | P5 | restart re-attach, pre-08 upgrade path, per-member `_attached` | P3 | 3 h |
-| P6 | `atomic-join --member`, `atomic-resources`, client | P1 (wire shape only) | 4 h |
+| P6 | `atomic-join --member`, `atomic-leave --cancel-tasks`, `atomic-resources`, client | P1 (wire shape only) | 4 h |
 | P7 | `federation.js` + `atomic_campaign.js` member rows and chips | P4 | 3 h |
 | P8 | campaign runner touch points (§9), incl. deleting the two staging paths | P4, 121-G | 3 h |
 | P9 | `demo/local` (two GPU members) + smoke assertions | P6, P8, 121 all | 4 h |
 | P10 | docs (§11) | all | 3 h |
 | P11 | Rewriting the existing federation tests listed in §12 | P3, P4 | 1 h |
 
-≈ **36 h**.
+≈ **37 h**.
 
 ## 14. Sequencing across 120 / 121 / 08
 
 ```
 120 (requirements passthrough)  ──┐
                                   ├─▶ 121-A/B/C (schema, matcher, records)
-                                  │        │
+                                  │        │            │
+                                  │        │            └─────────────┐
                                   │        ├─▶ 121-D/E (routes, pilots)  ─┐
                                   │        ├─▶ 121-F   (policy v2)        ├─▶ 121-J (harness)
-                                  │        └─▶ 121-G/H (cwd, summary)    ─┘        │
-                                  │                                                │
-  08-P1/P2/P6 (state, policy, CLI) ── can start immediately, no dispatcher needed   │
-  08-P3/P4/P5 ── build against 121 §4's route contract with a FAKE _DispatcherAPI ──┤
-                                                                                    ▼
+                                  │        └─▶ 121-G/H (cwd, inputs, summary) ┘      │
+                                  │                                                  │
+  08-P1 (state) + 08-P6 (CLI) ── start immediately, no dispatcher, no 121 needed      │
+  08-P2 (policy) ── needs 121-B (`task_dispatcher_match`) only ◀──────────────┘       │
+  08-P3/P4/P5 ── build against 121 §4's route contract with a FAKE _DispatcherAPI ────┤
+                                                                                      ▼
                                                              08-P7/P8/P9 (UI, runner, demo e2e)
 ```
 
@@ -833,15 +930,23 @@ Rules that make the parallelism real:
 3. 08-P3/P4/P5 use a fake `_DispatcherAPI` (the existing test seam,
    `plugin_federation.py:162-176`) until 121-D lands. No integration test in
    those packages.
-4. 121 §3 (schema) and §4 (routes) are **frozen** as of review round 1 —
-   findings 1, 2, 4, 5, 6 and 9 are folded in. 08-P3/P4/P5 may be written
-   against them without waiting for 121 code. The member contract is
-   deliberately minimal: add, remove, identical-re-POST-is-a-no-op. No
-   partial updates, no quiesce, no budget top-up.
+4. 121 §3 (schema), §4 (routes) and §9 (the verbose member dict) are
+   **frozen** as of review round 2 — rounds 1 and 2 are folded in. 08-P3/P4/
+   P5 may be written against them without waiting for 121 code. The member
+   contract is deliberately minimal: add, remove,
+   identical-re-POST-is-a-no-op. No partial updates, no quiesce, no budget
+   top-up.
 5. `inputs_b64` (121 §4.3) is on the critical path for 08-P8: land 121-G
    before rewriting the runner, or the runner has to keep both staging
    paths alive for a while.
-6. Integration order at the end: 121-J (fake pilots + fake rhapsody, orbit
+6. **120's federation follow-up (its §PR1.6) is folded into 08-P4 — do not
+   land it separately.** That step teaches `plugin_federation._route_submit`
+   to project `requirements` into the dispatcher payload; 08-P4 rewrites the
+   same function to forward the object (minus `node_hours`) to a class pool.
+   Two people editing that one call in two PRs is a guaranteed conflict and
+   a guaranteed half-state. 120 keeps the dispatcher side; the federation
+   side is 08's.
+7. Integration order at the end: 121-J (fake pilots + fake rhapsody, orbit
    only) → the 08 co-hosted test → `demo/local` full cycle → the acceptance
    run.
 
