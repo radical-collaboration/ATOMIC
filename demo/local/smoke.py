@@ -1294,8 +1294,8 @@ def hint_for(message: str) -> str:
                 'the client lost that pinning.')
 
     if 'connection refused' in text or 'cannot reach broker' in text:
-        return ('hint: no broker on that URL -- run demo/local/up.sh, or '
-                'check demo/local/run/broker.log')
+        return ('hint: no broker on that URL -- run demo/local/up.sh (or '
+                'demo/local/broker.sh), or check demo/local/run/broker.log')
 
     if '503' in text and 'federation' in text:
         return ('hint: 503 from the federation usually means the broker was '

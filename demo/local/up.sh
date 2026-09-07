@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 #
-# demo/local/up.sh -- bring up the ATOMIC WM demo on localhost.
+# demo/local/up.sh -- bring the whole ATOMIC WM demo up on localhost, in
+# one command.
 #
-#   1. install radical.orbit and atomic-wm into ve3 (non-editable) so the
-#      pilots, the endpoint wrapper, the entry points and the console
-#      scripts are all current,
-#   2. isolate state: federation / campaign / store go under
-#      $ATOMIC_DEMO_TMP; the dispatcher has no env override, so its state
-#      dir is backed up and cleared (down.sh restores it),
-#   3. start the broker (background, log + pidfile) and wait for
-#      GET /endpoints,
-#   4. join three local resources (five members in two capability class
-#      pools) with `atomic-join --detach`,
-#   5. wait until all three are federated and the allocation-mode one
-#      reports a live pilot, then print the Explorer URL and the table.
+# This is the *automated* path.  It orchestrates the three per-role
+# scripts, which is exactly what a human does by hand in three terminals:
+#
+#   demo/local/broker.sh  [--skip-install] [--plugins LIST]
+#   demo/local/join.sh    local_a          (then local_b, local_c)
+#   demo/local/submit.sh  --wait           <- up.sh stops before this one
+#
+# and then adds the two steps that only make sense once *all* resources
+# are in: wait until the federation lists them and the allocation-mode
+# one reports a live pilot, and print the Explorer URL and the table.
 #
 # Then:  ve3/bin/python demo/local/smoke.py  and  demo/local/down.sh
 #
@@ -23,6 +22,8 @@ set -euo pipefail
 
 # shellcheck source=demo/local/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
+
+DEMO_TOOL='up.sh'
 
 DO_INSTALL=1
 DO_JOIN=1
@@ -60,195 +61,37 @@ parse_args() {
                             demo_die "unknown argument: $1"    ;;
         esac
     done
+
+    export ATOMIC_DEMO_PLUGINS
 }
 
 # --------------------------------------------------------------------------
-# fail MSG [LOGFILE...] -- die, naming the logs worth reading
-fail() {
-    local msg="$1"; shift
+# install + state isolation + broker, in broker.sh.  The broker it starts
+# is a detached background process with a pidfile, so it outlives that
+# script (and this one) and down.sh stops it.
+step_broker() {
+    local args=(--plugins "$ATOMIC_DEMO_PLUGINS")
 
-    printf '\n'
-    demo_warn "$msg"
+    [ "$DO_INSTALL" -eq 1 ] || args+=(--skip-install)
 
-    for log in "$@"; do
-        [ -f "$log" ] || continue
-        printf '\n--- last 30 lines of %s ---\n' "$log" >&2
-        tail -n 30 "$log" >&2 || true
-    done
-
-    printf '\n' >&2
-    demo_die "$msg -- up.sh gives up; run demo/local/down.sh before retrying"
+    "$ATOMIC_DEMO_DIR/broker.sh" "${args[@]}" \
+        || demo_die 'demo/local/broker.sh failed -- see the output above'
 }
 
 # --------------------------------------------------------------------------
-step_prepare() {
-    demo_log "run dir  : $RUN_DIR"
-    demo_log "scratch  : $ATOMIC_DEMO_TMP"
-    demo_log "broker   : $RADICAL_ORBIT_BROKER_URL"
-    demo_log "plugins  : $ATOMIC_DEMO_PLUGINS"
-
-    mkdir -p "$RUN_DIR"
-    mkdir -p "$RADICAL_ORBIT_FEDERATION_STATE" \
-             "$ATOMIC_CAMPAIGN_STATE"          \
-             "$ATOMIC_STORE_ROOT"              \
-             "$ATOMIC_WM_STATE"
-
-    local name
-    for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
-        mkdir -p "$ATOMIC_DEMO_TMP/$name"
-    done
-
-    [ -x "$VE/bin/python" ] \
-        || demo_die "no python in $VE/bin -- is ORBIT_SRC=$ORBIT_SRC right?"
-
-    [ -r "$RADICAL_ORBIT_BROKER_CERT" ] \
-        || demo_die "broker cert missing: $RADICAL_ORBIT_BROKER_CERT"
-    [ -r "$ATOMIC_DEMO_BROKER_KEY" ] \
-        || demo_die "broker key missing: $ATOMIC_DEMO_BROKER_KEY"
-
-    if [ -f "$ATOMIC_DEMO_BROKER_PID" ]; then
-        local old
-        old="$(cat "$ATOMIC_DEMO_BROKER_PID" 2> /dev/null || true)"
-        if [ -n "$old" ] && kill -0 "$old" 2> /dev/null; then
-            demo_die "a demo broker is still running (pid $old) -- run" \
-                     "demo/local/down.sh first"
-        fi
-        rm -f "$ATOMIC_DEMO_BROKER_PID"
-    fi
-}
-
-# --------------------------------------------------------------------------
-# ve3 currently holds a stale radical.orbit (and a pre-#121 endpoint
-# wrapper).  Pilots run the *installed* code, not $PYTHONPATH, so both
-# repos have to be installed -- non-editable, per the ground rules.
-step_install() {
-    if [ "$DO_INSTALL" -eq 0 ]; then
-        demo_log 'install : skipped (--skip-install)'
-        return 0
-    fi
-
-    demo_log "install : radical.orbit from $ORBIT_SRC  (log: $ATOMIC_DEMO_PIP_LOG)"
-    : > "$ATOMIC_DEMO_PIP_LOG"
-
-    "$VE/bin/pip" install --quiet --no-input "$ORBIT_SRC" \
-        >> "$ATOMIC_DEMO_PIP_LOG" 2>&1 \
-        || fail 'pip install radical.orbit failed' "$ATOMIC_DEMO_PIP_LOG"
-
-    demo_log "install : atomic-wm[cli] from $ATOMIC_SRC"
-
-    "$VE/bin/pip" install --quiet --no-input "$ATOMIC_SRC[cli]" \
-        >> "$ATOMIC_DEMO_PIP_LOG" 2>&1 \
-        || fail 'pip install atomic-wm[cli] failed' "$ATOMIC_DEMO_PIP_LOG"
-
-    local missing=''
-    local tool
-    for tool in atomic-join atomic-leave atomic-resources atomic-campaign \
-                atomic-fake-md atomic-fake-train; do
-        [ -x "$VE/bin/$tool" ] || missing="$missing $tool"
-    done
-
-    [ -z "$missing" ] || fail "console scripts missing after install:$missing" \
-                              "$ATOMIC_DEMO_PIP_LOG"
-}
-
-# --------------------------------------------------------------------------
-# The task dispatcher's state root is a module constant (no env override)
-# and stale sessions are replayed at broker start -- so move it aside.
-step_isolate_state() {
-    local src="$ATOMIC_DEMO_DISPATCHER_STATE"
-
-    if [ ! -d "$src" ]; then
-        demo_log 'state   : no dispatcher state to back up'
-        mkdir -p "$src"
-        return 0
-    fi
-
-    if [ -z "$(ls -A "$src" 2> /dev/null || true)" ]; then
-        demo_log 'state   : dispatcher state already empty'
-        return 0
-    fi
-
-    local bak="$RUN_DIR/state.bak-$(date '+%Y%m%d-%H%M%S')"
-
-    mv "$src" "$bak"
-    mkdir -p "$src"
-    printf '%s\n' "$bak" > "$ATOMIC_DEMO_STATE_BAK"
-
-    demo_log "state   : dispatcher state moved to $bak (down.sh restores it)"
-}
-
-# --------------------------------------------------------------------------
-step_start_broker() {
-    if demo_broker_alive; then
-        demo_die "something already answers on $RADICAL_ORBIT_BROKER_URL --" \
-                 "run demo/local/down.sh, or set ATOMIC_DEMO_BROKER_PORT"
-    fi
-
-    demo_log "broker  : starting (log: $ATOMIC_DEMO_BROKER_LOG)"
-
-    : > "$ATOMIC_DEMO_BROKER_LOG"
-
-    "$VE/bin/python" "$ORBIT_SRC/bin/radical-orbit-broker.py" \
-        --host    "$ATOMIC_DEMO_BROKER_HOST"                  \
-        --port    "$ATOMIC_DEMO_BROKER_PORT"                  \
-        --no-auth                                             \
-        --plugins "$ATOMIC_DEMO_PLUGINS"                      \
-        --cert    "$RADICAL_ORBIT_BROKER_CERT"                \
-        --key     "$ATOMIC_DEMO_BROKER_KEY"                   \
-        >> "$ATOMIC_DEMO_BROKER_LOG" 2>&1 &
-
-    local pid=$!
-    printf '%s\n' "$pid" > "$ATOMIC_DEMO_BROKER_PID"
-
-    local deadline=$(( $(date +%s) + ATOMIC_DEMO_BROKER_WAIT ))
-
-    while true; do
-
-        if ! kill -0 "$pid" 2> /dev/null; then
-            rm -f "$ATOMIC_DEMO_BROKER_PID"
-            fail "broker (pid $pid) died during startup" \
-                 "$ATOMIC_DEMO_BROKER_LOG"
-        fi
-
-        if demo_broker_alive; then
-            demo_log "broker  : up (pid $pid), GET /endpoints answers 200"
-            return 0
-        fi
-
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            fail "broker did not answer GET /endpoints within" \
-                 "${ATOMIC_DEMO_BROKER_WAIT}s" "$ATOMIC_DEMO_BROKER_LOG"
-        fi
-
-        sleep "$ATOMIC_DEMO_POLL"
-    done
-}
-
-# --------------------------------------------------------------------------
+# one join.sh per resource, all detached (the live join is a stage moment,
+# not something an automated bring-up does)
 step_join() {
     if [ "$DO_JOIN" -eq 0 ]; then
         demo_log 'join    : skipped (--no-join)'
         return 0
     fi
 
-    local name log
+    local name
     for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
-
-        demo_join_args "$name"
-
-        log="$RUN_DIR/join-$name.log"
-
-        demo_log "join    : $name (log: $log)"
-
-        # `timeout` guards against atomic-join hanging on a broker that
-        # accepts the connection but never answers
-        if ! timeout "$ATOMIC_DEMO_JOIN_WAIT" \
-                 "$VE/bin/atomic-join" "${DEMO_JOIN_ARGS[@]}" --detach \
-                 > "$log" 2>&1; then
-            fail "atomic-join $name failed" "$log" \
-                 "$ATOMIC_WM_STATE/$name/endpoint.log" \
-                 "$ATOMIC_DEMO_BROKER_LOG"
-        fi
+        "$ATOMIC_DEMO_DIR/join.sh" "$name" \
+            || demo_die "demo/local/join.sh $name failed --" \
+                        'run demo/local/down.sh before retrying'
     done
 }
 
@@ -349,8 +192,8 @@ step_wait_resources() {
 
         if [ "$(date +%s)" -ge "$deadline" ]; then
             demo_warn "still $status"
-            fail "resources not ready after ${ATOMIC_DEMO_RESOURCE_WAIT}s" \
-                 "$err" "$ATOMIC_DEMO_BROKER_LOG"
+            demo_fail "resources not ready after ${ATOMIC_DEMO_RESOURCE_WAIT}s" \
+                      "$err" "$ATOMIC_DEMO_BROKER_LOG"
         fi
 
         demo_log "wait    : $status"
@@ -372,6 +215,7 @@ step_report() {
     fi
 
     demo_log 'next     : ve3/bin/python demo/local/smoke.py'
+    demo_log '           (or demo/local/submit.sh --wait)'
     demo_log 'teardown : demo/local/down.sh'
 }
 
@@ -379,10 +223,11 @@ step_report() {
 main() {
     parse_args "$@"
 
-    step_prepare
-    step_install
-    step_isolate_state
-    step_start_broker
+    # the role scripts print their own "what next" hints; up.sh has a
+    # summary of its own, so they stay quiet while it drives them
+    export ATOMIC_DEMO_ORCHESTRATED=1
+
+    step_broker
     step_join
     step_wait_resources
     step_report

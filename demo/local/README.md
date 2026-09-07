@@ -1,18 +1,89 @@
 # The ATOMIC WM demo, on one laptop
 
-Three commands bring the whole demo up on localhost, prove it works, and
-take it down again:
+The harness is one script per **role**, and they all source `env.sh` —
+which owns the whole environment and every shared helper, so no script
+duplicates any of it:
+
+| script | role | what it is |
+|---|---|---|
+| `broker.sh` | broker | install, isolate state, start the broker, wait for it |
+| `join.sh` | resource | join **one** resource (`--live` = the on-camera join) |
+| `submit.sh` | client | submit the campaign (`--wait` = follow it to the end) |
+| `up.sh` | orchestrator | `broker.sh` + three `join.sh` + wait + report |
+| `down.sh` | teardown | leave, stop, sweep, verify, restore |
+| `smoke.py` | proof | submit a campaign and **assert** the demo's claims |
+
+Everything runs against `https://127.0.0.1:8010`. Tuesday's run on real
+machines is the *same code* with different `atomic-join` arguments — see
+"Mapping to the real resources" at the end.
+
+## Running it — by hand, one terminal per role
+
+This is the on-stage sequence. Every step prints what it did and what to
+do next.
 
 ```bash
-demo/local/check_env.sh                       # optional: are we ready?
+demo/local/check_env.sh              # optional: are we ready?
+```
+
+**Terminal 1 — the broker.** Returns once the broker answers; the broker
+itself keeps running in the background with a pidfile.
+
+```bash
+demo/local/broker.sh                 # add --skip-install after the first
+                                     # run of the day (it is the slow part)
+```
+
+**Terminal 2 — the resources that are up before the audience arrives.**
+Each call joins one resource, detached, and returns.
+
+```bash
+demo/local/join.sh local_a
+demo/local/join.sh local_b
+```
+
+**The live moment — joining a resource on camera.** `--live` runs
+`atomic-join` in the *foreground*: the join scrolls by, the federation
+grows by one row in the Explorer, and the process stays there until
+Ctrl-C leaves the federation again. It therefore cannot print the
+resource table afterwards, and says so — watch it from a third terminal
+with `atomic-resources` (after `source demo/local/env.sh`).
+
+```bash
+demo/local/join.sh local_c --live    # Ctrl-C to leave again
+```
+
+**The client.** `--wait` polls until the campaign is terminal and then
+prints the collected results; without it, it prints the campaign id and
+returns.
+
+```bash
+demo/local/submit.sh --wait          # or --sweep temperature=300,600
+```
+
+Or drive the same campaign from the Explorer's ATOMIC page
+(`https://127.0.0.1:8010/`) — the form submits the same spec and sweep.
+
+**Teardown**, whichever way the demo was run:
+
+```bash
+demo/local/down.sh                   # leave, stop, restore, keep logs
+```
+
+## Running it — the automated path
+
+`up.sh` is exactly the sequence above with the three joins detached, plus
+the wait-for-resources step. It is what a rehearsal (and CI) uses:
+
+```bash
 demo/local/up.sh                              # broker + 3 federated resources
 ve3/bin/python demo/local/smoke.py            # submit a campaign, assert it
 demo/local/down.sh                            # leave, stop, restore, keep logs
 ```
 
-Everything runs against `https://127.0.0.1:8010`. Tuesday's run on real
-machines is the *same code* with different `atomic-join` arguments — see
-"Mapping to the real resources" at the end.
+`submit.sh` *runs* the demo, `smoke.py` *proves* it: same campaign, but
+smoke.py asserts the seven claims listed below and exits non-zero naming
+the one that broke.
 
 ## What comes up
 
@@ -129,7 +200,7 @@ It asserts, and exits 1 naming the assertion if any of it is untrue:
 
 Budget: the whole smoke run should stay under five minutes.
 
-`smoke.py` needs no environment of its own: `up.sh` exports into its own
+`smoke.py` needs no environment of its own: the scripts export into their own
 subshell, so when `$RADICAL_ORBIT_BROKER_URL` is unset `smoke.py` reads
 the handful of variables it needs back out of `env.sh`. Sourcing `env.sh`
 first still wins — an explicitly set variable is never overridden.
@@ -139,7 +210,8 @@ first still wins — an explicitly set variable is never overridden.
 | what | where |
 |---|---|
 | broker log | `demo/local/run/broker.log` |
-| join logs | `demo/local/run/join-<resource>.log` |
+| join logs (detached joins; `--live` writes to the terminal) | `demo/local/run/join-<resource>.log` |
+| what `submit.sh` submitted | `demo/local/run/submit.log` |
 | endpoint logs (incl. pilot start-up) | `/tmp/atomic-demo/endpoints/<resource>/endpoint.log` |
 | the joined record of a resource (members, pools, member ids — what `atomic-leave` matches its pilots with) | `/tmp/atomic-demo/endpoints/<resource>/record.json` |
 | campaign + results payloads from the last smoke run | `demo/local/run/smoke-campaign.json`, `smoke-results.json` |
@@ -153,7 +225,7 @@ The demo writes into exactly two places: `/tmp/atomic-demo` and
 `demo/local/run`. The one exception is the task dispatcher's state
 directory (`~/.radical/orbit/task_dispatcher/state`), which has no
 environment override and whose stale sessions would be replayed at broker
-start — `up.sh` moves it into `demo/local/run/state.bak-<ts>` and
+start — `broker.sh` moves it into `demo/local/run/state.bak-<ts>` and
 `down.sh` moves it back.
 
 `demo/local/run/` is scratch: it is safe to delete between runs and should
@@ -162,6 +234,23 @@ not be committed.
 ## Options
 
 ```
+broker.sh --skip-install skip the two pip installs (fast iteration)
+          --plugins LIST broker-hosted plugin set (default:
+                         task_dispatcher,federation,atomic_campaign)
+                         Refuses to start a second broker while the
+                         pidfile of a live one is around.
+
+join.sh RESOURCE         one of local_a, local_b, local_c — the join
+                         arguments live in env.sh (demo_join_args)
+        --live           foreground join (Ctrl-C leaves again); without
+                         it the endpoint is detached and join.sh returns
+
+submit.sh --sweep K=V,V  parameter sweep (default temperature=300,600,900)
+          --spec PATH    workflow spec (default examples/workflow_vacancy.json)
+          --wait         poll to the end, then print the results;
+                         exit 0 only on DONE
+          --timeout SEC  budget for --wait (default 600)
+
 up.sh   --skip-install   skip the two pip installs (fast iteration)
         --no-join        broker only, no resources
         --plugins LIST   broker-hosted plugin set (default:
@@ -192,7 +281,7 @@ via `$ATOMIC_WM_STATE`, so a demo run leaves nothing in `~/.radical`).
 uses it to turn a bare `atomic-fake-md` into an absolute path, so a pilot
 whose python environment lacks `atomic-wm` still finds the workload
 tools. The broker process is the one that needs it — it builds the task
-command — and inherits it from `up.sh`.
+command — and inherits it from `broker.sh`.
 
 ## Before a cross-host run (Tuesday) — two non-negotiables
 
@@ -212,11 +301,11 @@ command — and inherits it from `up.sh`.
 
 ## Troubleshooting
 
-**`up.sh` says the broker died during startup.** Read
+**`broker.sh` (or `up.sh`) says the broker died during startup.** Read
 `demo/local/run/broker.log`. Usual causes: the TLS key is more permissive
 than `0600` (the broker refuses to start), a plugin listed in `--plugins`
 is not installed (`federation` lives in radical.orbit, `atomic_campaign`
-in this repo — `up.sh` installs both; try without `--skip-install`), or
+in this repo — `broker.sh` installs both; try without `--skip-install`), or
 port 8010 is taken (`demo/local/check_env.sh`).
 
 **`atomic-join` fails or the endpoint never connects.** Read

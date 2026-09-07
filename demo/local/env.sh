@@ -4,10 +4,15 @@
 #
 #   source demo/local/env.sh
 #
-# Sourced by up.sh / down.sh / check_env.sh, and meant to be sourced into
-# an interactive shell as well: after that, `atomic-resources`,
-# `atomic-campaign ...` and friends talk to the demo broker without any
-# further flags.
+# Sourced by every script in demo/local/ -- the per-role ones
+# (broker.sh, join.sh, submit.sh), the orchestrator (up.sh), down.sh and
+# check_env.sh -- and meant to be sourced into an interactive shell as
+# well: after that, `atomic-resources`, `atomic-campaign ...` and friends
+# talk to the demo broker without any further flags.
+#
+# This file is the single home of the demo's environment *and* of the
+# bash helpers more than one of those scripts needs; nothing below is
+# copy-pasted into a role script.
 #
 # Everything here follows the spike findings recorded in
 # plans/00-overview.md ("Spike result -- local pool path WORKS"):
@@ -62,6 +67,33 @@ demo_die() {
     exit 1
 }
 
+# demo_hint MSG...  -- a "what to do next" line.  Suppressed while up.sh
+# orchestrates the role scripts, because up.sh prints its own summary.
+demo_hint() {
+    [ "${ATOMIC_DEMO_ORCHESTRATED:-0}" = '1' ] && return 0
+    demo_log "$@"
+}
+
+# demo_fail MSG [LOGFILE...] -- die, naming the logs worth reading.
+# $DEMO_TOOL is the script that gives up (set at the top of each).
+demo_fail() {
+    local msg="$1"; shift
+    local log
+
+    printf '\n'
+    demo_warn "$msg"
+
+    for log in "$@"; do
+        [ -f "$log" ] || continue
+        printf '\n--- last 30 lines of %s ---\n' "$log" >&2
+        tail -n 30 "$log" >&2 || true
+    done
+
+    printf '\n' >&2
+    demo_die "$msg -- ${DEMO_TOOL:-the demo} gives up;" \
+             "run demo/local/down.sh before retrying"
+}
+
 # demo_prepend_path VAR VALUE -- idempotent ':'-list prepend
 demo_prepend_path() {
     local var="$1" val="$2" cur=''
@@ -109,6 +141,48 @@ demo_broker_alive() {
 # may contain the pattern) out of the match.
 demo_orbit_pids() {
     pgrep -f '[r]adical-orbit' 2> /dev/null || true
+}
+
+# demo_broker_pid -- print the pid from the broker pidfile, but only if
+# that process is still alive; non-zero (and silent) otherwise.
+demo_broker_pid() {
+    local pid=''
+
+    [ -f "$ATOMIC_DEMO_BROKER_PID" ] || return 1
+
+    pid="$(cat "$ATOMIC_DEMO_BROKER_PID" 2> /dev/null || true)"
+
+    [ -n "$pid" ]                    || return 1
+    kill -0 "$pid" 2> /dev/null      || return 1
+
+    printf '%s\n' "$pid"
+}
+
+# demo_require_broker -- die politely unless the demo broker answers.
+# join.sh and submit.sh are useless without it, and "connection refused"
+# from a CLI is a worse first message than this one.
+demo_require_broker() {
+    demo_broker_alive && return 0
+
+    demo_die "no demo broker on $RADICAL_ORBIT_BROKER_URL --" \
+             'run demo/local/broker.sh first'
+}
+
+# demo_mkdirs -- every directory the demo writes into (idempotent).
+# Called by whichever role script runs first; the manual sequence has no
+# single entry point that could do it once.
+demo_mkdirs() {
+    local name
+
+    mkdir -p "$RUN_DIR"                        \
+             "$RADICAL_ORBIT_FEDERATION_STATE" \
+             "$ATOMIC_CAMPAIGN_STATE"          \
+             "$ATOMIC_STORE_ROOT"              \
+             "$ATOMIC_WM_STATE"
+
+    for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
+        mkdir -p "$ATOMIC_DEMO_TMP/$name"
+    done
 }
 
 # --------------------------------------------------------------------------
@@ -241,7 +315,8 @@ ATOMIC_DEMO_STATE_BAK="$RUN_DIR/state.bak.latest"
 ATOMIC_DEMO_RESOURCES=(local_a local_b local_c)
 
 # demo_join_args NAME -- fills the array DEMO_JOIN_ARGS with the
-# `atomic-join` arguments for one resource (--detach is added by up.sh).
+# `atomic-join` arguments for one resource (--detach is added by
+# join.sh, which is the only caller).
 demo_join_args() {
     local name="$1"
 
@@ -280,6 +355,17 @@ demo_join_args() {
     esac
 }
 
+# demo_known_resource NAME -- 0 if NAME is one of the demo's resources
+demo_known_resource() {
+    local name="$1" known
+
+    for known in "${ATOMIC_DEMO_RESOURCES[@]}"; do
+        [ "$known" = "$name" ] && return 0
+    done
+
+    return 1
+}
+
 # resources that must show a live pilot before the smoke test starts
 # (allocation mode starts its pilot at join time; a login-mode member has
 # min_pilots=0 and only starts one when the first task arrives, so
@@ -287,11 +373,24 @@ demo_join_args() {
 ATOMIC_DEMO_PILOT_RESOURCES=(local_a)
 
 # --------------------------------------------------------------------------
-# timeouts (seconds) -- every wait loop in up.sh/down.sh uses one of these
+# the campaign the client step submits
+# --------------------------------------------------------------------------
+#
+# submit.sh's defaults; smoke.py carries the same two values of its own
+# (it must stay runnable with nothing sourced).
+
+: "${ATOMIC_DEMO_SPEC:=$ATOMIC_SRC/examples/workflow_vacancy.json}"
+: "${ATOMIC_DEMO_SWEEP:=temperature=300,600,900}"
+
+export ATOMIC_DEMO_SPEC ATOMIC_DEMO_SWEEP
+
+# --------------------------------------------------------------------------
+# timeouts (seconds) -- every wait loop in the demo scripts uses one of these
 # --------------------------------------------------------------------------
 
 : "${ATOMIC_DEMO_BROKER_WAIT:=60}"     # broker answering GET /endpoints
 : "${ATOMIC_DEMO_JOIN_WAIT:=120}"      # one atomic-join --detach call
 : "${ATOMIC_DEMO_RESOURCE_WAIT:=90}"   # all resources listed + pilots up
+: "${ATOMIC_DEMO_CAMPAIGN_WAIT:=600}"  # submit.sh --wait budget
 : "${ATOMIC_DEMO_STOP_WAIT:=15}"       # SIGTERM grace before SIGKILL
 : "${ATOMIC_DEMO_POLL:=2}"             # wait-loop poll interval
