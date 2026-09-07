@@ -25,6 +25,7 @@ stderr ourselves to ``<state>/endpoint.log``.
 """
 
 import errno
+import json
 import os
 import re
 import shutil
@@ -106,6 +107,18 @@ def pid_path(name: str) -> str:
     return os.path.join(state_dir(name), 'endpoint.pid')
 
 
+def record_path(name: str) -> str:
+    """The joined record, as the federation returned it.
+
+    Written next to the pidfile at join time so a teardown knows this
+    resource's pools and member ids **exactly** -- that is what turns
+    pilot matching from a guess into a literal (see
+    :func:`pilot_patterns`).
+    """
+
+    return os.path.join(state_dir(name), 'record.json')
+
+
 # ---------------------------------------------------------------------------
 # pidfile
 # ---------------------------------------------------------------------------
@@ -173,6 +186,48 @@ def remove_pidfile(name: str) -> None:
 
     try:
         os.unlink(pid_path(name))
+    except OSError:
+        pass
+
+
+def write_record(name: str, record: Any) -> Optional[str]:
+    """Store the joined record next to the pidfile; never raises."""
+
+    if not isinstance(record, dict) or not record:
+        return None
+
+    path = record_path(name)
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as fout:
+            json.dump(record, fout, indent=2, sort_keys=False, default=str)
+    except (OSError, TypeError, ValueError):
+        # a teardown that has to fall back to the name-based pattern is
+        # worse than one that does not, but it is not a reason to fail a
+        # join that already succeeded
+        return None
+
+    return path
+
+
+def read_record(name: str) -> Optional[Dict[str, Any]]:
+    """Read the joined record back; ``None`` if there is none (or junk)."""
+
+    try:
+        with open(record_path(name), 'r', encoding='utf-8') as fin:
+            record = json.load(fin)
+    except (OSError, ValueError):
+        return None
+
+    return record if isinstance(record, dict) else None
+
+
+def remove_record(name: str) -> None:
+    """Delete the stored record of `name`, if any."""
+
+    try:
+        os.unlink(record_path(name))
     except OSError:
         pass
 
@@ -481,43 +536,97 @@ def is_endpoint_cmdline(cmdline: str, endpoint: str) -> bool:
     return bool(_named_endpoint_re(endpoint).search(cmdline))
 
 
-# a capability class / member short name, as `atomic-join --member`
-# validates them: lowercase, no dots
-_NAME_PAT = r'[a-z0-9][a-z0-9_-]*'
+# A member short name, as `atomic-join --member` validates it: lowercase,
+# no dots.  The *class* half of a fallback pattern deliberately excludes
+# `_` -- see `pilot_patterns` for why.
+_MEMBER_PAT = r'[a-z0-9][a-z0-9_-]*'
+_CLASS_PAT  = r'[a-z0-9][a-z0-9-]*'
+
+
+def child_endpoint_prefix(pool: str, member_id: str = '') -> str:
+    """The prefix of a pilot's child endpoint name.
+
+    The dispatcher names a pilot ``<pool>_<pid>`` and, in a capability
+    class pool, ``<pool>_<member_id>_<pid>`` -- with
+    ``pid = 'p.<hex>'``.  This builds the exact literal up to that pid,
+    which is what makes matching a pilot to a resource unambiguous.
+    """
+
+    if member_id:
+        return '%s_%s_' % (pool, member_id)
+
+    return '%s_' % pool
+
+
+def pilot_patterns(name: str,
+                   record: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Regexes matching the child endpoint names of `name`'s pilots.
+
+    **Exact, by construction, whenever we know the record.**  A joined
+    record names each member's ``pool_name`` and ``member_id``, so the
+    child endpoint prefix is a literal (``fed-gpu_local_a.gpu_``) and no
+    guessing is involved.
+
+    Without a record (no ``record.json``, no reachable broker) this falls
+    back to a pattern built from the resource name alone -- and that
+    fallback has a **limitation worth knowing**: a class-pool child
+    endpoint is ``fed-<class>_<resource>.<member>_p.<hex>``, and both the
+    class and the resource name may contain ``_``, so
+    ``fed-cpu_local_a.cpu_…`` reads as class ``cpu`` + resource
+    ``local_a`` *or* as class ``cpu_local`` + resource ``a``.  The
+    fallback resolves that by refusing an ``_`` inside the class half, so
+    a resource named ``a`` never claims ``local_a``'s pilots; the price is
+    that pilots of a class whose own name contains ``_`` are not matched
+    by the fallback at all.  Keep the record file and this never comes up.
+    """
+
+    prefixes = []
+
+    for member in (record or {}).get('members') or []:
+        pool = str(member.get('pool_name') or '')
+        mid  = str(member.get('member_id') or '')
+        if pool and mid:
+            prefixes.append(child_endpoint_prefix(pool, mid))
+
+    pool_name = str((record or {}).get('pool_name') or '')
+    if pool_name:
+        # a resource-per-pool federation (or a record from one)
+        prefixes.append(child_endpoint_prefix(pool_name))
+
+    if prefixes:
+        return [re.escape(prefix) for prefix in prefixes]
+
+    # nothing known: the resource's own pool, plus the ambiguous class
+    # form with an underscore-free class half (see above)
+    return [re.escape(pool_prefix(name)),
+            '%s%s_%s\\.%s_' % (re.escape(POOL_PREFIX), _CLASS_PAT,
+                                re.escape(name), _MEMBER_PAT)]
 
 
 def pilot_pids(name: str,
-               procs: Optional[Iterable[Tuple[int, str]]] = None
-               ) -> List[int]:
+               procs: Optional[Iterable[Tuple[int, str]]] = None,
+               record: Optional[Dict[str, Any]] = None) -> List[int]:
     """Pids of pilot children still running for the resource `name`.
 
     psij's ``local`` executor cancels only the wrapper job, so a pilot's
     endpoint can outlive its pool.  A pilot is an orbit endpoint whose
-    ``--name`` is the dispatcher's child endpoint name, and there are two
-    shapes of those:
+    ``--name`` is the dispatcher's child endpoint name for one of this
+    resource's members (see :func:`pilot_patterns`); *record* is the
+    joined record, and passing it is what makes the match exact.
 
-    * ``fed-<name>_p.<hex>`` -- one pool per resource (``f'{pool}_{pid}'``);
-    * ``fed-<class>_<name>.<member>_p.<hex>`` -- a capability class pool,
-      where the pool is named after the class and the member id carries
-      the resource name (``f'{pool}_{member_id}_{pid}'``).
-
-    Both are matched, and the whole argument is: a plain prefix test would
-    let the resource ``local`` kill the pilots of ``local_a``.
+    The whole argument is matched, never a prefix: the resource ``local``
+    must not kill the pilots of ``local_a``.
     """
 
     if procs is None:
         procs = iter_processes()
+    if record is None:
+        record = read_record(name)
 
-    mine = os.getpid()
-
-    # 'fed-<name>_'                     -- one pool per resource
-    per_resource = re.escape(pool_prefix(name))
-    # 'fed-<class>_<name>.<member>_'    -- a capability class pool
-    per_class    = '%s%s_%s\\.%s_' % (re.escape(POOL_PREFIX), _NAME_PAT,
-                                      re.escape(name), _NAME_PAT)
-
-    pattern = re.compile(r'(?:^|\s)(?:-n|--name)\s+(?:%s|%s)p\.[0-9a-f]+'
-                         r'(?:\s|$)' % (per_resource, per_class))
+    mine    = os.getpid()
+    pattern = re.compile(r'(?:^|\s)(?:-n|--name)\s+(?:%s)p\.[0-9a-f]+'
+                         r'(?:\s|$)'
+                         % '|'.join(pilot_patterns(name, record)))
     found   = []
 
     for pid, cmdline in procs:
@@ -551,14 +660,17 @@ def kill_pilots(name: str,
                 procs: Optional[Iterable[Tuple[int, str]]] = None,
                 timeout: float = 5.0,
                 killer: Any = None,
-                alive: Any = None) -> List[int]:
+                alive: Any = None,
+                record: Optional[Dict[str, Any]] = None) -> List[int]:
     """Terminate the surviving pilot children of the resource `name`.
 
     Returns the pids which were signalled (empty when there were none).
-    `killer`/`alive` are injectable, as in :func:`kill_pids`.
+    *record* is the joined record (see :func:`pilot_patterns`); without
+    one the stored ``record.json`` is read.  `killer`/`alive` are
+    injectable, as in :func:`kill_pids`.
     """
 
-    pids = pilot_pids(name, procs)
+    pids = pilot_pids(name, procs, record)
 
     if pids:
         kill_pids(pids, timeout=timeout, killer=killer, alive=alive)

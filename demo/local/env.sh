@@ -224,9 +224,16 @@ ATOMIC_DEMO_STATE_BAK="$RUN_DIR/state.bak.latest"
 # So `md` (lammps, no GPU) can only run on local_a.default or local_b.cpu,
 # and `train` (pytorch, 1 GPU) only in fed-gpu -- whose two members sit at
 # two different "sites", which is the point of the whole class-pool
-# arrangement.  The GPU members declare ONE core and max_pilots=1, so one
-# of them runs one train task at a time and three sweep points cannot fit
-# on a single member.
+# arrangement.
+#
+# Why the smoke test may insist on TWO GPU members: each of them declares
+# ONE core and max_pilots=1, so a member runs one train task at a time and
+# the three sweep points cannot all run concurrently on one.  What makes
+# the second member actually get work is timing, not capacity alone: the
+# dispatcher grows the second member's pilot while the first is busy, so
+# that pilot must become active within 2 x the train stage's duration of
+# the first one.  `train` therefore runs with `--duration-sec 30`, which
+# leaves ~60 s of margin against a warm-up measured at 5-15 s locally.
 #
 # The "GPU" is fake (psij `local`, rhapsody backend `concurrent`): only
 # the *declaration* matters for routing, and nothing reserves a GPU.
@@ -254,9 +261,8 @@ demo_join_args() {
                      --mode       login
                      --site       NERSC
                      --kind       hpc
-                     --declare    mem_gb=16
-                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=lammps,pytorch,site=NERSC'
-                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=NERSC'
+                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=lammps,pytorch,site=NERSC,mem_gb_per_node=16'
+                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=NERSC,mem_gb_per_node=16'
                      --scratch    "$ATOMIC_DEMO_TMP/local_b") ;;
 
         local_c) DEMO_JOIN_ARGS=(
@@ -264,9 +270,8 @@ demo_join_args() {
                      --mode       login
                      --site       PSC
                      --kind       hpc
-                     --declare    mem_gb=16
-                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=pytorch,site=PSC'
-                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=PSC'
+                     --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=pytorch,site=PSC,mem_gb_per_node=16'
+                     --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=PSC,mem_gb_per_node=16'
                      --scratch    "$ATOMIC_DEMO_TMP/local_c") ;;
 
         *)       demo_warn "no join arguments known for '$name'"

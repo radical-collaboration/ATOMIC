@@ -166,15 +166,34 @@ class _FederationAPI(FederationAPI):
             '/%s/submit/%s' % (FEDERATION_PLUGIN, DEFAULT_SID),
             {'task': task, 'requirements': requirements})
         if status >= 400:
-            # 409 is the federation's "no class has an eligible member";
-            # 400 is the dispatcher's "no member satisfies the task
-            # requirements" (shape or software) coming back through it --
-            # both mean the same thing to somebody watching the demo
-            reason = REASON_NO_RESOURCE if status in (400, 409) \
-                     else REASON_NOT_STARTED
+            detail = self._detail(data)
             raise FederationCallError(
-                reason, self._detail(data) or 'HTTP %d' % status)
+                self._submit_reason(status, detail),
+                detail or 'HTTP %d' % status)
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _submit_reason(status: int, detail: str) -> str:
+        """Which on-screen phrase a failed submit deserves.
+
+        409 is the federation's own "no class has an eligible member".
+        A 400 is ambiguous -- it is also what a malformed body earns --
+        so only the dispatcher's two placement refusals are reported as a
+        missing resource; every other 400 is a broken call, and saying
+        "no resource satisfies the requirements" about one would send
+        whoever reads it looking in the wrong place.
+        """
+
+        if status == 409:
+            return REASON_NO_RESOURCE
+
+        if status == 400:
+            text = (detail or '').lower()
+            if 'no member satisfies' in text or 'exceed every pilot_size' \
+                    in text:
+                return REASON_NO_RESOURCE
+
+        return REASON_NOT_STARTED
 
     async def task(self, task_id: str) -> Dict[str, Any]:
 

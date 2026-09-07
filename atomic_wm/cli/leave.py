@@ -185,10 +185,35 @@ def stop_endpoint(args: argparse.Namespace) -> int:
     return 1
 
 
-def stop_pilots(args: argparse.Namespace) -> int:
+def resource_record(args: argparse.Namespace) -> Optional[dict]:
+    """This resource's joined record -- the local copy, else the broker's.
+
+    It names every member's ``pool_name`` and ``member_id``, which is what
+    lets :func:`endpoint_proc.pilot_patterns` build exact child endpoint
+    prefixes instead of guessing from the resource name.  It has to be
+    fetched **before** leaving, because leaving removes the resource.
+    """
+
+    record = endpoint_proc.read_record(args.name)
+
+    if record:
+        return record
+
+    try:
+        client = Client(broker=args.broker, token=args.token, cert=args.cert)
+        record = client.fed_resource(args.name)
+    except (ValueError, ClientError):
+        return None
+
+    return record if isinstance(record, dict) else None
+
+
+def stop_pilots(args: argparse.Namespace,
+                record: Optional[dict] = None) -> int:
     """Step 3 -- terminate pilot children which outlived the pool."""
 
-    pids = endpoint_proc.kill_pilots(args.name, timeout=args.timeout)
+    pids = endpoint_proc.kill_pilots(args.name, timeout=args.timeout,
+                                     record=record)
 
     if pids:
         info('terminated %d surviving pilot process(es): %s'
@@ -201,6 +226,9 @@ def stop_pilots(args: argparse.Namespace) -> int:
 def run(args: argparse.Namespace) -> int:
     """Tear the resource down; 0 only if every step succeeded."""
 
+    # before the federation forgets this resource
+    record = resource_record(args)
+
     rc = leave_federation(args)
 
     if args.keep_endpoint:
@@ -208,7 +236,9 @@ def run(args: argparse.Namespace) -> int:
         return rc
 
     rc |= stop_endpoint(args)
-    rc |= stop_pilots(args)
+    rc |= stop_pilots(args, record)
+
+    endpoint_proc.remove_record(args.name)
 
     return 1 if rc else 0
 

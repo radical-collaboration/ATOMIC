@@ -62,9 +62,15 @@ REASON_STAGE_IN    = 'the input file could not be placed on the resource'
 
 # --------------------------------------------------------------------------
 def reason_failed(stage: 'StageRun') -> str:
-    """The on-screen text for a stage whose task did not succeed."""
+    """The on-screen text for a stage whose task did not succeed.
 
-    if stage.resource:
+    The resource is named only once a poll **confirmed** the placement
+    (``member_id`` is set).  Before that the resource on the record is
+    the advisory one the submit answered with, and blaming a resource
+    that may never have seen the task is worse than saying nothing.
+    """
+
+    if stage.member_id and stage.resource:
         return 'the stage failed on resource %s' % stage.resource
     return 'the stage failed'
 
@@ -571,9 +577,12 @@ class StageRunner:
         member   = task_dict.get('member')
 
         if mid:
+            # the member id is the authoritative placement: it is what the
+            # dispatcher stamped on the task, so its two halves win over
+            # any `resource`/`member` the answer also carried
             split_res, _, split_mem = str(mid).rpartition('.')
-            resource = resource or split_res or None
-            member   = member   or split_mem or None
+            resource = split_res or resource or None
+            member   = split_mem or member   or None
             if mid != stage.member_id:
                 stage.member_id = str(mid)
                 changed = True

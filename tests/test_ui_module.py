@@ -131,7 +131,13 @@ const RESOURCES = { resources: [
         budget: { node_hours: 1.0 },
         usage: { node_hours_used: 1.4, node_hours_remaining: 0,
                  tasks_running: 0, tasks_done: 1 },
-        liveness: 'ok' } ] },
+        liveness: 'ok' },
+      // a member whose name and site carry markup, and whose usage
+      // carries no task counts at all
+      { member: '<b>x"y', member_id: 'local_b.<b>x"y', class: 'cpu',
+        pool_name: 'fed-cpu', nodes: 1, cpus_per_node: 1,
+        software: [], attributes: { site: '"><script>' },
+        budget: {}, usage: {}, liveness: 'ok' } ] },
 ] };
 
 // `m1`/`m2` are the MEMBERS the poll reported for the two stages; a null
@@ -299,9 +305,19 @@ check(res.includes('serving endpoint: ep_local_a'),
 // --- member sub-rows ------------------------------------------------------
 // local_b declares two members in two class pools; local_a declares none
 // and must render exactly as before (one row, no sub-rows)
-check((res.match(/class="ac-member"/g) || []).length === 2,
-      'expected two member sub-rows, got '
+check((res.match(/class="ac-member"/g) || []).length === 3,
+      'expected three member sub-rows, got '
       + (res.match(/class="ac-member"/g) || []).length);
+// a member name / site out of a join spec is data, not markup
+check(!/<b>x/.test(res) && !/<script>/.test(res),
+      'a member name or site was rendered as markup');
+check(res.includes('&lt;b&gt;') || res.includes('&lt;'),
+      'a hostile member name was not escaped at all');
+// no task counts reported for that member: '–', not a zero we invented
+check(m._internals.countCell(undefined) === '–'
+      && m._internals.countCell(0) === '0'
+      && m._internals.countCell(3) === '3',
+      'an absent task count must render as a dash, not 0');
 check(res.includes('└ cpu') && res.includes('└ gpu'),
       'member sub-rows are not labelled with the member name');
 check(res.includes('cpu / fed-cpu') && res.includes('gpu / fed-gpu'),

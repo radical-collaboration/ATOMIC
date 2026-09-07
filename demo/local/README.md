@@ -42,11 +42,17 @@ goes to `fed-gpu`, whose two members sit at two different "sites". The
 **dispatcher**, not the federation, decides which of them each task gets:
 the federation picks a *class*, the dispatcher picks the member.
 
-The two GPU members declare one core and `max_pilots=1`, so each of them
-runs one `train` task at a time. With three sweep points the class pool
-therefore has to use both — which is what `smoke.py --min-gpu-members`
-asserts, and what would silently not happen if `fed-gpu` had a single
-member.
+**Why two GPU members, and why `train` takes 30 s.** Each GPU member
+declares one core and `max_pilots=1`, so it runs one `train` task at a
+time and the three sweep points cannot all run concurrently on one
+member. But capacity alone does not *force* the second member to be
+used: the dispatcher grows its pilot while the first member is busy, so
+that pilot has to become active within **2 × the stage duration** of the
+first one. `train` therefore runs with `--duration-sec 30`, which leaves
+roughly 60 s of margin against a locally measured pilot warm-up of
+5–15 s. That is what makes `smoke.py --min-gpu-members 2` (the default)
+a fair assertion rather than a race; lower it to `1` on a federation
+that genuinely has one GPU member.
 
 The "GPU" is fake (psij `local`, rhapsody backend `concurrent`) and
 nothing reserves it: a declared GPU is a *routing* statement this round,
@@ -94,11 +100,12 @@ wf-001    600          train  DONE   local_b   gpu      fed-gpu  cmp-b6b15c84-wf
 [01:19:31] OK       : campaign cmp-b6b15c84, 3 workflows, 6 stages, 3 resources, 4 members, 24s
 ```
 
-Measured on this laptop before the class-pool change: `up.sh` ~14 s
+Measured on this laptop **before** the class-pool change: `up.sh` ~14 s
 including both pip installs, campaign wall time ~24 s, `down.sh` ~3 s.
-Five members mean up to five pilots on one laptop and the GPU members
-serialise the three `train` tasks two at a time, so the campaign now
-takes longer — watch that number.  The accuracies are deterministic —
+The numbers after it are **not measured yet** — pending the next
+acceptance run. Expect the campaign to take noticeably longer: five
+members mean up to five pilots on one laptop, and the two GPU members
+serialise three 30 s `train` tasks two at a time.  The accuracies are deterministic —
 the same three numbers come back on every run, because the workload seeds
 itself from its own parameters.
 
@@ -134,6 +141,7 @@ first still wins — an explicitly set variable is never overridden.
 | broker log | `demo/local/run/broker.log` |
 | join logs | `demo/local/run/join-<resource>.log` |
 | endpoint logs (incl. pilot start-up) | `/tmp/atomic-demo/endpoints/<resource>/endpoint.log` |
+| the joined record of a resource (members, pools, member ids — what `atomic-leave` matches its pilots with) | `/tmp/atomic-demo/endpoints/<resource>/record.json` |
 | campaign + results payloads from the last smoke run | `demo/local/run/smoke-campaign.json`, `smoke-results.json` |
 | pip output | `demo/local/run/pip.log` |
 | federation / campaign plugin state | `/tmp/atomic-demo/state/` |

@@ -60,7 +60,8 @@ columns: the *Type* cell becomes `class / pool_name`, *Cores*/*GPUs* are
 work* come from the member's own `software`, `budget` and `usage`. The
 member id and queue are tooltip material, and a member declaring GPUs
 says so as *declared, not reserved* — nothing pins a GPU to a task this
-round. A record with no `members` (a federation that predates class
+round. A member whose `usage` carries no task counts shows `–`, not a
+zero it cannot vouch for. A record with no `members` (a federation that predates class
 pools) renders exactly as before: one row, no sub-rows.
 
 The allowance is `budget.node_hours` where declared, otherwise

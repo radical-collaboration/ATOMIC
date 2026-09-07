@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import ssl
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     import requests
@@ -376,21 +376,6 @@ def member_id(resource: str, member: str) -> str:
     return '%s.%s' % (resource, member)
 
 
-def split_member_id(mid: str) -> Tuple[str, str]:
-    """``'local_b.gpu'`` -> ``('local_b', 'gpu')``.
-
-    A resource name may contain dots and a member name may not, so the
-    **last** dot is the separator -- ``rpartition``, never ``partition``.
-    """
-
-    resource, dot, member = str(mid or '').rpartition('.')
-
-    if not dot:
-        return (str(mid or ''), '')
-
-    return (resource, member)
-
-
 def _int(value: Any, default: int) -> int:
     """An int from whatever a record carried; *default* for anything else."""
 
@@ -437,7 +422,10 @@ def members_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
         'member_id'       : member_id(name, DEFAULT_MEMBER) if name else '',
         'class'           : 'gpu' if gpus else 'cpu',
         'pool_name'       : record.get('pool_name') or '',
-        'queue'           : pool.get('queue') or record.get('mode') or '',
+        # a derived member has no queue of its own: an allocation-mode
+        # resource never declared one, and inventing the join mode here
+        # would put a word that is not a queue in a queue column
+        'queue'           : pool.get('queue') or '',
         'account'         : pool.get('account'),
         'nodes'           : nodes,
         'cpus_per_node'   : cpus,

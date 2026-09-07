@@ -71,7 +71,7 @@ const EXAMPLES = [{
        inputs: [], outputs: ['md.json']},
       {name: 'train', type: 'ml_training',
        cmd: ['atomic-fake-train', '--in', 'md.json',
-             '--epochs', '20', '--duration-sec', '10', '--out', 'model.json'],
+             '--epochs', '20', '--duration-sec', '30', '--out', 'model.json'],
        requirements: {cores: 1, gpus: 1, software: ['pytorch']},
        inputs: ['md.json'], outputs: ['model.json']}
     ]
@@ -880,6 +880,12 @@ function nodeHourCell(usage, bud) {
     : `${fmtNum(used, 2)} h <span style="color:var(--muted)">used</span>`;
 }
 
+// A member's usage may not carry task counts at all (a federation that
+// does not break them down per member); an absent count is not zero.
+function countCell(value) {
+  return Number.isFinite(num(value, NaN)) ? String(num(value, 0)) : '–';
+}
+
 function softwareCell(list) {
   return isArr(list) && list.length
     ? list.map(s => `<span class="ac-soft">${esc(s)}</span>`).join('')
@@ -912,8 +918,8 @@ function renderMemberRow(r, m) {
     <td>${softwareCell(m.software)}</td>
     <td class="ac-mono" style="min-width:150px">${
       nodeHourCell(usage, m.budget || {})}</td>
-    <td class="ac-mono">${num(usage.tasks_running, 0)} running
-        · ${num(usage.tasks_done, 0)} done</td>
+    <td class="ac-mono">${countCell(usage.tasks_running)} running
+        · ${countCell(usage.tasks_done)} done</td>
     <td>${esc(m.liveness || r.liveness || '')}</td>
   </tr>`;
 }
@@ -1594,6 +1600,6 @@ export const _internals = {
   parseSweepValues, stateClass, stateBadge, stateWord, stateLabel,
   varyingKeys, legendLabel, paramsLabel, niceTicks, downsample,
   renderPlot, renderFiles, renderResourceRow, renderMemberRow, membersOf,
-  placementOf, pickMetrics,
+  placementOf, countCell, pickMetrics,
   PLOT_GEOMETRY: {PW, PH, PAD}
 };

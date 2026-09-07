@@ -293,6 +293,12 @@ def _member_fragments(name: str, rest: str) -> List[Tuple[str, List[str]]]:
         if not key:
             raise UsageError('--member %s:%s: %r has an empty key'
                              % (name, rest, item))
+        if key not in MEMBER_KEYS and key.lower() in MEMBER_KEYS:
+            # 'Queue=RM' would quietly become an attribute nobody matches
+            raise UsageError('--member %s: unknown key %r -- did you mean '
+                             '%r?  Keys are lower case; anything else '
+                             'becomes an attribute'
+                             % (name, key, key.lower()))
         if any(key == known for known, _ in pairs):
             raise UsageError('--member %s: key %r given more than once'
                              % (name, key))
@@ -331,21 +337,30 @@ def _member_int(name: str, key: str, values: List[str]) -> int:
 
 
 def _attribute_value(values: List[str]) -> Any:
-    """An attribute value: a number where it looks like one, else text.
+    """An attribute value: a number where it round-trips, else text.
 
     A single value stays a scalar (``site=NERSC``); several become a list
     (``labels=a,b``), which is what the dispatcher's matcher understands.
+
+    A value is only turned into a number when the number renders back to
+    exactly what was typed -- ``256`` and ``1.5`` become numbers, while
+    ``007``, ``1.50``, ``1e3`` and ``0x10`` stay text.  A label is matched
+    by equality, so silently rewriting the operator's spelling would
+    match a different thing than the one they wrote.
     """
 
     def one(text: str) -> Any:
         try:
-            return int(text)
+            if str(int(text)) == text:
+                return int(text)
         except ValueError:
             pass
         try:
-            return float(text)
+            if repr(float(text)) == text:
+                return float(text)
         except ValueError:
-            return text
+            pass
+        return text
 
     if len(values) == 1:
         return one(values[0])
@@ -547,10 +562,17 @@ def _validate_members(args: argparse.Namespace) -> None:
 
     given = [flag for flag, val in _login_flags(args) if val is not None]
 
+    if args.software:
+        given.append('--software')
+    for key in ('cores', 'gpus'):
+        if key in args.declared:
+            given.append('--declare %s=' % key)
+
     if given:
         raise UsageError('--member and %s are mutually exclusive -- a '
-                         'member carries its own queue/size/budget'
-                         % ', '.join(given))
+                         'member carries its own queue, size, budget and '
+                         'software, and the resource-wide capabilities are '
+                         'their sum' % ', '.join(given))
 
     for member in args.members:
         name    = member['member']
@@ -938,6 +960,10 @@ def teardown(client: Optional[Client], name: str,
              cancel_tasks: bool = False) -> None:
     """Leave the federation, stop the endpoint, kill surviving pilots."""
 
+    # read the joined record BEFORE dropping it: it names this resource's
+    # pools and member ids, which is what makes the pilot match exact
+    record = endpoint_proc.read_record(name)
+
     if client is not None:
         do_leave(client, name, cancel_tasks=cancel_tasks)
 
@@ -945,12 +971,13 @@ def teardown(client: Optional[Client], name: str,
         proc.stop()
         info('endpoint stopped')
 
-    pids = endpoint_proc.kill_pilots(name)
+    pids = endpoint_proc.kill_pilots(name, record=record)
     if pids:
         info('terminated %d surviving pilot process(es): %s'
              % (len(pids), ', '.join(str(p) for p in pids)))
 
     endpoint_proc.remove_pidfile(name)
+    endpoint_proc.remove_record(name)
 
 
 def install_signal_handlers(stop: threading.Event) -> None:
@@ -1095,6 +1122,11 @@ def run(args: argparse.Namespace) -> int:
         abort(name, proc)
         return 1
 
+    # the federation's answer names every member's pool and member id --
+    # store it so `atomic-leave` can match this resource's pilots exactly
+    endpoint_proc.write_record(name, full if isinstance(full, dict)
+                               else record)
+
     _report_joined(name, record, full)
 
     # ------------------------------------------------------------ 5. serve
@@ -1131,14 +1163,17 @@ def _report_join_failure(e: BaseException, name: str, log: str) -> None:
 def abort(name: str, proc: EndpointProcess) -> None:
     """Undo a join that never completed: stop the child, drop the pidfile."""
 
+    record = endpoint_proc.read_record(name)
+
     proc.stop()
 
-    pids = endpoint_proc.kill_pilots(name)
+    pids = endpoint_proc.kill_pilots(name, record=record)
     if pids:
         info('terminated %d surviving pilot process(es): %s'
              % (len(pids), ', '.join(str(p) for p in pids)))
 
     endpoint_proc.remove_pidfile(name)
+    endpoint_proc.remove_record(name)
 
 
 def member_size(member: Dict[str, Any]) -> str:

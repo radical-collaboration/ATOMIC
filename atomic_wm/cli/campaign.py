@@ -91,6 +91,11 @@ def _params_label(params: Dict[str, Any]) -> str:
     return ' '.join('%s=%s' % (k, params[k]) for k in sorted(params))
 
 
+# stage states in which no member has been bound yet, so any resource on
+# the record is still advisory
+_UNPLACED_STATES = ('PENDING', 'STAGING', 'SUBMITTED')
+
+
 # ---------------------------------------------------------------------------
 def _stage_cell(stage: Dict[str, Any]) -> str:
     """``md:DONE@local_b/cpu`` -- the placement the last poll reported.
@@ -105,7 +110,10 @@ def _stage_cell(stage: Dict[str, Any]) -> str:
     mem   = stage.get('member')
     label = '%s:%s' % (stage.get('name') or '?', state)
 
-    if not res:
+    # while a stage is only submitted, `resource` is the advisory value
+    # the class pool answered with -- the binding choice is made when the
+    # dispatcher places the task, and `member_id` is how we know it was
+    if not res or (state in _UNPLACED_STATES and not stage.get('member_id')):
         return label
 
     return '%s@%s%s' % (label, res, '/%s' % mem if mem else '')

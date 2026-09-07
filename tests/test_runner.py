@@ -474,11 +474,27 @@ class TestFailures:
         assert bad.stages[0].state == 'FAILED'
         assert bad.stages[0].exit_code == 3
         assert bad.stages[1].state == 'SKIPPED'
-        # the on-screen reason is a fixed phrase; ORBIT's text is in `detail`
-        assert bad.stages[0].reason == 'the stage failed on resource res-a'
+        # the on-screen reason is a fixed phrase; ORBIT's text is in
+        # `detail`.  No poll named a member here, so the resource on the
+        # record is still the advisory one and is NOT blamed by name
+        assert bad.stages[0].reason == 'the stage failed'
         assert 'boom' in (bad.stages[0].detail or '')
         assert 'boom' not in (bad.reason or '')
         assert camp.state == 'FAILED'
+
+    def test_a_confirmed_placement_is_named_in_the_reason(self, tmp_path):
+        # once a poll reported a member_id the placement is no longer
+        # advisory, so the failure may name the resource it happened on
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'FAILED', 'exit_code': 3,
+                              'member_id': 'res-b.gpu', 'error': 'boom'}]}})
+        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        _run(fed, camp, _store(tmp_path))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.reason == 'the stage failed on resource res-b'
+        assert stage.detail == 'boom'
 
     def test_nonzero_exit_code_is_a_failure(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={

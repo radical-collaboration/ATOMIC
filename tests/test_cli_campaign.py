@@ -208,6 +208,26 @@ class TestStatus:
         assert 'md:DONE@res-a/cpu' in out
         assert 'train:DONE@res-b' in out
 
+    def test_a_submitted_stage_hides_the_advisory_resource(self, client,
+                                                            capsys):
+        # SUBMITTED + no member_id: the resource on the record is the
+        # advisory one the class pool answered with, not a placement
+        camp = _campaign('SUBMITTED')
+        client.campaign.return_value = camp
+
+        cli.main(['--broker', 'https://x', 'status', 'cmp-1234'])
+        out = capsys.readouterr().out
+        assert 'md:SUBMITTED' in out and '@res-a' not in out
+
+    def test_a_confirmed_placement_is_shown_while_submitted(self, client,
+                                                            capsys):
+        camp = _campaign('SUBMITTED')
+        camp['workflows'][0]['stages'][0]['member_id'] = 'res-a.cpu'
+        client.campaign.return_value = camp
+
+        cli.main(['--broker', 'https://x', 'status', 'cmp-1234'])
+        assert 'md:SUBMITTED@res-a/cpu' in capsys.readouterr().out
+
     def test_an_unplaced_stage_shows_no_resource(self, client, capsys):
         # a task queued in a capability class pool has no member yet, and
         # may have no resource either -- that is not an error

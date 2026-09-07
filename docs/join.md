@@ -102,7 +102,11 @@ atomic-leave local_b
 Repeatable, login mode only, and **mutually exclusive** with the flat
 `--queue/--account/--nodes/--cpus/--gpus-per-node/--walltime/--max-pilots`
 flags (those describe exactly one member, so mixing the two would leave
-it open which member they belong to).
+it open which member they belong to), with `--software`, and with
+`--declare cores=`/`gpus=` — a member carries its own software and size,
+and the resource-wide capabilities are their sum. `--declare mem_gb=`
+still applies to the resource; per-member memory is the
+`mem_gb_per_node` attribute, which is what the dispatcher matches on.
 
 | key | goes to | notes |
 |---|---|---|
@@ -138,8 +142,15 @@ dropped token, and `software` is **always** normalised to a list — the
 record shape never depends on how many tags were typed.  A scalar key
 handed several values (`queue=RM,GPU`) is an error too.
 
-Numbers in attributes stay numbers (`mem_gb_per_node=256` → `256`,
-`tier=1.5` → `1.5`); several values become a list of strings.
+A value becomes a number only when the number renders back to exactly
+what was typed: `mem_gb_per_node=256` → `256` and `tier=1.5` → `1.5`,
+while `007`, `1.50`, `1e3` and `0x10` stay **text**. Labels are matched
+by equality, so rewriting the spelling would match something other than
+what was written. Several values become a list of strings.
+
+Keys are lower case. A key that only differs in case from a known one
+(`Queue=RM`) is rejected rather than quietly filed as an attribute
+nobody matches on.
 
 `atomic-join` echoes every parsed member back on success — class, pool,
 queue, size, budget, software, attributes — so a typo is visible rather
@@ -277,6 +288,7 @@ only needs an endpoint), `ATOMIC_SPEC`, `ATOMIC_FORCE=1` to reinstall,
 |---|---|
 | `~/.radical/orbit/atomic/<name>/endpoint.log` | the endpoint child's stdout/stderr (`$ATOMIC_WM_STATE` moves the whole tree) |
 | `~/.radical/orbit/atomic/<name>/endpoint.pid` | pidfile written as soon as the endpoint child exists (before the join), read by `atomic-leave`; a clean teardown removes it (so if the CLI itself is `SIGKILL`ed, `atomic-leave` can still stop the endpoint) |
+| `~/.radical/orbit/atomic/<name>/record.json` | the record the federation answered the join with, including every member's `pool_name` and `member_id`; it is what lets `atomic-leave` match this resource's pilots **exactly** (see Troubleshooting → *Leftover processes*).  Removed on teardown |
 | `~/.radical/orbit/logs/ep_<name>.log` | the endpoint's own log (ORBIT's logging) |
 | `~/.radical/orbit/federation/scratch/<name>` | default task scratch, unless `--scratch` says otherwise |
 
@@ -321,9 +333,21 @@ outbound access to the broker's host and port.
 *and* any surviving pilot child of it.  Both are matched **by name, not
 by broker**: the endpoint is the process whose `--name` is `ep_<name>`,
 a pilot is one whose `--name` is the dispatcher's child endpoint name —
-`fed-<class>_<resource>.<member>_p.<id>` for a class pool, or
-`fed-<name>_p.<id>` for a pool that is not one (psij's `local` executor
-cancels only the wrapper job).  So `atomic-leave local` never touches `local_a`'s processes — and
+`<pool>_<member_id>_p.<id>` for a class pool, or `<pool>_p.<id>` for a
+pool that is not one (psij's `local` executor cancels only the wrapper
+job).
+
+Those names are built **literally** from `record.json` (or, if that is
+gone, from `GET resource/default/<name>` before the leave), so
+`atomic-leave a` can never touch `local_a`'s pilots.  Only when neither
+is available does it fall back to a pattern derived from the resource
+name — and that fallback has a limit worth knowing: in
+`fed-cpu_local_a.cpu_…` the class/resource boundary is a `_` like any
+other, so it resolves the ambiguity by refusing an `_` inside the class
+half.  A resource named `a` therefore still never claims `local_a`'s
+pilots, but pilots of a class whose *own* name contains `_` are not
+matched by the fallback at all.  Keep `record.json` and the question
+does not arise.  So `atomic-leave local` never touches `local_a`'s processes — and
 never touches endpoints of other brokers or other resources on the same
 machine.  The pid from the pidfile is only signalled after `/proc`
 confirms it really is that endpoint (pids get reused; a stale pidfile is

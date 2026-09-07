@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
 from atomic_wm.campaign.runner  import (FederationCallError, TaskNotFound,
+                                        REASON_NOT_STARTED,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS)
 from atomic_wm.campaign.state   import REASON_INTERRUPTED
 from atomic_wm.plugins.campaign import PluginAtomicCampaign, _FederationAPI
@@ -429,18 +430,39 @@ class TestErrorMapping:
         assert not isinstance(exc.value, TaskNotFound)
         assert exc.value.reason == REASON_NO_STATUS
 
-    def test_400_no_member_satisfies_is_also_no_resource(self, tmp_path):
+    @pytest.mark.parametrize('detail', [
+        'no member satisfies the task requirements: software missing: lammps',
+        "task needs 2 gpus; the largest pilot_size offering GPUs is "
+        "'bridges.gpu/default' with 1 gpu/node -- requirements exceed "
+        "every pilot_size",
+    ])
+    def test_a_400_placement_refusal_reads_as_no_resource(self, tmp_path,
+                                                          detail):
         # the dispatcher answers 400 when no member of the class can
         # satisfy the shape or the software; to somebody watching the demo
         # that is the same thing as the federation's own 409
         api, _ = self._api(tmp_path, {
-            ('POST', '/federation/submit/default'):
-                (400, {'detail': 'no member satisfies task requirements: '
-                                 'software missing: lammps'})})
+            ('POST', '/federation/submit/default'): (400, {'detail': detail})})
         with pytest.raises(FederationCallError) as exc:
             asyncio.run(api.submit({'task_id': 't1'}, {'gpus': 1}))
         assert exc.value.reason == REASON_NO_RESOURCE
-        assert 'software missing' in exc.value.detail
+        assert exc.value.detail == detail
+
+    @pytest.mark.parametrize('detail', [
+        "body needs a 'task' object",
+        'unknown requirement key: colour',
+        '',
+    ])
+    def test_any_other_400_is_a_call_that_did_not_work(self, tmp_path,
+                                                       detail):
+        # a malformed body earns a 400 too; blaming the resources for it
+        # would send whoever reads the screen looking in the wrong place
+        api, _ = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'): (400, {'detail': detail})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't1'}, {}))
+        assert exc.value.reason == REASON_NOT_STARTED
+        assert exc.value.detail == (detail or 'HTTP 400')
 
     def test_a_campaign_reason_never_carries_orbit_words(self, tmp_path):
         host = FakeHost(plugins={'federation': object()}, responses={

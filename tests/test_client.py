@@ -336,13 +336,12 @@ def test_members_of_derives_one_member_for_an_old_record():
     assert member['attributes']['mem_gb_per_node'] == 8.0
 
 
-def test_split_member_id_splits_on_the_last_dot():
+def test_member_id_joins_resource_and_member():
 
-    # a resource name may contain dots, a member short name may not
-    assert client.split_member_id('local_b.gpu')   == ('local_b', 'gpu')
-    assert client.split_member_id('a.b.c.gpu')     == ('a.b.c', 'gpu')
-    assert client.split_member_id('local_b')       == ('local_b', '')
-    assert client.member_id('a.b', 'gpu')          == 'a.b.gpu'
+    # a resource name may contain dots, a member short name may not, so
+    # the LAST dot is always the separator
+    assert client.member_id('a.b', 'gpu') == 'a.b.gpu'
+    assert client.member_id('local_b', 'gpu').rpartition('.')[0] == 'local_b'
 
 
 def test_campaign_routes_use_the_default_sid(broker):

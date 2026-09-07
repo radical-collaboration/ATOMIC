@@ -200,6 +200,13 @@ def test_a_derived_member_of_a_gpu_resource_is_the_gpu_class():
     assert members_of(record)[0]['class'] == 'gpu'
 
 
+def test_a_derived_allocation_member_has_no_queue_of_its_own():
+
+    # an allocation-mode resource never declared a queue; putting the join
+    # mode in a queue column would be a word that is not a queue
+    assert members_of(FLAT)[0]['queue'] == ''
+
+
 def test_a_login_record_without_members_derives_from_its_pool_block():
 
     record = json.loads(json.dumps(FLAT))

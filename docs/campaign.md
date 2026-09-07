@@ -95,9 +95,10 @@ dispatchers or plugins:
 | reason | when |
 |---|---|
 | `the resource federation is not available` | the federation is not hosted |
-| `no resource satisfies the stage requirements` | federation `submit` said 409 (no class has an eligible member) or 400 (no member satisfies the task's shape or software) |
-| `the stage could not be started` | any other submit failure |
-| `the stage failed on resource <name>` | the task ended FAILED / non-zero |
+| `no resource satisfies the stage requirements` | federation `submit` said 409 (no class has an eligible member), or 400 with a *placement* refusal — `no member satisfies …` / `… exceed every pilot_size …` |
+| `the stage could not be started` | any other submit failure, including a 400 that is not a placement refusal (a malformed body earns a 400 too, and blaming the resources for it would send the reader looking in the wrong place) |
+| `the stage failed on resource <name>` | the task ended FAILED / non-zero **and** a poll had confirmed the placement (`member_id`) |
+| `the stage failed` | the task ended FAILED / non-zero before any poll named a member — the resource on the record is still the advisory one |
 | `the stage status could not be read` | task 404, or 10 unreadable polls |
 | `the input file could not be placed on the resource` | an input could not be read out of the previous stage's outputs |
 | `output(s) not collected: …` | a declared output was nowhere to be found |
@@ -161,8 +162,10 @@ further JSON ones — are listed under `files[stage]` by name and size only.
      the same rather than burning the whole timeout;
    - **placement is what the poll says.** Each poll may carry
      `member_id` (`<resource>.<member>`, split on the *last* dot),
-     `member`, `resource`, `class` and `cwd`; whatever it names
-     overwrites the advisory values from the submit. `resource: null` is
+     `member`, `resource`, `cwd` and — not guaranteed — `class`;
+     whatever it names overwrites the advisory values from the submit,
+     and `member_id` wins over a `resource`/`member` in the same answer
+     because it is what the dispatcher stamped on the task. `resource: null` is
      a legitimate answer — for a task the class pool has not placed yet,
      and for one whose resource left the federation while it was queued —
      and never fails a stage: the last placement that *was* named stays

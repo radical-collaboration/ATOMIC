@@ -758,6 +758,72 @@ def test_leave_stops_endpoint_and_pilots(broker, table, capsys):
     assert 'terminated 1 surviving pilot' in capsys.readouterr().out
 
 
+def test_leave_kills_the_pilots_named_in_the_stored_record(broker, table,
+                                                           capsys):
+
+    # the record names the member ids, so the match is a literal -- and
+    # `local_a` must not touch a pilot of the resource `a`
+    broker.resources.append({'name': 'local_a'})
+    endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
+    endpoint_proc.write_record('local_a', {
+        'name': 'local_a',
+        'members': [{'member_id': 'local_a.cpu', 'pool_name': 'fed-cpu'},
+                    {'member_id': 'local_a.gpu', 'pool_name': 'fed-gpu'}]})
+
+    tbl = table({100: EP_A,
+                 200: _pilot('fed-cpu_local_a.cpu_p.a1b2c3d4e5'),
+                 210: _pilot('fed-gpu_local_a.gpu_p.b1b2c3d4e5'),
+                 300: _pilot('fed-cpu_a.cpu_p.c1b2c3d4e5')})
+
+    rc = leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                     'local_a'])
+
+    assert rc == 0
+    killed = [pid for pid, sig in tbl.killed if sig == signal.SIGTERM]
+    assert killed == [100, 200, 210]
+    assert 300 in tbl.procs                      # resource `a`, untouched
+    # the record is dropped with the pidfile
+    assert endpoint_proc.read_record('local_a') is None
+
+
+def test_leave_asks_the_broker_when_there_is_no_stored_record(broker, table):
+
+    # the record has to be fetched BEFORE leaving -- afterwards the
+    # federation no longer knows the resource
+    broker.resources.append({
+        'name': 'local_a',
+        'members': [{'member_id': 'local_a.cpu',
+                     'pool_name': 'fed-big_mem'}]})
+    endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
+
+    tbl = table({100: EP_A,
+                 200: _pilot('fed-big_mem_local_a.cpu_p.a1b2c3d4e5')})
+
+    assert leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                       'local_a']) == 0
+
+    killed = [pid for pid, sig in tbl.killed if sig == signal.SIGTERM]
+    # the underscore in the class name is exactly what the name-based
+    # fallback cannot resolve -- the fetched record can
+    assert killed == [100, 200]
+
+
+def test_leave_reports_what_the_federation_did(broker, table, capsys):
+
+    broker.resources.append({
+        'name': 'local_a',
+        'members': [{'member_id': 'local_a.cpu', 'pool_name': 'fed-cpu'},
+                    {'member_id': 'local_a.gpu', 'pool_name': 'fed-gpu'}]})
+    endpoint_proc.write_pidfile('local_a', 100, 'ep_local_a')
+    table({100: EP_A})
+
+    assert leave.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                       'local_a', '--cancel-tasks']) == 0
+
+    out = capsys.readouterr().out
+    assert '2 member(s) removed' in out
+
+
 def test_leave_without_a_pidfile(broker, table, capsys):
 
     broker.resources.append({'name': 'local_a'})
@@ -1076,6 +1142,36 @@ def test_parse_member_software_is_always_a_list():
         'attributes': {'site': 'NERSC'}}
 
 
+def test_parse_member_rejects_a_case_folded_known_key():
+
+    # 'Queue=RM' would quietly become an attribute nobody matches on
+    with pytest.raises(join.UsageError) as exc:
+        join.parse_member('cpu:Queue=RM')
+
+    assert "did you mean 'queue'" in str(exc.value)
+
+
+@pytest.mark.parametrize('text,value', [
+    ('256',   256),          # round-trips
+    ('1.5',   1.5),          # round-trips
+    ('0',     0),
+    ('-3',    -3),
+    ('007',   '007'),        # would come back as '7'
+    ('1.50',  '1.50'),       # would come back as '1.5'
+    ('1e3',   '1e3'),        # would come back as '1000.0'
+    ('0x10',  '0x10'),
+    ('NERSC', 'NERSC'),
+])
+def test_attribute_numbers_are_only_coerced_when_they_round_trip(text,
+                                                                 value):
+
+    member = join.parse_member('cpu:label=%s' % text)
+    got    = member['attributes']['label']
+
+    assert got == value
+    assert isinstance(got, type(value))
+
+
 def test_parse_member_unknown_keys_become_attributes():
 
     member = join.parse_member('cpu:queue=RM,site=NERSC,mem_gb_per_node=256,'
@@ -1226,11 +1322,26 @@ def test_an_explicit_node_hours_wins_over_the_member_sum():
     assert record['budget'] == {'node_hours': 9.0}
 
 
-def test_declared_capabilities_still_win():
+def test_a_resource_wide_memory_declaration_still_applies():
 
-    record = join.assemble_record(_member_args('--declare', 'cores=99'))
+    # --declare mem_gb is not derivable from the members, so it stays
+    record = join.assemble_record(_member_args('--declare', 'mem_gb=64'))
 
-    assert record['capabilities']['cores'] == 99
+    assert record['capabilities']['mem_gb'] == 64.0
+
+
+@pytest.mark.parametrize('extra', [['--software', 'lammps'],
+                                   ['--declare', 'cores=99'],
+                                   ['--declare', 'gpus=4'],
+                                   ['--declare', 'cores=8,mem_gb=16']])
+def test_member_rejects_resource_wide_size_and_software(extra):
+
+    # a member carries its own software and size; the resource-wide
+    # capabilities are their sum, so declaring both is ambiguous
+    with pytest.raises(join.UsageError) as exc:
+        _member_args(*extra)
+
+    assert 'mutually exclusive' in str(exc.value)
 
 
 def test_joined_members_are_echoed_back(capsys):
@@ -1249,17 +1360,107 @@ def test_joined_members_are_echoed_back(capsys):
     assert 'software=lammps,pytorch' in out
 
 
+# a class pool names its pilots '<pool>_<member_id>_<pid>'; the resource
+# name sits inside the member id, and BOTH the class and the resource name
+# may contain '_' -- which is exactly where a name-based match goes wrong
+def _pilot(name):
+    return 'radical-orbit-endpoint --name %s --plugins default' % name
+
+
+CLASS_PROCS = [(20, _pilot('fed-gpu_local_a.gpu_p.a1b2c3d4e5')),
+               (21, _pilot('fed-cpu_local.cpu_p.b1b2c3d4e5')),
+               (22, _pilot('fed-cpu_a.cpu_p.c1b2c3d4e5')),
+               (23, _pilot('fed-cpu_local_a.cpu_p.d1b2c3d4e5')),
+               (24, _pilot('fed-local_b_p.e1b2c3d4e5'))]
+
+
 def test_pilot_pids_matches_a_class_pool_pilot():
 
-    # a class pool names its pilots '<pool>_<member_id>_<pid>'
-    procs = [(20, 'radical-orbit-endpoint --name fed-gpu_local_a.gpu_'
-                  'p.a1b2c3d4e5 --plugins default'),
-             (21, 'radical-orbit-endpoint --name fed-cpu_local.cpu_'
-                  'p.a1b2c3d4e5 --plugins default')]
+    assert endpoint_proc.pilot_pids('local_a', CLASS_PROCS) == [20, 23]
+    assert endpoint_proc.pilot_pids('local_a.gpu', CLASS_PROCS) == []
 
-    assert endpoint_proc.pilot_pids('local_a', procs) == [20]
-    assert endpoint_proc.pilot_pids('local',   procs) == [21]
-    assert endpoint_proc.pilot_pids('local_a.gpu', procs) == []
+
+@pytest.mark.parametrize('name,expected', [
+    ('a',       [22]),            # NOT local_a's pilots (class 'cpu_local')
+    ('local',   [21]),            # NOT local_a's either
+    ('local_a', [20, 23]),
+    ('local_b', [24]),            # a pool that is not a class pool
+])
+def test_the_name_fallback_never_claims_another_resources_pilots(
+        name, expected):
+
+    # no record.json and no broker: the fallback resolves the
+    # class/resource ambiguity by refusing an '_' inside the class half
+    assert endpoint_proc.pilot_pids(name, CLASS_PROCS) == expected
+
+
+def test_a_joined_record_makes_the_match_exact():
+
+    record = {'name': 'a', 'members': [
+        {'member_id': 'a.cpu', 'pool_name': 'fed-cpu'}]}
+
+    assert endpoint_proc.pilot_pids('a', CLASS_PROCS, record) == [22]
+    assert endpoint_proc.pilot_patterns('a', record) == \
+        [endpoint_proc.re.escape('fed-cpu_a.cpu_')]
+
+
+def test_a_record_with_an_underscored_class_is_matched_exactly():
+
+    # the fallback cannot resolve this one (documented); the record can
+    procs  = [(30, _pilot('fed-big_mem_local_a.cpu_p.f1b2c3d4e5'))]
+    record = {'name': 'local_a', 'members': [
+        {'member_id': 'local_a.cpu', 'pool_name': 'fed-big_mem'}]}
+
+    assert endpoint_proc.pilot_pids('local_a', procs, record) == [30]
+    assert endpoint_proc.pilot_pids('local_a', procs) == []      # fallback
+
+
+def test_the_record_is_written_at_join_and_removed_at_teardown(tmp_path):
+
+    full = {'name': 'local_b', 'members': [
+        {'member': 'gpu', 'member_id': 'local_b.gpu',
+         'pool_name': 'fed-gpu'}]}
+
+    assert endpoint_proc.read_record('local_b') is None
+    endpoint_proc.write_record('local_b', full)
+    assert endpoint_proc.read_record('local_b') == full
+
+    endpoint_proc.remove_record('local_b')
+    assert endpoint_proc.read_record('local_b') is None
+    # removing one that is not there is not an error
+    endpoint_proc.remove_record('local_b')
+
+
+def test_an_unreadable_record_is_simply_absent(tmp_path):
+
+    endpoint_proc.state_dir('local_c', create=True)
+    with open(endpoint_proc.record_path('local_c'), 'w',
+              encoding='utf-8') as fout:
+        fout.write('{not json')
+
+    assert endpoint_proc.read_record('local_c') is None
+    # ... and a non-dict record is not written at all
+    assert endpoint_proc.write_record('local_d', ['nope']) is None
+
+
+def test_join_stores_the_record_the_federation_returned(broker, proc):
+
+    rc = join.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                    '--name', 'local_b', '--mode', 'login', '--detach',
+                    '--member', MEMBER_GPU])
+
+    assert rc == 0
+
+    # the SERVER's record, with the member id, class and pool it filled in
+    stored = endpoint_proc.read_record('local_b')
+    assert stored is not None
+    member = stored['members'][0]
+    assert member['member_id'] == 'local_b.gpu'
+    assert member['pool_name'] == 'fed-gpu'
+    assert member['class']     == 'gpu'
+    # ... which is what makes the pilot match a literal
+    assert endpoint_proc.pilot_patterns('local_b', stored) == \
+        [endpoint_proc.re.escape('fed-gpu_local_b.gpu_')]
 
 
 # ---------------------------------------------------------------------------

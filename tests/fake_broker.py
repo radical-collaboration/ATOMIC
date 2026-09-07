@@ -211,9 +211,22 @@ class FakeBroker:
         budget = record.get('budget') or {'node_hours': self.derived_budget}
 
         full = dict(record)
+
+        # the federation fills a member's id, class and pool server-side
+        members = []
+        for member in record.get('members') or []:
+            cls = member.get('class') or (
+                  'gpu' if member.get('gpus_per_node') else 'cpu')
+            members.append(dict(member,
+                                member_id='%s.%s' % (name, member['member']),
+                                **{'class': cls},
+                                pool_name='fed-%s' % cls))
+        if members:
+            full['members'] = members
+
         full.update({'joined_at'     : 1757100000.0,
-                     'dispatcher_sid': 'fed-%s' % name,
-                     'pool_name'     : 'fed-%s' % name,
+                     'dispatcher_sid': 'fed' if members else 'fed-%s' % name,
+                     'pool_name'     : '' if members else 'fed-%s' % name,
                      'liveness'      : 'ok',
                      'budget'        : budget,
                      'usage'         : {'node_hours_used'     : 0.0,
@@ -236,7 +249,12 @@ class FakeBroker:
         for rec in list(self.resources):
             if rec.get('name') == name:
                 self.resources.remove(rec)
-                return FakeResponse(200, {'ok': True})
+                return FakeResponse(200, {
+                    'resource'       : name,
+                    'ok'             : True,
+                    'members_removed': len(rec.get('members') or []) or 1,
+                    'tasks_requeued' : 0,
+                    'tasks_failed'   : 0})
 
         return FakeResponse(404, error_body(404, 'unknown resource %r' % name))
 
