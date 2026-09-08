@@ -23,14 +23,14 @@ This is the on-stage sequence. Every step prints what it did and what to
 do next.
 
 ```bash
-demo/local/check_env.sh              # optional: are we ready?
+demo/2026_09_08/check_env.sh              # optional: are we ready?
 ```
 
 **Terminal 1 — the broker.** Returns once the broker answers; the broker
 itself keeps running in the background with a pidfile.
 
 ```bash
-demo/local/broker.sh                 # add --skip-install after the first
+demo/2026_09_08/broker.sh                 # add --skip-install after the first
                                      # run of the day (it is the slow part)
 ```
 
@@ -38,8 +38,8 @@ demo/local/broker.sh                 # add --skip-install after the first
 Each call joins one resource, detached, and returns.
 
 ```bash
-demo/local/join.sh local_a
-demo/local/join.sh local_b
+demo/2026_09_08/join.sh local_a
+demo/2026_09_08/join.sh local_b
 ```
 
 **The live moment — joining a resource on camera.** `--live` runs
@@ -47,10 +47,10 @@ demo/local/join.sh local_b
 grows by one row in the Explorer, and the process stays there until
 Ctrl-C leaves the federation again. It therefore cannot print the
 resource table afterwards, and says so — watch it from a third terminal
-with `atomic-resources` (after `source demo/local/env.sh`).
+with `atomic-resources` (after `source demo/2026_09_08/env.sh`).
 
 ```bash
-demo/local/join.sh local_c --live    # Ctrl-C to leave again
+demo/2026_09_08/join.sh local_c --live    # Ctrl-C to leave again
 ```
 
 **The client.** `--wait` polls until the campaign is terminal and then
@@ -58,7 +58,7 @@ prints the collected results; without it, it prints the campaign id and
 returns.
 
 ```bash
-demo/local/submit.sh --wait          # or --sweep temperature=300,600
+demo/2026_09_08/submit.sh --wait          # or --sweep temperature=300,600
 ```
 
 Or drive the same campaign from the Explorer's ATOMIC page
@@ -67,7 +67,7 @@ Or drive the same campaign from the Explorer's ATOMIC page
 **Teardown**, whichever way the demo was run:
 
 ```bash
-demo/local/down.sh                   # leave, stop, restore, keep logs
+demo/2026_09_08/down.sh                   # leave, stop, restore, keep logs
 ```
 
 ## Running it — the automated path
@@ -76,9 +76,9 @@ demo/local/down.sh                   # leave, stop, restore, keep logs
 the wait-for-resources step. It is what a rehearsal (and CI) uses:
 
 ```bash
-demo/local/up.sh                              # broker + 3 federated resources
-ve3/bin/python demo/local/smoke.py            # submit a campaign, assert it
-demo/local/down.sh                            # leave, stop, restore, keep logs
+demo/2026_09_08/up.sh                              # broker + 3 federated resources
+ve3/bin/python demo/2026_09_08/smoke.py            # submit a campaign, assert it
+demo/2026_09_08/down.sh                            # leave, stop, restore, keep logs
 ```
 
 `submit.sh` *runs* the demo, `smoke.py` *proves* it: same campaign, but
@@ -142,9 +142,9 @@ so only `local_a` has a pilot before the campaign starts.
 
 ```
 [00:12:03] install : radical.orbit from /home/merzky/radical/radical.orbit
-[00:12:31] state   : dispatcher state moved to demo/local/run/state.bak-…
+[00:12:31] state   : dispatcher state moved to demo/2026_09_08/run/state.bak-…
 [00:12:32] broker  : up (pid 41234), GET /endpoints answers 200
-[00:12:33] join    : local_a (log: demo/local/run/join-local_a.log)
+[00:12:33] join    : local_a (log: demo/2026_09_08/run/join-local_a.log)
 …
 [00:13:02] wait    : 3 resources federated, pilots up on local_a
 [00:13:02] Explorer : https://127.0.0.1:8010/
@@ -209,26 +209,26 @@ first still wins — an explicitly set variable is never overridden.
 
 | what | where |
 |---|---|
-| broker log | `demo/local/run/broker.log` |
-| join logs (detached joins; `--live` writes to the terminal) | `demo/local/run/join-<resource>.log` |
-| what `submit.sh` submitted | `demo/local/run/submit.log` |
+| broker log | `demo/2026_09_08/run/broker.log` |
+| join logs (detached joins; `--live` writes to the terminal) | `demo/2026_09_08/run/join-<resource>.log` |
+| what `submit.sh` submitted | `demo/2026_09_08/run/submit.log` |
 | endpoint logs (incl. pilot start-up) | `/tmp/atomic-demo/endpoints/<resource>/endpoint.log` |
 | the joined record of a resource (members, pools, member ids — what `atomic-leave` matches its pilots with) | `/tmp/atomic-demo/endpoints/<resource>/record.json` |
-| campaign + results payloads from the last smoke run | `demo/local/run/smoke-campaign.json`, `smoke-results.json` |
-| pip output | `demo/local/run/pip.log` |
+| campaign + results payloads from the last smoke run | `demo/2026_09_08/run/smoke-campaign.json`, `smoke-results.json` |
+| pip output | `demo/2026_09_08/run/pip.log` |
 | federation / campaign plugin state | `/tmp/atomic-demo/state/` |
 | central result store | `/tmp/atomic-demo/store/<campaign>/<workflow>/<stage>/` |
 | task scratch | `/tmp/atomic-demo/<resource>/` |
-| dispatcher state backup | `demo/local/run/state.bak-<timestamp>` |
+| dispatcher state backup | `demo/2026_09_08/run/state.bak-<timestamp>` |
 
 The demo writes into exactly two places: `/tmp/atomic-demo` and
-`demo/local/run`. The one exception is the task dispatcher's state
+`demo/2026_09_08/run`. The one exception is the task dispatcher's state
 directory (`~/.radical/orbit/task_dispatcher/state`), which has no
 environment override and whose stale sessions would be replayed at broker
-start — `broker.sh` moves it into `demo/local/run/state.bak-<ts>` and
+start — `broker.sh` moves it into `demo/2026_09_08/run/state.bak-<ts>` and
 `down.sh` moves it back.
 
-`demo/local/run/` is scratch: it is safe to delete between runs and should
+`demo/2026_09_08/run/` is scratch: it is safe to delete between runs and should
 not be committed.
 
 ## Options
@@ -270,7 +270,7 @@ down.sh --all-endpoints  kill every radical-orbit-endpoint process, not
         --wipe           also remove /tmp/atomic-demo
 ```
 
-`source demo/local/env.sh` in your own shell to get the same environment
+`source demo/2026_09_08/env.sh` in your own shell to get the same environment
 by hand — after that `atomic-resources`, `atomic-campaign status <cid>`
 and friends talk to the demo broker with no flags. Do that before running
 `atomic-leave` manually, or it will look for pidfiles in the wrong place
@@ -302,14 +302,14 @@ command — and inherits it from `broker.sh`.
 ## Troubleshooting
 
 **`broker.sh` (or `up.sh`) says the broker died during startup.** Read
-`demo/local/run/broker.log`. Usual causes: the TLS key is more permissive
+`demo/2026_09_08/run/broker.log`. Usual causes: the TLS key is more permissive
 than `0600` (the broker refuses to start), a plugin listed in `--plugins`
 is not installed (`federation` lives in radical.orbit, `atomic_campaign`
 in this repo — `broker.sh` installs both; try without `--skip-install`), or
-port 8010 is taken (`demo/local/check_env.sh`).
+port 8010 is taken (`demo/2026_09_08/check_env.sh`).
 
 **`atomic-join` fails or the endpoint never connects.** Read
-`demo/local/run/join-<name>.log` and
+`demo/2026_09_08/run/join-<name>.log` and
 `/tmp/atomic-demo/endpoints/<name>/endpoint.log`. The classic causes are
 the two environment rules `env.sh` exists for: `RADICAL_LOG_LVL` set to
 something the endpoint's `--log-level` rejects (e.g. `DEBUG_9`), and
@@ -336,7 +336,7 @@ log and in
 scripts — only on task state.
 
 **`smoke.py` times out.** It polls campaign state only, so a timeout means
-a task is stuck, not that a pilot is slow. `demo/local/run/broker.log`
+a task is stuck, not that a pilot is slow. `demo/2026_09_08/run/broker.log`
 shows the dispatcher's view; `smoke-campaign.json` shows how far each
 workflow got.
 

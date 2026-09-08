@@ -299,7 +299,7 @@ def test_declared_budget_is_sent():
 def test_allocation_record_shape():
 
     args = parsed(ARGS_LOCAL + ['--site', 'local', '--kind', 'workstation',
-                                '--scratch', '/tmp/atomic-demo/local_a'])
+                                '--scratch', '/tmp/atomic-demo/2026_09_08_a'])
     rec  = join.assemble_record(args, {'gpus': 0, 'mem_gb': 8.0})
 
     assert rec == {'name'        : 'local_a',
@@ -309,7 +309,7 @@ def test_allocation_record_shape():
                    'kind'        : 'workstation',
                    'capabilities': {'cores': 4, 'gpus': 0, 'mem_gb': 8.0,
                                     'software': ['lammps']},
-                   'scratch_base': '/tmp/atomic-demo/local_a'}
+                   'scratch_base': '/tmp/atomic-demo/2026_09_08_a'}
 
 
 def test_login_record_carries_the_pool():
@@ -397,7 +397,7 @@ def _client(broker):
 def test_join_flow_detached(broker, proc, capsys):
 
     rc = join.main(ARGS_LOCAL + ['--site', 'local', '--detach',
-                                 '--scratch', '/tmp/atomic-demo/local_a'])
+                                 '--scratch', '/tmp/atomic-demo/2026_09_08_a'])
 
     assert rc == 0
 
@@ -419,7 +419,7 @@ def test_join_flow_detached(broker, proc, capsys):
         'kind'        : 'workstation',
         'capabilities': {'cores': 4, 'gpus': 2, 'mem_gb': 32.0,
                          'software': ['lammps']},
-        'scratch_base': '/tmp/atomic-demo/local_a'}]
+        'scratch_base': '/tmp/atomic-demo/2026_09_08_a'}]
 
     # ... and a pidfile was written for atomic-leave
     info = pidfile('local_a')

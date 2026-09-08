@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# demo/local/broker.sh -- the *broker* role of the ATOMIC WM demo.
+# demo/2026_09_08/broker.sh -- the *broker* role of the ATOMIC WM demo.
 #
 # One role, one terminal (xGFabric style).  This is terminal 1:
 #
-#   demo/local/broker.sh                # install, isolate state, start
-#   demo/local/broker.sh --skip-install # fast iteration
+#   demo/2026_09_08/broker.sh                # install, isolate state, start
+#   demo/2026_09_08/broker.sh --skip-install # fast iteration
 #
 # It does three things, in this order:
 #
@@ -19,16 +19,16 @@
 #      GET /endpoints answers 200.
 #
 # The broker keeps running after this script returns -- it is a detached
-# background process with a pidfile, and `demo/local/down.sh` stops it.
+# background process with a pidfile, and `demo/2026_09_08/down.sh` stops it.
 # Running the script again while that broker is alive is refused.
 #
-# Next: demo/local/join.sh <resource>, then demo/local/submit.sh.
+# Next: demo/2026_09_08/join.sh <resource>, then demo/2026_09_08/submit.sh.
 #
-# See demo/local/README.md.
+# See demo/2026_09_08/README.md.
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 DEMO_TOOL='broker.sh'
@@ -90,7 +90,7 @@ step_prepare() {
     local old=''
     if old="$(demo_broker_pid)"; then
         demo_die "a demo broker is still running (pid $old) -- run" \
-                 "demo/local/down.sh first"
+                 "demo/2026_09_08/down.sh first"
     fi
 
     rm -f "$ATOMIC_DEMO_BROKER_PID"
@@ -161,7 +161,7 @@ step_isolate_state() {
 step_start_broker() {
     if demo_broker_alive; then
         demo_die "something already answers on $RADICAL_ORBIT_BROKER_URL --" \
-                 "run demo/local/down.sh, or set ATOMIC_DEMO_BROKER_PORT"
+                 "run demo/2026_09_08/down.sh, or set ATOMIC_DEMO_BROKER_PORT"
     fi
 
     demo_log "broker  : starting (log: $ATOMIC_DEMO_BROKER_LOG)"
@@ -208,9 +208,9 @@ step_start_broker() {
 step_report() {
     demo_hint "Explorer: $RADICAL_ORBIT_BROKER_URL/ (self-signed cert)"
     demo_hint "logs    : $ATOMIC_DEMO_BROKER_LOG"
-    demo_hint "next    : demo/local/join.sh RESOURCE" \
+    demo_hint "next    : demo/2026_09_08/join.sh RESOURCE" \
               "(${ATOMIC_DEMO_RESOURCES[*]})"
-    demo_hint "teardown: demo/local/down.sh"
+    demo_hint "teardown: demo/2026_09_08/down.sh"
 }
 
 # --------------------------------------------------------------------------

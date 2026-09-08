@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""demo/local/smoke.py -- prove the ATOMIC WM demo actually ran.
+"""demo/2026_09_08/smoke.py -- prove the ATOMIC WM demo actually ran.
 
 Submits ``examples/workflow_vacancy.json`` as a campaign with the sweep
 ``temperature=300,600,900``, waits for it, and then asserts everything the
@@ -19,7 +19,7 @@ demo claims on stage:
    so a violation means results got mixed up between workflows,
 7. the central store holds the six JSON outputs plus a manifest per stage.
 
-**The placement this asserts against** (``demo/local/env.sh``): ``md``
+**The placement this asserts against** (``demo/2026_09_08/env.sh``): ``md``
 needs lammps and no GPU, so it runs in ``fed-cpu`` on ``local_a.default``
 or ``local_b.cpu`` -- never on ``local_c.cpu``, which has no lammps.
 ``train`` needs pytorch and one GPU, so it runs in ``fed-gpu``, whose two
@@ -28,15 +28,15 @@ take one task at a time -- three ``train`` tasks therefore use both.
 Which member gets which task is the *dispatcher's* choice, not the
 federation's.
 
-Run it after ``demo/local/up.sh``::
+Run it after ``demo/2026_09_08/up.sh``::
 
-    ve3/bin/python demo/local/smoke.py
+    ve3/bin/python demo/2026_09_08/smoke.py
 
 Exit codes: 0 all good, 1 an assertion failed, 2 could not run at all
 (broker unreachable, bad arguments, campaign never finished).
 
 The module is written so that every check is a small pure function over
-plain JSON -- ``demo/local/test_smoke_helpers.py`` exercises them with
+plain JSON -- ``demo/2026_09_08/test_smoke_helpers.py`` exercises them with
 canned payloads, no broker needed.
 """
 
@@ -855,8 +855,8 @@ DEMO_ENV_KEYS = ('RADICAL_ORBIT_BROKER_URL', 'RADICAL_ORBIT_BROKER_CERT',
 def load_demo_env(env_sh: Optional[str] = None) -> List[str]:
     """Fill in demo defaults from ``env.sh`` when nobody sourced it.
 
-    The documented sequence is ``./demo/local/up.sh && ve3/bin/python
-    demo/local/smoke.py``, and ``up.sh`` exports into its own subshell --
+    The documented sequence is ``./demo/2026_09_08/up.sh && ve3/bin/python
+    demo/2026_09_08/smoke.py``, and ``up.sh`` exports into its own subshell --
     so by the time smoke.py runs, the caller's environment may know
     nothing about the demo.  Rather than duplicate the defaults here,
     read them back out of ``env.sh`` itself.
@@ -904,7 +904,7 @@ def make_client(args: argparse.Namespace) -> Any:
     except ImportError as e:
         raise SmokeError('cannot import atomic_wm.client (%s) -- run this '
                          'with the orbit venv python, after '
-                         'demo/local/up.sh has installed atomic-wm[cli]' % e)
+                         'demo/2026_09_08/up.sh has installed atomic-wm[cli]' % e)
 
     try:
         return Client(broker=args.broker, token=args.token, cert=args.cert)
@@ -1104,7 +1104,7 @@ def run(args: argparse.Namespace) -> int:
 
     added = load_demo_env()
     if added:
-        log('env      : took %s from demo/local/env.sh'
+        log('env      : took %s from demo/2026_09_08/env.sh'
             % ', '.join(sorted(added)))
 
     client = make_client(args)
@@ -1121,7 +1121,7 @@ def run(args: argparse.Namespace) -> int:
 
     if not software:
         raise SmokeError('the federation lists no resources -- did '
-                         'demo/local/up.sh finish?')
+                         'demo/2026_09_08/up.sh finish?')
 
     log_federation(software, members)
 
@@ -1250,7 +1250,7 @@ def report_failures(fails: Sequence[str], run_dir: str,
                                                               run_dir))
     warn('  %s/<resource>/endpoint.log -- pilot start-up'
          % os.environ.get('ATOMIC_WM_STATE', '~/.radical/orbit/atomic'))
-    warn('  demo/local/README.md, section "Troubleshooting"')
+    warn('  demo/2026_09_08/README.md, section "Troubleshooting"')
 
     return EXIT_ASSERT
 
@@ -1294,15 +1294,15 @@ def hint_for(message: str) -> str:
                 'the client lost that pinning.')
 
     if 'connection refused' in text or 'cannot reach broker' in text:
-        return ('hint: no broker on that URL -- run demo/local/up.sh (or '
-                'demo/local/broker.sh), or check demo/local/run/broker.log')
+        return ('hint: no broker on that URL -- run demo/2026_09_08/up.sh (or '
+                'demo/2026_09_08/broker.sh), or check demo/2026_09_08/run/broker.log')
 
     if '503' in text and 'federation' in text:
         return ('hint: 503 from the federation usually means the broker was '
                 'started without the plugin -- check the --plugins line in '
-                'demo/local/run/broker.log')
+                'demo/2026_09_08/run/broker.log')
 
-    return 'see demo/local/README.md, section "Troubleshooting"'
+    return 'see demo/2026_09_08/README.md, section "Troubleshooting"'
 
 
 # ---------------------------------------------------------------------------

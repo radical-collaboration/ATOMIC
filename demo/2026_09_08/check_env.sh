@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 #
-# demo/local/check_env.sh -- verify the demo's prerequisites.
+# demo/2026_09_08/check_env.sh -- verify the demo's prerequisites.
 #
 # Starts nothing, changes nothing, installs nothing.  Run it before
 # up.sh (Monday morning, or on a new machine) to find out whether the
 # demo *can* come up:
 #
-#   demo/local/check_env.sh
+#   demo/2026_09_08/check_env.sh
 #
 # Exit code 0 = ready, 1 = at least one FAIL.  WARNs are things the demo
 # survives (a missing node for the UI tests, an unrelated broker running).
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 FAILED=0
@@ -153,7 +153,7 @@ check_ports() {
         ok "127.0.0.1:$ATOMIC_DEMO_BROKER_PORT free (the demo broker)"
     else
         bad "127.0.0.1:$ATOMIC_DEMO_BROKER_PORT is in use --"\
-            'run demo/local/down.sh, or set $ATOMIC_DEMO_BROKER_PORT'
+            'run demo/2026_09_08/down.sh, or set $ATOMIC_DEMO_BROKER_PORT'
     fi
 }
 
@@ -275,12 +275,12 @@ main() {
     printf '\n'
 
     if [ "$FAILED" -gt 0 ]; then
-        printf '%d FAIL, %d WARN -- fix the failures before demo/local/up.sh\n' \
+        printf '%d FAIL, %d WARN -- fix the failures before demo/2026_09_08/up.sh\n' \
                "$FAILED" "$WARNED"
         return 1
     fi
 
-    printf '0 FAIL, %d WARN -- ready for demo/local/up.sh\n' "$WARNED"
+    printf '0 FAIL, %d WARN -- ready for demo/2026_09_08/up.sh\n' "$WARNED"
     return 0
 }
 

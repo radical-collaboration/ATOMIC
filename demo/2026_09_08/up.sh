@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 #
-# demo/local/up.sh -- bring the whole ATOMIC WM demo up on localhost, in
+# demo/2026_09_08/up.sh -- bring the whole ATOMIC WM demo up on localhost, in
 # one command.
 #
 # This is the *automated* path.  It orchestrates the three per-role
 # scripts, which is exactly what a human does by hand in three terminals:
 #
-#   demo/local/broker.sh  [--skip-install] [--plugins LIST]
-#   demo/local/join.sh    local_a          (then local_b, local_c)
-#   demo/local/submit.sh  --wait           <- up.sh stops before this one
+#   demo/2026_09_08/broker.sh  [--skip-install] [--plugins LIST]
+#   demo/2026_09_08/join.sh    local_a          (then local_b, local_c)
+#   demo/2026_09_08/submit.sh  --wait           <- up.sh stops before this one
 #
 # and then adds the two steps that only make sense once *all* resources
 # are in: wait until the federation lists them and the allocation-mode
 # one reports a live pilot, and print the Explorer URL and the table.
 #
-# Then:  ve3/bin/python demo/local/smoke.py  and  demo/local/down.sh
+# Then:  ve3/bin/python demo/2026_09_08/smoke.py  and  demo/2026_09_08/down.sh
 #
-# See demo/local/README.md.
+# See demo/2026_09_08/README.md.
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 DEMO_TOOL='up.sh'
@@ -75,7 +75,7 @@ step_broker() {
     [ "$DO_INSTALL" -eq 1 ] || args+=(--skip-install)
 
     "$ATOMIC_DEMO_DIR/broker.sh" "${args[@]}" \
-        || demo_die 'demo/local/broker.sh failed -- see the output above'
+        || demo_die 'demo/2026_09_08/broker.sh failed -- see the output above'
 }
 
 # --------------------------------------------------------------------------
@@ -90,8 +90,8 @@ step_join() {
     local name
     for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
         "$ATOMIC_DEMO_DIR/join.sh" "$name" \
-            || demo_die "demo/local/join.sh $name failed --" \
-                        'run demo/local/down.sh before retrying'
+            || demo_die "demo/2026_09_08/join.sh $name failed --" \
+                        'run demo/2026_09_08/down.sh before retrying'
     done
 }
 
@@ -214,9 +214,9 @@ step_report() {
         printf '\n'
     fi
 
-    demo_log 'next     : ve3/bin/python demo/local/smoke.py'
-    demo_log '           (or demo/local/submit.sh --wait)'
-    demo_log 'teardown : demo/local/down.sh'
+    demo_log 'next     : ve3/bin/python demo/2026_09_08/smoke.py'
+    demo_log '           (or demo/2026_09_08/submit.sh --wait)'
+    demo_log 'teardown : demo/2026_09_08/down.sh'
 }
 
 # --------------------------------------------------------------------------

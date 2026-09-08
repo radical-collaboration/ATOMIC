@@ -41,4 +41,4 @@ nosetests.xml
 
 # demo / runtime artefacts
 telemetry-output/
-demo/local/run/
+demo/2026_09_08/run/

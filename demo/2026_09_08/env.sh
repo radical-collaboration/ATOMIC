@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 #
-# demo/local/env.sh -- environment for the ATOMIC WM localhost demo.
+# demo/2026_09_08/env.sh -- environment for the ATOMIC WM localhost demo.
 #
-#   source demo/local/env.sh
+#   source demo/2026_09_08/env.sh
 #
-# Sourced by every script in demo/local/ -- the per-role ones
+# Sourced by every script in demo/2026_09_08/ -- the per-role ones
 # (broker.sh, join.sh, submit.sh), the orchestrator (up.sh), down.sh and
 # check_env.sh -- and meant to be sourced into an interactive shell as
 # well: after that, `atomic-resources`, `atomic-campaign ...` and friends
@@ -91,7 +91,7 @@ demo_fail() {
 
     printf '\n' >&2
     demo_die "$msg -- ${DEMO_TOOL:-the demo} gives up;" \
-             "run demo/local/down.sh before retrying"
+             "run demo/2026_09_08/down.sh before retrying"
 }
 
 # demo_prepend_path VAR VALUE -- idempotent ':'-list prepend
@@ -165,7 +165,7 @@ demo_require_broker() {
     demo_broker_alive && return 0
 
     demo_die "no demo broker on $RADICAL_ORBIT_BROKER_URL --" \
-             'run demo/local/broker.sh first'
+             'run demo/2026_09_08/broker.sh first'
 }
 
 # demo_mkdirs -- every directory the demo writes into (idempotent).

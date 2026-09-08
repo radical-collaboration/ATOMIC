@@ -1,11 +1,11 @@
-"""Unit tests for the pure helpers in ``demo/local/smoke.py``.
+"""Unit tests for the pure helpers in ``demo/2026_09_08/smoke.py``.
 
 No broker, no network, no ``requests`` -- the helpers are fed canned
 payloads shaped like the contract in ``plans/00-overview.md``.  This is
 what lets the smoke test be written (and its assertions trusted) before
 the plugins it talks to exist.
 
-    python -m pytest demo/local/test_smoke_helpers.py -q
+    python -m pytest demo/2026_09_08/test_smoke_helpers.py -q
 
 The repo's own ``pytest`` run (``testpaths = ["tests"]``) does not pick
 this file up: it belongs to the demo harness, not to the package.
@@ -452,7 +452,7 @@ def test_store_without_campaign_dir(tmp_path):
 # capability class pools: members, pools and the GPU spread
 # ---------------------------------------------------------------------------
 #
-# The federation demo/local builds: three resources, five members, two
+# The federation demo/2026_09_08 builds: three resources, five members, two
 # class pools -- `md` (lammps, no GPU) can only run on local_a.default or
 # local_b.cpu, `train` (pytorch, 1 GPU) only in fed-gpu, whose two members
 # sit at two "sites".

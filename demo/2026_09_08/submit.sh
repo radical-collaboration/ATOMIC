@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# demo/local/submit.sh -- the *client* role of the ATOMIC WM demo.
+# demo/2026_09_08/submit.sh -- the *client* role of the ATOMIC WM demo.
 #
 # One campaign, one invocation (xGFabric style).  This is the client
 # terminal, after broker.sh and the joins:
 #
-#   demo/local/submit.sh                # submit and return the id
-#   demo/local/submit.sh --wait         # ... and follow it to the end
-#   demo/local/submit.sh --sweep temperature=300,600 --wait
+#   demo/2026_09_08/submit.sh                # submit and return the id
+#   demo/2026_09_08/submit.sh --wait         # ... and follow it to the end
+#   demo/2026_09_08/submit.sh --sweep temperature=300,600 --wait
 #
 # It is `atomic-campaign submit` with the demo's spec and sweep filled
 # in, nothing more -- the same command a user would type, so what the
@@ -20,11 +20,11 @@
 # The assertions live in smoke.py, not here: this script *runs* the
 # demo, smoke.py *proves* it.
 #
-# See demo/local/README.md.
+# See demo/2026_09_08/README.md.
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 DEMO_TOOL='submit.sh'
@@ -187,7 +187,7 @@ main() {
 
     demo_hint "follow  : atomic-campaign status $CID"
     demo_hint "results : atomic-campaign results $CID"
-    demo_hint "prove   : $VE/bin/python demo/local/smoke.py"
+    demo_hint "prove   : $VE/bin/python demo/2026_09_08/smoke.py"
 }
 
 

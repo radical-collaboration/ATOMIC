@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# demo/local/join.sh -- the *resource* role of the ATOMIC WM demo.
+# demo/2026_09_08/join.sh -- the *resource* role of the ATOMIC WM demo.
 #
 # One resource, one invocation (xGFabric style).  This is terminal 2:
 #
-#   demo/local/join.sh local_a          # detached: joins and returns
-#   demo/local/join.sh local_b
-#   demo/local/join.sh local_c --live   # foreground: the on-camera join
+#   demo/2026_09_08/join.sh local_a          # detached: joins and returns
+#   demo/2026_09_08/join.sh local_b
+#   demo/2026_09_08/join.sh local_c --live   # foreground: the on-camera join
 #
 # The join arguments come from `demo_join_args` in env.sh -- the one
 # place that describes the demo's three resources and their five members,
@@ -14,7 +14,7 @@
 #
 # Detached (the default) is what the pre-joined resources want: the
 # endpoint keeps running with a pidfile, `atomic-leave <name>` (or
-# demo/local/down.sh) stops it again.
+# demo/2026_09_08/down.sh) stops it again.
 #
 # --live runs `atomic-join` in the *foreground*: the audience sees the
 # join happen, the endpoint's own progress lines scroll by, and Ctrl-C
@@ -22,11 +22,11 @@
 # resource is joined, so this script cannot print the resource table
 # afterwards -- it prints where to look for it instead.
 #
-# See demo/local/README.md.
+# See demo/2026_09_08/README.md.
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 DEMO_TOOL='join.sh'
@@ -94,7 +94,7 @@ join_detached() {
                   "$ATOMIC_DEMO_BROKER_LOG"
     fi
 
-    demo_hint "leave   : atomic-leave $NAME  (or demo/local/down.sh)"
+    demo_hint "leave   : atomic-leave $NAME  (or demo/2026_09_08/down.sh)"
 }
 
 # --------------------------------------------------------------------------

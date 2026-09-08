@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# demo/local/down.sh -- tear the ATOMIC WM localhost demo down again.
+# demo/2026_09_08/down.sh -- tear the ATOMIC WM localhost demo down again.
 #
 #   1. `atomic-leave` for every joined resource (removes it from the
 #      federation, stops its endpoint and any surviving pilot children),
@@ -11,7 +11,7 @@
 #   4. verify no orbit process is left,
 #   5. restore the dispatcher state dir up.sh moved aside.
 #
-# Logs are kept on purpose (demo/local/run/); scratch and plugin state
+# Logs are kept on purpose (demo/2026_09_08/run/); scratch and plugin state
 # under $ATOMIC_DEMO_TMP are kept too unless --wipe is given.
 #
 # Idempotent: running it twice, or on a machine where nothing is up, is
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-# shellcheck source=demo/local/env.sh
+# shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
 
 KILL_ALL_ENDPOINTS=0
