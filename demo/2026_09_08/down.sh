@@ -109,21 +109,24 @@ stop_pid() {
 
 # --------------------------------------------------------------------------
 step_leave() {
-    local name line listed=() names=()
+    local name rec joined=() names=()
 
-    # Every demo resource the federation lists -- not only the ones this
-    # shell was sourced for.  `down.sh` without --resource on r3 must take
-    # r3 out too, or the record outlives its endpoint and blocks the next
-    # join with a 409.  Anything not known to the demo is left alone.
-    while read -r line; do
-        [ -n "$line" ] || continue
-        name="${line%% *}"
+    # Only what THIS host joined: the resources of the selected name plus
+    # every resource with a join record under $ATOMIC_WM_STATE here
+    # (atomic-join writes one per joined resource on the joining host).
+    # Never resources other hosts joined -- `down.sh` on r3 must not take
+    # Perlmutter out of the federation.  A record another host left
+    # behind is handled by join.sh, which leaves a same-named record whose
+    # liveness is not ok before joining.
+    for rec in "$ATOMIC_WM_STATE"/*/record.json; do
+        [ -f "$rec" ] || continue
+        name="$(basename "$(dirname "$rec")")"
         case " $ATOMIC_DEMO_KNOWN " in
-            *" $name "*) listed+=("$name") ;;
+            *" $name "*) joined+=("$name") ;;
         esac
-    done <<< "$(demo_fed_resources)"
+    done
 
-    for name in "${ATOMIC_DEMO_RESOURCES[@]}" "${listed[@]}"; do
+    for name in "${ATOMIC_DEMO_RESOURCES[@]}" "${joined[@]}"; do
         case " ${names[*]:-} " in
             *" $name "*) ;;
             *) names+=("$name") ;;
