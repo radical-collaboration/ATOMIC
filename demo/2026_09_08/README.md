@@ -102,12 +102,15 @@ Without a flag they use `$ATOMIC_DEMO_RESOURCE`, and failing that
 |---|---|---|---|---|
 | `local` | the laptop (broker host) | Rutgers | `https://127.0.0.1:8010` | `/tmp/atomic-demo` |
 | `local_a` `local_b` `local_c` | the laptop's three fake resources | Rutgers | `https://127.0.0.1:8010` | `/tmp/atomic-demo` |
-| `r3` | the Rutgers workstation — also the distributed run's broker host | Rutgers | `https://$ATOMIC_DEMO_BROKER_HOST:8010` (`r3`) | `/tmp/atomic-demo` |
-| `perlmutter` | NERSC | NERSC | same | `$PSCRATCH/atomic-demo` (else `$SCRATCH`) |
+| `r3` | the Rutgers workstation — also the distributed run's broker host | Rutgers | binds `0.0.0.0:8010`, dials its own FQDN/IP | `/tmp/atomic-demo` |
+| `perlmutter` | NERSC | NERSC | `https://$ATOMIC_DEMO_BROKER_HOST:8010` — must be exported | `$PSCRATCH/atomic-demo` (else `$SCRATCH`) |
 | `odo` | OLCF's Slurm test system | OLCF | same | `$MEMBERWORK/atomic-demo` |
 
-Set `ATOMIC_DEMO_BROKER_HOST` once on the remote hosts to name the r3
-broker; `ATOMIC_DEMO_SCRATCH_BASE` overrides the scratch base anywhere.
+On the remote hosts `ATOMIC_DEMO_BROKER_HOST` has no default (`r3` is an
+ssh alias on the laptop, not a DNS name): `broker.sh` on r3 prints the
+FQDN/IP to export, and `join.sh`/`submit.sh` refuse until it is set.
+`ATOMIC_DEMO_BROKER_BIND` is the listen address (broker.sh only);
+`ATOMIC_DEMO_SCRATCH_BASE` overrides the scratch base anywhere.
 
 **The join mode is detected, not configured.** `$SLURM_JOB_ID` set means
 this shell is *inside an allocation*, so the endpoint **is** the resource
@@ -499,7 +502,8 @@ The stack knobs, all read from the environment (see `env.sh`):
 
 ```
 ATOMIC_DEMO_RESOURCE             the resource, when no flag is given
-ATOMIC_DEMO_BROKER_HOST          the broker host (r3 for the real run)
+ATOMIC_DEMO_BROKER_HOST          the host clients dial (remote resources: export it)
+ATOMIC_DEMO_BROKER_BIND          the address broker.sh listens on (0.0.0.0 on r3)
 ATOMIC_DEMO_SCRATCH_BASE         where task scratch goes on this machine
 ATOMIC_DEMO_ORBIT_REPO / _REF    the radical.orbit pin
 ATOMIC_DEMO_ATOMIC_REPO / _REF   the atomic-wm pin
@@ -624,11 +628,14 @@ live and selectable, no editing required:
 ### On the broker host (r3)
 
 ```bash
-export ATOMIC_DEMO_BROKER_HOST=r3            # once, in your shell
 demo/2026_09_08/check_env.sh --resource r3   # optional
 demo/2026_09_08/broker.sh    --resource r3   # installs the pinned stack, starts
 demo/2026_09_08/join.sh      r3              # r3 joins itself
 ```
+
+`broker.sh` binds all interfaces and ends with a `remote :` block: the
+`export ATOMIC_DEMO_BROKER_HOST=...` line and the `scp` of the broker
+cert that Perlmutter and Odo need.
 
 ### On Perlmutter / Odo
 
@@ -637,7 +644,7 @@ the broker's `broker_cert.pem` to `~/.radical/orbit/` there (or export
 `RADICAL_ORBIT_BROKER_CERT`), then:
 
 ```bash
-export ATOMIC_DEMO_BROKER_HOST=<r3 host name>
+export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP printed by broker.sh on r3>
 # no ssh key for GitHub on this host?  then also:
 #   export ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
 #   export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-collaboration/ATOMIC.git

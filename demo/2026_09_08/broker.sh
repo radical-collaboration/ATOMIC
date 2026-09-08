@@ -111,7 +111,7 @@ parse_args() {
 step_prepare() {
     demo_log "run dir  : $RUN_DIR"
     demo_log "scratch  : $ATOMIC_DEMO_TMP"
-    demo_log "broker   : $RADICAL_ORBIT_BROKER_URL"
+    demo_log "broker   : $RADICAL_ORBIT_BROKER_URL (binds $ATOMIC_DEMO_BROKER_BIND:$ATOMIC_DEMO_BROKER_PORT)"
     demo_log "plugins  : $ATOMIC_DEMO_PLUGINS"
     demo_log "venv     : $VE"
     demo_log "pins     : radical.orbit@$ATOMIC_DEMO_ORBIT_REF," \
@@ -189,7 +189,7 @@ step_start_broker() {
     : > "$ATOMIC_DEMO_BROKER_LOG"
 
     "$VE/bin/python" "$VE/bin/radical-orbit-broker.py"        \
-        --host    "$ATOMIC_DEMO_BROKER_HOST"                  \
+        --host    "$ATOMIC_DEMO_BROKER_BIND"                  \
         --port    "$ATOMIC_DEMO_BROKER_PORT"                  \
         --no-auth                                             \
         --plugins "$ATOMIC_DEMO_PLUGINS"                      \
@@ -212,6 +212,13 @@ step_start_broker() {
 
         if demo_broker_alive; then
             demo_log "broker  : up (pid $pid), GET /endpoints answers 200"
+            if [ "$ATOMIC_DEMO_BROKER_BIND" != '127.0.0.1' ]; then
+                demo_log "remote  : on Perlmutter / Odo, before join.sh:"
+                demo_log "remote  :   export ATOMIC_DEMO_BROKER_HOST=$ATOMIC_DEMO_BROKER_HOST"
+                demo_log "remote  :   scp $ATOMIC_DEMO_BROKER_HOST:.radical/orbit/broker_cert.pem ~/.radical/orbit/"
+                demo_log "remote  : (the broker advertises itself as:" \
+                         "$(grep -o 'on https://[^ ]*' "$ATOMIC_DEMO_BROKER_LOG" | sed 's/^on //' | grep -v '0\.0\.0\.0' | tr '\n' ' '))"
+            fi
             return 0
         fi
 

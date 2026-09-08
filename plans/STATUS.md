@@ -86,3 +86,4 @@ Branches: radical.orbit `feature/atomic-federation`, atomic `feature/demo-wm`. N
   table, real vs simulated).
 - Verified: fast path cycle DONE in 78 s; forced fresh-venv clone 94 s, rerun
   7 s "up to date"; wrong-branch checkout refused; 57 helper tests pass.
+- 2026-09-08 16:40 host three: broker.sh installed the pinned stack fine (clone on wrong-branch checkout) but the broker died: it bound to the literal 'r3', which is a laptop ssh alias and does not resolve there. Fix: ATOMIC_DEMO_BROKER_BIND (0.0.0.0 on r3) split from ATOMIC_DEMO_BROKER_HOST (r3: own FQDN/IP; perlmutter/odo: must be exported, join/submit refuse otherwise); broker.sh prints the export + scp lines for the remote hosts. Verified: r3 path (broker + self-join) and full local cycle on a wildcard bind, DONE; 57 tests.

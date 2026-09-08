@@ -56,7 +56,11 @@ check_resource() {
     ok "resource   : $ATOMIC_DEMO_RESOURCE (host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE)"
     ok "mode       : $ATOMIC_DEMO_MODE -- $ATOMIC_DEMO_MODE_WHY"
     ok "joinable   : ${ATOMIC_DEMO_RESOURCES[*]}"
-    ok "broker     : $RADICAL_ORBIT_BROKER_URL"
+    case "$ATOMIC_DEMO_BROKER_HOST" in
+        *'TODO('*) bad "broker host is still a placeholder:"\
+                       "$ATOMIC_DEMO_BROKER_HOST" ;;
+        *)         ok  "broker     : $RADICAL_ORBIT_BROKER_URL" ;;
+    esac
 
     case "$ATOMIC_DEMO_SCRATCH_BASE" in
         *'TODO('*) bad "scratch base is still a placeholder:"\

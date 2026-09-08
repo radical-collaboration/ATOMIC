@@ -293,6 +293,13 @@ demo_broker_pid() {
 # join.sh and submit.sh are useless without it, and "connection refused"
 # from a CLI is a worse first message than this one.
 demo_require_broker() {
+    case "$ATOMIC_DEMO_BROKER_HOST" in
+        *'TODO('*)
+            demo_die "no broker host for '$ATOMIC_DEMO_RESOURCE':" \
+                     "$ATOMIC_DEMO_BROKER_HOST --" \
+                     'broker.sh prints the value to export' ;;
+    esac
+
     demo_broker_alive && return 0
 
     demo_die "no demo broker on $RADICAL_ORBIT_BROKER_URL --" \
@@ -362,6 +369,19 @@ else
     ATOMIC_DEMO_MODE_WHY='no SLURM_JOB_ID -- this looks like a login node'
 fi
 
+# the name this machine is reachable under from elsewhere: the FQDN if
+# it has a domain part, else the first non-loopback IPv4 -- the same
+# choice radical.orbit makes when advertising a wildcard-bound broker
+demo_own_host() {
+    local fqdn ip
+    fqdn="$(hostname -f 2> /dev/null || true)"
+    case "$fqdn" in
+        *.*) printf '%s\n' "$fqdn"; return 0 ;;
+    esac
+    ip="$(hostname -I 2> /dev/null | awk '{print $1}')"
+    printf '%s\n' "${ip:-${fqdn:-127.0.0.1}}"
+}
+
 case "$ATOMIC_DEMO_RESOURCE" in
 
     # the laptop: three fake resources against a loopback broker.  Their
@@ -385,7 +405,11 @@ case "$ATOMIC_DEMO_RESOURCE" in
         ATOMIC_DEMO_MODE_WHY='r3 is a workstation -- the endpoint is the resource'
         ATOMIC_DEMO_RESOURCES=(r3)
         ATOMIC_DEMO_PILOT_RESOURCES=(r3)
-        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        # this IS the broker host: bind every interface, advertise the
+        # machine's own routable name ('r3' is the laptop's ssh alias and
+        # does not resolve here)
+        : "${ATOMIC_DEMO_BROKER_BIND:=0.0.0.0}"
+        : "${ATOMIC_DEMO_BROKER_HOST:=$(demo_own_host)}"
         : "${ATOMIC_DEMO_SCRATCH_BASE:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}"
         ;;
 
@@ -393,7 +417,7 @@ case "$ATOMIC_DEMO_RESOURCE" in
         ATOMIC_DEMO_HOST='perlmutter'
         ATOMIC_DEMO_SITE='NERSC'
         ATOMIC_DEMO_RESOURCES=(perlmutter)
-        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
         if   [ -n "${PSCRATCH:-}" ]; then
             : "${ATOMIC_DEMO_SCRATCH_BASE:=$PSCRATCH/atomic-demo}"
         elif [ -n "${SCRATCH:-}" ]; then
@@ -406,7 +430,7 @@ case "$ATOMIC_DEMO_RESOURCE" in
     odo) ATOMIC_DEMO_HOST='odo'
         ATOMIC_DEMO_SITE='OLCF'
         ATOMIC_DEMO_RESOURCES=(odo)
-        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
         # OLCF hands out $MEMBERWORK/<project> on Lustre; without it we
         # cannot guess the project, so say so rather than guess
         if [ -n "${MEMBERWORK:-}" ]; then
@@ -456,15 +480,21 @@ demo_drop_path PYTHONPATH "$ATOMIC_SRC/src"
 # broker
 # --------------------------------------------------------------------------
 
-# $ATOMIC_DEMO_BROKER_HOST is set per resource above: 127.0.0.1 on the
-# laptop, the r3 host name everywhere else (the distributed run's broker
-# lives on r3).  Set it once in your environment to point elsewhere.
+# Two different things:
+#   ATOMIC_DEMO_BROKER_BIND  the address the broker LISTENS on (broker.sh
+#                            only): 127.0.0.1 on the laptop, 0.0.0.0 on r3
+#   ATOMIC_DEMO_BROKER_HOST  the name clients and endpoints DIAL: set per
+#                            resource above -- 127.0.0.1 on the laptop,
+#                            r3's own routable name on r3, and on the
+#                            remote resources whatever you export (there
+#                            is no sane default: 'r3' is an ssh alias).
+# Pilots do not use either: the broker hands them its own advertised
+# URL, which for a wildcard bind is its FQDN (or outbound IP).
 # A non-default port: the user's own brokers live on 8000/8003.
 : "${ATOMIC_DEMO_BROKER_PORT:=8010}"
+: "${ATOMIC_DEMO_BROKER_BIND:=$ATOMIC_DEMO_BROKER_HOST}"
 
-# the advertised broker URL is the literal bind host -- 0.0.0.0 would
-# advertise the FQDN to pilots, so bind to a routable name and say so
-export ATOMIC_DEMO_BROKER_HOST ATOMIC_DEMO_BROKER_PORT
+export ATOMIC_DEMO_BROKER_BIND ATOMIC_DEMO_BROKER_HOST ATOMIC_DEMO_BROKER_PORT
 export RADICAL_ORBIT_BROKER_URL="https://$ATOMIC_DEMO_BROKER_HOST:$ATOMIC_DEMO_BROKER_PORT"
 export RADICAL_ORBIT_BROKER_CERT="$HOME/.radical/orbit/broker_cert.pem"
 
