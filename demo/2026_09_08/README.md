@@ -104,7 +104,18 @@ Without a flag they use `$ATOMIC_DEMO_RESOURCE`, and failing that
 | `local_a` `local_b` `local_c` | the laptop's three fake resources | Rutgers | radical.3 | `/tmp/atomic-demo` |
 | `r3` | radical.3, the RADICAL lab server — the demo's broker host | Rutgers | binds `0.0.0.0:8010` | `/tmp/atomic-demo` |
 | `perlmutter` | NERSC | NERSC | radical.3 | `$PSCRATCH/atomic-demo` (else `$SCRATCH`) |
-| `odo` | OLCF's Slurm test system (project `fus183`) | OLCF | radical.3 | `$HOME/tmp/atomic-demo` |
+| `odo` | OLCF's Slurm test system (project `fus183`, queue `interact`) | OLCF | radical.3, via the ORNL proxy | `$HOME/tmp/atomic-demo` |
+
+**Odo goes through the ORNL proxy.** OLCF compute nodes have no direct
+route out, so `env.sh odo` exports the `*_proxy` variables from OLCF's
+docs (`proxy.ccs.ornl.gov:3128`) and clones over HTTPS; git, pip and the
+endpoint's dial to the broker all honour them. `ATOMIC_DEMO_NO_PROXY=1`
+leaves the environment alone. Whether the proxy lets a CONNECT through
+to port 8010 is the one thing to test first (`check_env.sh` does not):
+
+```
+curl -sk -m 10 -x http://proxy.ccs.ornl.gov:3128 https://95.217.193.116:8010/endpoints
+```
 
 **The broker is radical.3 for every resource** — `https://95.217.193.116:8010`
 — unless `ATOMIC_DEMO_BROKER_HOST` says otherwise. The laptop's fake

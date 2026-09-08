@@ -117,7 +117,16 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # and clone defaults below derive from it.  Empty = laptop/r3 defaults.
 case "${1:-${ATOMIC_DEMO_RESOURCE:-local}}" in
     perlmutter) : "${ATOMIC_DEMO_HOME:=${SCRATCH:-${PSCRATCH:-$HOME}}/demo}" ;;
-    odo)        : "${ATOMIC_DEMO_HOME:=$HOME/tmp/demo}"                      ;;
+    odo)        : "${ATOMIC_DEMO_HOME:=$HOME/tmp/demo}"
+                # OLCF compute nodes reach the internet only through the
+                # ORNL HTTP proxy (below): ssh to GitHub hangs, https works
+                case "$ATOMIC_DEMO_ORBIT_REPO" in
+                    git+ssh://*|ssh://*) ATOMIC_DEMO_ORBIT_REPO='https://github.com/radical-cybertools/radical.orbit.git' ;;
+                esac
+                case "$ATOMIC_DEMO_ATOMIC_REPO" in
+                    git+ssh://*|ssh://*) ATOMIC_DEMO_ATOMIC_REPO='https://github.com/radical-collaboration/ATOMIC.git' ;;
+                esac
+                ;;
     *)          : "${ATOMIC_DEMO_HOME:=}"                                    ;;
 esac
 
@@ -488,6 +497,18 @@ case "$ATOMIC_DEMO_RESOURCE" in
         # $HOME/tmp for now (2026-09-08): $MEMBERWORK is not set in the
         # allocation shell, and the Odo home has room.  Project: fus183.
         : "${ATOMIC_DEMO_SCRATCH_BASE:=$HOME/tmp/atomic-demo}"
+        # OLCF compute nodes have no direct route out; everything (git,
+        # pip, the endpoint's dial to the broker -- websockets >= 14 reads
+        # https_proxy) goes through the ORNL proxy.  Values from OLCF's
+        # docs (software/analytics/jax.rst, 2026-09-08).  Set
+        # ATOMIC_DEMO_NO_PROXY=1 to leave the environment alone.
+        if [ "${ATOMIC_DEMO_NO_PROXY:-0}" != 1 ]; then
+            export all_proxy='socks://proxy.ccs.ornl.gov:3128/'
+            export ftp_proxy='ftp://proxy.ccs.ornl.gov:3128/'
+            export http_proxy='http://proxy.ccs.ornl.gov:3128/'
+            export https_proxy='http://proxy.ccs.ornl.gov:3128/'
+            export no_proxy='localhost,127.0.0.0/8,*.ccs.ornl.gov'
+        fi
         ;;
 esac
 
@@ -1058,7 +1079,20 @@ demo_join_args() {
                 local q_cpu='TODO(CPU queue/partition)'
                 local q_gpu='TODO(GPU queue/partition)'
                 local acct='TODO(allocation/project id)'
-                [ "$name" = odo ] && acct='fus183'
+                local cpus='TODO(cpus per node)'
+                local gpus='TODO(gpus per node)'
+                local wall='TODO(pilot walltime, seconds)'
+                local nh_cpu='TODO(cpu member budget)'
+                local nh_gpu='TODO(gpu member budget)'
+                local maxp='TODO(max concurrent gpu pilots)'
+                if [ "$name" = odo ]; then
+                    # Odo (OLCF, 2026-09-08): `interact` partition, project
+                    # fus183; a node is one 64-core EPYC + 4 MI250X = 8
+                    # GCDs (Odo user guide).  30 min pilots, 2 node-hours
+                    # per member, one GPU pilot at a time.
+                    q_cpu='interact'; q_gpu='interact'; acct='fus183'
+                    cpus=64; gpus=8; wall=1800; nh_cpu=2; nh_gpu=2; maxp=1
+                fi
                 local base="$ATOMIC_DEMO_SCRATCH_BASE/$name"
 
                 DEMO_JOIN_ARGS=(
@@ -1066,8 +1100,8 @@ demo_join_args() {
                      --mode       login
                      --site       "$ATOMIC_DEMO_SITE"
                      --kind       hpc
-                     --member     "cpu:queue=$q_cpu,account=$acct,nodes=1,cpus=TODO(cpus per node),walltime=TODO(pilot walltime, seconds),node_hours=TODO(cpu member budget),software=lammps,pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
-                     --member     "gpu:queue=$q_gpu,account=$acct,nodes=1,cpus=TODO(cpus per node),gpus=TODO(gpus per node),walltime=TODO(pilot walltime, seconds),node_hours=TODO(gpu member budget),max_pilots=TODO(max concurrent gpu pilots),software=pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
+                     --member     "cpu:queue=$q_cpu,account=$acct,nodes=1,cpus=$cpus,walltime=$wall,node_hours=$nh_cpu,software=lammps,pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
+                     --member     "gpu:queue=$q_gpu,account=$acct,nodes=1,cpus=$cpus,gpus=$gpus,walltime=$wall,node_hours=$nh_gpu,max_pilots=$maxp,software=pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
                      --scratch    "$base")
             fi ;;
 
