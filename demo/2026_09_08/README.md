@@ -125,8 +125,9 @@ The scripts remember the resource of the last join or broker run in
 - Put the venv and the clones on scratch: `$SCRATCH/demo` on Perlmutter,
   `$HOME/tmp/demo` on Odo (home directories are quota'd).
 - Set the ORNL proxy on Odo, and clone over https there.
-- Declare `shared_fs=false` for the remote joins (plus `gpus=8` on Odo)
-  and load the `psij` plugin, without which every pilot fails at submit.
+- Declare `shared_fs=false` for the remote joins (plus `gpus=8` on Odo).
+  The endpoint inside the allocation is the pilot; nothing else is
+  launched there.
 - Dial radical.3 as the broker from every resource.
 - Start `broker.sh` with an empty federation; `--keep-state` opts out.
 

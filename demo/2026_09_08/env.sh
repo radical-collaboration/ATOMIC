@@ -1142,12 +1142,11 @@ demo_join_args() {
                     decl='gpus=8,shared_fs=false'
                 fi
 
-                # `default,psij`: on a compute node the endpoint's default
-                # plugin set is rhapsody/staging/sysinfo/queue_info -- no
-                # psij -- but the dispatcher launches every pilot through
-                # the endpoint's psij plugin (local executor, inside the
-                # allocation).  Without it each pilot FAILS at submit and
-                # the pool's tasks stay QUEUED (seen on Odo, 2026-09-08).
+                # No `--plugins default,psij` any more: since Orbit plan
+                # 122 (feature/atomic-federation 71e895c) the dispatcher
+                # adopts an allocation's endpoint as the pilot instead of
+                # launching a second endpoint through psij.  The demo of
+                # 2026-09-08 still needed psij on the compute node.
                 DEMO_JOIN_ARGS=(
                      --name       "$name"
                      --mode       allocation
@@ -1155,7 +1154,6 @@ demo_join_args() {
                      --kind       hpc
                      --declare    "$decl"
                      --software   lammps,pytorch
-                     --plugins    default,psij
                      --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/$name")
 
             else
