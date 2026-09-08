@@ -255,6 +255,16 @@ renders as a single row, exactly as before.  A `*` behind the node-hours
 means the federation could not refresh usage for that row and is showing
 its last known values (`"stale": true`).
 
+The last column is the federation's derived `state` — the endpoint's
+liveness (`ok` / `suspect` / `lost`) or `failing`: reachable, but holding
+no pilot because the ones it submitted keep dying.  A `failing` row is
+followed by an indented `! pilot: <reason>` line carrying what the batch
+system actually said (plus `(paused until HH:MM:SS)` while the dispatcher
+has stopped trying), so a site that fails every submit is visible in the
+table instead of only in the broker log.  `--json` carries the same
+under each member's `usage`: `pilot_error`, `pilot_failures`,
+`paused_until`.
+
 ## Bootstrapping a machine
 
 `bootstrap.sh` prepares a venv and joins in one step, on a machine that

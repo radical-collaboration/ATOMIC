@@ -412,6 +412,23 @@ export function css() {
     .ac-dot.ok      { background: var(--accent2); box-shadow: 0 0 6px rgba(0,212,170,.6); }
     .ac-dot.suspect { background: var(--warn); }
     .ac-dot.lost    { background: var(--danger); }
+    /* reachable, but every pilot it is asked to start dies at submit */
+    .ac-dot.failing { background: var(--danger); box-shadow: 0 0 6px rgba(251,113,133,.7); }
+    .ac-fail-label  { color: var(--danger); font-weight: 600; }
+    /* what the batch system said, under the row that owns it */
+    .ac-pilot-error td {
+      padding: 0 10px 9px 28px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .72rem;
+      color: #fb7185;
+    }
+    /* the reason rides in the same span class a campaign detail uses;
+       inside this row it is not a block of its own */
+    .ac-pilot-error .ac-detail {
+      margin: 0;
+      font-size: inherit;
+      color: inherit;
+    }
 
     /* ---- submit form ---- */
     .ac-submit-grid {
@@ -955,6 +972,50 @@ function countCell(value) {
   return Number.isFinite(num(value, NaN)) ? String(num(value, 0)) : '–';
 }
 
+// The Status cell of a resource or a member row.  `state` is what the
+// federation derives -- every liveness value plus `failing`, a site that
+// answers but whose pilots die at submit; a federation that sends no
+// `state` still shows its `liveness`, exactly as this always did.
+function statusCell(record, fallback) {
+  const rec  = record || {};
+  const alt  = fallback || {};
+  const live = String(rec.state || rec.liveness
+                      || alt.state || alt.liveness || '').toLowerCase();
+  const dot  = ['ok', 'suspect', 'lost', 'failing'].includes(live)
+             ? live : '';
+  const label = live === 'ok'       ? 'online'
+              : live === 'suspect'  ? 'unsteady'
+              : live === 'lost'     ? 'offline'
+              : live === 'failing'  ? 'failing' : 'unknown';
+  const cls  = live === 'failing' ? ' class="ac-fail-label"' : '';
+
+  return `<span class="ac-dot ${dot}"></span><span${cls}>${
+    esc(label)}</span>`;
+}
+
+// The row under a member that cannot start work: the site is reachable but
+// everything submitted to it dies, so the row would otherwise look exactly
+// like an idle one.  The label is ATOMIC vocabulary; the reason itself is
+// server-authored text and rides in an `ac-detail` span, like a campaign's
+// own `detail` does.
+function pilotErrorRow(m) {
+  const usage = (m && m.usage) || {};
+  const err   = usage.pilot_error;
+  if (!err) return '';
+
+  const text  = String(err);
+  const short = text.length > 140 ? text.slice(0, 137) + '…' : text;
+  const pause = num(usage.paused_until, 0);
+  const until = pause > 0
+              ? ` — retrying after ${new Date(pause * 1000)
+                                     .toLocaleTimeString()}` : '';
+
+  return `<tr class="ac-pilot-error">
+    <td colspan="10" title="${esc(text)}">! cannot start work here: <span
+      class="ac-detail">${esc(short)}</span>${esc(until)}</td>
+  </tr>`;
+}
+
 function softwareCell(list) {
   return isArr(list) && list.length
     ? list.map(s => `<span class="ac-soft">${esc(s)}</span>`).join('')
@@ -989,8 +1050,8 @@ function renderMemberRow(r, m) {
       nodeHourCell(usage, m.budget || {})}</td>
     <td class="ac-mono">${countCell(usage.tasks_running)} running
         · ${countCell(usage.tasks_done)} done</td>
-    <td>${esc(m.liveness || r.liveness || '')}</td>
-  </tr>`;
+    <td>${statusCell(m, r)}</td>
+  </tr>` + pilotErrorRow(m);
 }
 
 function renderResourceRow(r) {
@@ -1001,14 +1062,6 @@ function renderResourceRow(r) {
 
   const nh   = nodeHourCell(usage, bud);
   const soft = softwareCell(caps.software);
-
-  const live = String(r.liveness || '').toLowerCase();
-  const dot  = live === 'ok' ? 'ok'
-             : live === 'suspect' ? 'suspect'
-             : live === 'lost' ? 'lost' : '';
-  const liveLabel = live === 'ok' ? 'online'
-                  : live === 'suspect' ? 'unsteady'
-                  : live === 'lost' ? 'offline' : 'unknown';
 
   const kind = [r.kind, r.mode].filter(Boolean).join(' / ') || '–';
   // the only place an Orbit-internal name is allowed: a tooltip
@@ -1026,7 +1079,7 @@ function renderResourceRow(r) {
     <td class="ac-mono" style="min-width:150px">${nh}</td>
     <td class="ac-mono">${num(usage.tasks_running, 0)} running
         · ${num(usage.tasks_done, 0)} done</td>
-    <td><span class="ac-dot ${dot}"></span>${esc(liveLabel)}</td>
+    <td>${statusCell(r)}</td>
   </tr>`;
 }
 

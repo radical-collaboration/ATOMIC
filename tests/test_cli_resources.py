@@ -172,6 +172,80 @@ def test_a_stale_member_is_marked_and_explained():
 
 
 # ---------------------------------------------------------------------------
+# a member whose pilots die at submit
+# ---------------------------------------------------------------------------
+
+QUOTA = 'psij submit_tunneled failed: [Errno 122] Disk quota exceeded'
+
+
+def _failing(record=None, paused=None, member=0):
+    """GROUPED with one member the dispatcher cannot start a pilot on."""
+
+    record = json.loads(json.dumps(record or GROUPED))
+    m      = record['members'][member]
+    m['state']  = 'failing'
+    record['state'] = 'failing'
+    m['usage'].update({'pilots_active' : 0,
+                       'pilot_error'   : QUOTA,
+                       'pilot_failures': 5,
+                       'paused_until'  : paused})
+
+    return record
+
+
+def test_the_state_column_shows_the_derived_word():
+
+    record = _failing()
+
+    # the member that is failing says so; the resource row above it too,
+    # and its healthy sibling does not
+    assert _row([record], '  └ cpu').rstrip().endswith('failing')
+    assert _row([record], 'local_b').rstrip().endswith('failing')
+    assert _row([record], '  └ gpu').rstrip().endswith('ok')
+
+
+def test_a_failing_member_row_is_followed_by_the_pilot_reason():
+
+    lines = _lines([_failing()])
+
+    assert lines[2].startswith('  └ cpu')
+    assert lines[3] == '    ! pilot: %s' % QUOTA
+    # the sibling row follows, un-annotated
+    assert lines[4].startswith('  └ gpu')
+
+
+def test_a_paused_member_says_until_when():
+
+    line = [x for x in _lines([_failing(paused=1757000000.0)])
+            if x.startswith('    ! pilot')][0]
+
+    assert QUOTA in line
+    assert 'paused until' in line
+
+
+def test_the_legend_explains_the_pilot_line():
+
+    assert '!:' in resources.render([_failing()])
+    # ... and only when there is one
+    assert '!:' not in resources.render([GROUPED])
+
+
+def test_a_healthy_table_carries_no_pilot_line():
+
+    assert '! pilot' not in resources.render([GROUPED])
+
+
+def test_the_state_falls_back_to_liveness():
+    # a broker that does not derive a state word: the column reads as before
+    record = json.loads(json.dumps(GROUPED))
+    record['liveness'] = 'suspect'
+    record['members'][0]['liveness'] = 'suspect'
+
+    assert _row([record], 'local_b').rstrip().endswith('suspect')
+    assert _row([record], '  └ cpu').rstrip().endswith('suspect')
+
+
+# ---------------------------------------------------------------------------
 # a record without members
 # ---------------------------------------------------------------------------
 
@@ -271,6 +345,23 @@ def test_json_passes_the_members_through(broker, capsys):
     assert out == [GROUPED]
     assert [m['member_id'] for m in out[0]['members']] == ['local_b.cpu',
                                                            'local_b.gpu']
+
+
+def test_json_passes_the_pilot_failure_fields_through(broker, capsys):
+
+    record = _failing(paused=17.0)
+    broker.resources.append(record)
+
+    rc  = resources.main(['--broker', 'https://127.0.0.1:8013',
+                          '--token', '', '--json'])
+    out = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert out == [record]                     # unchanged, keys and all
+    usage = out[0]['members'][0]['usage']
+    assert usage['pilot_error']    == QUOTA
+    assert usage['pilot_failures'] == 5
+    assert usage['paused_until']   == 17.0
 
 
 def test_the_table_is_rendered_from_the_broker_response(broker, capsys):

@@ -457,6 +457,10 @@ def members_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
         'budget'          : dict(record.get('budget') or {}),
         'usage'           : dict(record.get('usage') or {}),
         'liveness'        : record.get('liveness') or '',
+        # the derived state word ('failing' when the resource's pilots die
+        # at submit); an older federation sends none, hence the fallback
+        'state'           : record.get('state')
+                            or record.get('liveness') or '',
         'derived'         : True,
     }]
 

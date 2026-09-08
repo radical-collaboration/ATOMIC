@@ -48,7 +48,7 @@ A table of the federation's resources, one row each:
 | Software | `capabilities.software` |
 | Node-hours | `usage.node_hours_used` over the allowance, with a bar |
 | Active work | `usage.tasks_running` / `usage.tasks_done` |
-| Status | `liveness` → green (online) / amber (unsteady) / red (offline) |
+| Status | `state` (else `liveness`) → green (online) / amber (unsteady) / red (offline, failing) |
 
 Underneath each resource sit its **members**, one indented `└ name`
 sub-row per entry in `members[]` — a resource declares one member per
@@ -61,7 +61,12 @@ work* come from the member's own `software`, `budget` and `usage`. The
 member id and queue are tooltip material, and a member declaring GPUs
 says so as *declared, not reserved* — nothing pins a GPU to a task this
 round. A member whose `usage` carries no task counts shows `–`, not a
-zero it cannot vouch for. A record with no `members` (a federation that predates class
+zero it cannot vouch for. A member the federation reports as `failing` —
+reachable, but every pilot it submits dies — says *failing* in red and is
+followed by one monospace `! cannot start work here:` line carrying its
+`usage.pilot_error` (server text, truncated, full text in the tooltip) and,
+while the dispatcher is backing off, when it retries.
+A record with no `members` (a federation that predates class
 pools) renders exactly as before: one row, no sub-rows.
 
 The allowance is `budget.node_hours` where declared, otherwise

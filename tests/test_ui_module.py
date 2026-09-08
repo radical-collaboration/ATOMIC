@@ -129,9 +129,14 @@ const RESOURCES = { resources: [
         gpus_per_node: 1, software: ['pytorch'],
         attributes: { site: 'PSC' },
         budget: { node_hours: 1.0 },
+        // reachable, but every pilot it submits dies at submit time: the
+        // federation reports `failing` plus the reason and the pause
         usage: { node_hours_used: 1.4, node_hours_remaining: 0,
-                 tasks_running: 0, tasks_done: 1 },
-        liveness: 'ok' },
+                 tasks_running: 0, tasks_done: 1, pilots_active: 0,
+                 pilot_error: 'psij error: [Errno 122] "Disk quota '
+                            + 'exceeded"',
+                 pilot_failures: 5, paused_until: NOW + 60 },
+        liveness: 'ok', state: 'failing' },
       // a member whose name and site carry markup, and whose usage
       // carries no task counts at all
       { member: '<b>x"y', member_id: 'local_b.<b>x"y', class: 'cpu',
@@ -334,6 +339,28 @@ check((res.match(/width:100\.0%/) || []).length >= 1,
       "the gpu member's node-hour bar is not full (1.4 of 1.4 h)");
 check((res.match(/allocation/g) || []).length === 1,
       'the join mode is rendered twice (badge + Type column)');
+
+// --- a member whose pilots die at submit ----------------------------------
+// this is the line that was missing when a site failed every submit for
+// half an hour and the table said the member was fine
+check(res.includes('ac-dot failing') && res.includes('ac-fail-label'),
+      'a failing member does not get the failing state badge');
+check((res.match(/class="ac-pilot-error"/g) || []).length === 1,
+      'exactly one pilot-error row was expected, got '
+      + (res.match(/class="ac-pilot-error"/g) || []).length);
+check(/! cannot start work here:/.test(res),
+      'the failing member has no plain-language label');
+check(/ac-detail">psij error: \[Errno 122\]/.test(res),
+      'the reason is not under the member row (in an ac-detail span)');
+check(/retrying after/.test(res),
+      'the backoff deadline is not rendered');
+// the reason is server text: it must be escaped, not injected
+check(!/"Disk quota exceeded"/.test(res)
+      && res.includes('&quot;Disk quota'),
+      'the reason was not escaped');
+// a member with no error says nothing at all
+check(!/undefined/.test(res),
+      'a healthy member rendered an empty pilot-error row');
 check(!/NaN|undefined/.test(res), 'resources HTML contains NaN/undefined');
 
 const camp = page.html('.ac-campaigns-body');
@@ -394,6 +421,7 @@ check(!/NaN|undefined|\[object Object\]/.test(camp),
 const visible = (res + camp + tmpl)
   .replace(/<div class="ac-reason">[^<]*<\/div>/g, ' ')
   .replace(/<div class="ac-detail">[^<]*<\/div>/g, ' ')
+  .replace(/<span\s+class="ac-detail">[^<]*<\/span>/g, ' ')
   .replace(/<[^>]*>/g, ' ');
 for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher', 'namespace']) {
   check(!new RegExp(w, 'i').test(visible),

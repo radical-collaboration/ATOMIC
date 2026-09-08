@@ -15,11 +15,18 @@ Usage figures are refreshed by the federation on every call; when that
 refresh fails the record keeps its last values and is flagged
 ``"stale": true`` -- such rows are marked with a ``*`` rather than
 hidden, because a stale number still says more than a blank.
+
+The last column is the federation's derived ``state``: the endpoint's
+liveness (``ok`` / ``suspect`` / ``lost``) or ``failing`` -- reachable,
+but holding no pilot because the ones it submitted keep dying.  Such a
+row carries an indented ``! pilot: ...`` line with what the batch system
+actually said, which used to reach only the broker log.
 """
 
 import argparse
 import json
 import sys
+import time
 
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -148,6 +155,46 @@ def _tasks(usage: Dict[str, Any]) -> str:
                       _num(usage.get('tasks_done')))
 
 
+def state_of(record: Dict[str, Any], fallback: Dict[str, Any] = None) -> str:
+    """The word the STATE column shows for a resource or a member.
+
+    ``state`` is what the federation derives (every ``liveness`` value plus
+    ``failing`` -- reachable, but its pilots die at submit); a broker that
+    does not send one still has its ``liveness`` shown, exactly as before.
+    """
+
+    for source in (record, fallback or {}):
+        word = source.get('state') or source.get('liveness')
+        if word:
+            return str(word)
+
+    return DASH
+
+
+def pilot_note(record: Dict[str, Any]) -> str:
+    """The indented ``! pilot: ...`` line under a row, or ``''``.
+
+    Every pilot of this member failed at submit and only the broker log
+    said so -- this is that log line, on the row it belongs to.
+    """
+
+    usage = record.get('usage') or {}
+    error = usage.get('pilot_error')
+
+    if not error:
+        return ''
+
+    note  = '    ! pilot: %s' % str(error).strip()
+    until = usage.get('paused_until')
+
+    if isinstance(until, (int, float)) and not isinstance(until, bool) \
+            and until > 0:
+        note += ' (paused until %s)' % time.strftime(
+            '%H:%M:%S', time.localtime(until))
+
+    return note
+
+
 def row(record: Dict[str, Any], members: Sequence[Dict[str, Any]]
         ) -> Dict[str, str]:
     """The aggregate row of one resource.
@@ -175,7 +222,9 @@ def row(record: Dict[str, Any], members: Sequence[Dict[str, Any]]
         'node_hours': node_hours(record),
         'pilots'    : _num(usage.get('pilots_active')),
         'tasks'     : _tasks(usage),
-        'liveness'  : str(record.get('liveness') or DASH),
+        'liveness'  : state_of(record),
+        # a lone derived member IS this row, so its pilot error belongs here
+        'note'      : pilot_note(members[0]) if lone else '',
     }
 
 
@@ -198,8 +247,8 @@ def member_row(record: Dict[str, Any],
         'node_hours': node_hours(member),
         'pilots'    : _num(usage.get('pilots_active')),
         'tasks'     : _tasks(usage),
-        'liveness'  : str(member.get('liveness') or record.get('liveness')
-                          or DASH),
+        'liveness'  : state_of(member, record),
+        'note'      : pilot_note(member),
     }
 
 
@@ -235,6 +284,10 @@ def render(records: Sequence[Dict[str, Any]]) -> str:
     for r in rows:
         lines.append('  '.join(r[key].ljust(widths[key])
                                for _, key in COLUMNS).rstrip())
+        # the row's own bad news, under it and outside the columns: a
+        # quota or a queue error is far too long to be a table cell
+        if r.get('note'):
+            lines.append(r['note'])
 
     lines.append('')
     lines.append('SIZE: nodes x cores/node (+GPUs/node, declared -- not '
@@ -243,6 +296,10 @@ def render(records: Sequence[Dict[str, Any]]) -> str:
 
     if any('*' in r['node_hours'] for r in rows):
         lines.append('*: usage could not be refreshed -- values are stale')
+
+    if any(r.get('note') for r in rows):
+        lines.append("!: no pilot of that member survived submission -- "
+                     "the row's state is 'failing'")
 
     return '\n'.join(lines)
 
