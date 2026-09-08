@@ -511,6 +511,9 @@ ATOMIC_DEMO_PIP_PINS             extra pinned PyPI requirements
 ATOMIC_DEMO_VE                   the venv everything is installed into
 ATOMIC_DEMO_SRC                  where the demo keeps its own clones
 ATOMIC_DEMO_FORCE_CLONE=1        ignore local checkouts, always clone
+ATOMIC_DEMO_HOME                 where venv + clones live on an HPC site
+                                 (perlmutter: $SCRATCH/demo, odo:
+                                 $MEMBERWORK/demo; home dirs are quota'd)
 ATOMIC_DEMO_PYTHON               interpreter used to create the venv
 ATOMIC_DEMO_PYTHON_MODULE        environment module loaded first (perlmutter:
                                  python/3.12-26.1.0, odo: cray-python)

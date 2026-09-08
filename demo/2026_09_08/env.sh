@@ -110,10 +110,21 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # validated with.  Found on 2026-09-08, building a venv from scratch.
 : "${ATOMIC_DEMO_PIP_PINS:=rhapsody-py==0.4.0 opentelemetry-sdk==1.43.0}"
 
+# The demo's *home* on an HPC site: where its venv and clones live.  HPC
+# home directories are small and quota'd (Perlmutter: venv creation died
+# with "Disk quota exceeded"), so the sites use scratch, as the xGFabric
+# demo did.  Decided here, before the resource block, because the venv
+# and clone defaults below derive from it.  Empty = laptop/r3 defaults.
+case "${1:-${ATOMIC_DEMO_RESOURCE:-local}}" in
+    perlmutter) : "${ATOMIC_DEMO_HOME:=${SCRATCH:-${PSCRATCH:-$HOME}}/demo}" ;;
+    odo)        : "${ATOMIC_DEMO_HOME:=${MEMBERWORK:-$HOME}/demo}"           ;;
+    *)          : "${ATOMIC_DEMO_HOME:=}"                                    ;;
+esac
+
 # where ensure_stack keeps its own clones of the two pinned refs.  They
 # are a *cache*: cloned once, `git pull --ff-only` on every run, and
 # re-installed only when HEAD moved.  `down.sh --wipe` keeps them.
-: "${ATOMIC_DEMO_SRC:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}/src}"
+: "${ATOMIC_DEMO_SRC:=${ATOMIC_DEMO_HOME:-${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}/src}"
 
 # 1 = ignore a local checkout even when it is clean and on the pinned ref,
 # and always install from the clone (what a fresh host does anyway)
@@ -128,7 +139,8 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 
 export ATOMIC_DEMO_ORBIT_REPO  ATOMIC_DEMO_ORBIT_REF
 export ATOMIC_DEMO_ATOMIC_REPO ATOMIC_DEMO_ATOMIC_REF
-export ATOMIC_DEMO_SRC ATOMIC_DEMO_FORCE_CLONE ATOMIC_DEMO_PYTHON
+export ATOMIC_DEMO_HOME ATOMIC_DEMO_SRC ATOMIC_DEMO_FORCE_CLONE
+export ATOMIC_DEMO_PYTHON
 export ATOMIC_DEMO_PYTHON_MODULE
 export ATOMIC_DEMO_PIP_PINS
 
@@ -145,8 +157,9 @@ if [ -n "${VE:-}" ]; then
 fi
 
 if [ -z "${ATOMIC_DEMO_VE:-}" ]; then
-    if [ -d "$ORBIT_SRC/ve3" ]; then ATOMIC_DEMO_VE="$ORBIT_SRC/ve3"
-    else                             ATOMIC_DEMO_VE="$HOME/.atomic-demo/ve"
+    if   [ -n "$ATOMIC_DEMO_HOME" ]; then ATOMIC_DEMO_VE="$ATOMIC_DEMO_HOME/ve"
+    elif [ -d "$ORBIT_SRC/ve3" ];    then ATOMIC_DEMO_VE="$ORBIT_SRC/ve3"
+    else                                  ATOMIC_DEMO_VE="$HOME/.atomic-demo/ve"
     fi
 fi
 
