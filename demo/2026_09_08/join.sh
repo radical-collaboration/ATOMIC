@@ -54,6 +54,10 @@ unset _demo_res _demo_arg
 
 DEMO_TOOL='join.sh'
 
+# remember this host's resource for the scripts that take none (down.sh)
+mkdir -p "$RUN_DIR" && printf '%s\n' "$ATOMIC_DEMO_RESOURCE" > "$RUN_DIR/resource"
+
+
 NAME=''
 LIVE=0
 

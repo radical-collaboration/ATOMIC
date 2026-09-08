@@ -56,6 +56,10 @@ unset _demo_res _demo_argv _demo_i
 
 DEMO_TOOL='broker.sh'
 
+# remember this host's resource for the scripts that take none (down.sh)
+mkdir -p "$RUN_DIR" && printf '%s\n' "$ATOMIC_DEMO_RESOURCE" > "$RUN_DIR/resource"
+
+
 # a broker bound to loopback is reachable on loopback only: dial it there,
 # whatever the default broker host is (radical.3 for every resource)
 if [ "$ATOMIC_DEMO_BROKER_BIND" = '127.0.0.1' ] \

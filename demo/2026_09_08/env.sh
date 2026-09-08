@@ -110,6 +110,21 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # validated with.  Found on 2026-09-08, building a venv from scratch.
 : "${ATOMIC_DEMO_PIP_PINS:=rhapsody-py==0.4.0 opentelemetry-sdk==1.43.0}"
 
+# Which resource, when nobody says: the one this host last joined or
+# brokered.  join.sh and broker.sh write it to run/resource, so a plain
+# `down.sh` on Perlmutter tears Perlmutter down, not the laptop's
+# local_* (which is what the built-in default `local` would mean).  An
+# explicit argument or $ATOMIC_DEMO_RESOURCE always wins.
+ATOMIC_DEMO_RESOURCE_FROM=''
+case "${1:-}" in
+    ''|*/*|*.sh)
+        if [ -z "${ATOMIC_DEMO_RESOURCE:-}" ] \
+                && [ -r "$ATOMIC_DEMO_DIR/run/resource" ]; then
+            ATOMIC_DEMO_RESOURCE="$(head -n 1 "$ATOMIC_DEMO_DIR/run/resource")"
+            ATOMIC_DEMO_RESOURCE_FROM='run/resource'
+        fi ;;
+esac
+
 # The demo's *home* on an HPC site: where its venv and clones live.  HPC
 # home directories are small and quota'd (Perlmutter: venv creation died
 # with "Disk quota exceeded"), so the sites use scratch, as the xGFabric
@@ -574,7 +589,7 @@ export ATOMIC_DEMO_MODE ATOMIC_DEMO_SCRATCH_BASE
 case "$ATOMIC_DEMO_HOST" in
     laptop) : ;;
     *)      demo_log "resource: $ATOMIC_DEMO_RESOURCE" \
-                     "(host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE)"
+                     "(host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE)${ATOMIC_DEMO_RESOURCE_FROM:+ [from run/resource]}"
             demo_log "mode    : $ATOMIC_DEMO_MODE --" \
                      "$ATOMIC_DEMO_MODE_WHY"
             demo_log "scratch : $ATOMIC_DEMO_SCRATCH_BASE" ;;
