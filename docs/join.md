@@ -241,7 +241,7 @@ never register a federation session of their own.
 
 `atomic-leave <name>` takes `--cancel-tasks`: by default leaving a class
 pool cancels **nothing**, because another member can still run what this
-resource queued; a full teardown (`demo/local/down.sh`) asks for the
+resource queued; a full teardown (`demo/2026_09_08/down.sh`) asks for the
 cancel explicitly.  The federation answers with `members_removed`,
 `tasks_requeued` and `tasks_failed`, which the CLI prints.
 
