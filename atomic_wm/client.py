@@ -107,7 +107,7 @@ class PinnedCertAdapter(requests.adapters.HTTPAdapter):
 
         super().__init__(**kw)
 
-    def init_poolmanager(self, *args: Any, **kw: Any) -> Any:
+    def _pinned(self, kw: Dict[str, Any]) -> Dict[str, Any]:
 
         ctx = ssl.create_default_context(cafile=self._cafile)
         ctx.verify_mode    = ssl.CERT_REQUIRED
@@ -115,8 +115,20 @@ class PinnedCertAdapter(requests.adapters.HTTPAdapter):
 
         kw['ssl_context']     = ctx
         kw['assert_hostname'] = False        # urllib3 matches it itself
+        return kw
 
-        return super().init_poolmanager(*args, **kw)
+    def init_poolmanager(self, *args: Any, **kw: Any) -> Any:
+
+        return super().init_poolmanager(*args, **self._pinned(kw))
+
+    def proxy_manager_for(self, proxy: str, **kw: Any) -> Any:
+        # requests routes a proxied HTTPS call through a *separate*
+        # ProxyManager, built here, not through init_poolmanager -- so
+        # behind an HTTP proxy (OLCF: https_proxy=proxy.ccs.ornl.gov) the
+        # pin was silently dropped and the self-signed broker cert failed
+        # default verification, while the endpoint next to it (its own
+        # ssl context through the same CONNECT tunnel) joined fine.
+        return super().proxy_manager_for(proxy, **self._pinned(kw))
 
 
 class Client:

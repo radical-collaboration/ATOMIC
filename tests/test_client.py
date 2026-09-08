@@ -160,6 +160,22 @@ def test_tls_verify_uses_cert(broker, cert_file):
     assert broker.calls[-1]['verify'] is True
 
 
+def test_tls_pin_survives_an_http_proxy(cert_file):
+    # behind https_proxy (OLCF compute nodes) requests builds a separate
+    # ProxyManager; the pin must reach it too, or the broker's self-signed
+    # cert fails default verification while the endpoint joins fine
+    adapter = _client.PinnedCertAdapter(cert_file)
+
+    adapter.init_poolmanager(1, 1)
+    proxied = adapter.proxy_manager_for('http://proxy.example:3128')
+
+    for mgr in (adapter.poolmanager, proxied):
+        kw = mgr.connection_pool_kw
+        assert kw['assert_hostname'] is False
+        assert kw['ssl_context'].check_hostname is False
+        assert kw['ssl_context'].verify_mode == _client.ssl.CERT_REQUIRED
+
+
 def test_orbit_files_are_the_last_default(orbit_home):
 
     # a machine set up for ORBIT needs neither --cert nor --token
