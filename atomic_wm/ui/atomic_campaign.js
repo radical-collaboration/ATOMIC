@@ -372,8 +372,14 @@ export function css() {
       font-size: .82rem;
     }
     .ac-res-name { font-weight: 600; color: var(--text); }
-    /* one indented row per member of a resource */
-    .ac-member td { padding-left: 18px; color: var(--muted); }
+    /* the second header line: it names the columns of the sub-rows */
+    .ac-subhead th {
+      font-size: .68rem;
+      padding-top: 0;
+      opacity: .75;
+    }
+    /* one indented row per shape of work a resource runs */
+    .ac-pilot td { padding-left: 18px; color: var(--muted); }
     .ac-soft {
       display: inline-block;
       margin: 1px 4px 1px 0;
@@ -382,24 +388,6 @@ export function css() {
       font-size: .72rem;
       background: rgba(108, 99, 255, .14);
       color: #a5b4fc;
-    }
-    .ac-bar {
-      height: 7px;
-      border-radius: 4px;
-      background: var(--border);
-      overflow: hidden;
-      margin-top: 5px;
-      min-width: 110px;
-    }
-    .ac-bar > i {
-      display: block;
-      height: 100%;
-      border-radius: 4px;
-      background: linear-gradient(90deg, var(--accent), var(--accent2));
-      transition: width .5s ease;
-    }
-    .ac-bar.ac-hot > i {
-      background: linear-gradient(90deg, var(--warn), var(--danger));
     }
     .ac-dot {
       display: inline-block;
@@ -410,6 +398,9 @@ export function css() {
       background: var(--muted);
     }
     .ac-dot.ok      { background: var(--accent2); box-shadow: 0 0 6px rgba(0,212,170,.6); }
+    /* declared, reachable, running nothing right now: an outline, not a
+       colour -- idle is not a fault */
+    .ac-dot.idle    { background: transparent; box-shadow: inset 0 0 0 2px var(--muted); }
     .ac-dot.suspect { background: var(--warn); }
     .ac-dot.lost    { background: var(--danger); }
     /* reachable, but every pilot it is asked to start dies at submit */
@@ -921,69 +912,169 @@ function renderResources(page, st) {
     count.textContent = `· ${fmtNum(nh, 2)} node-hours used`;
   }
 
-  const rows = st.resources.map(r => renderResourceRow(r)
-                                   + membersOf(r).map(m => renderMemberRow(r, m))
-                                                 .join('')).join('');
+  const rows = st.resources.map(r => {
+    const pilots = pilotsOf(r);
+    return renderResourceRow(r, pilots)
+         + pilots.map(p => renderPilotRow(r, p)).join('');
+  }).join('');
+
+  // two independent column sets in one grid: a resource row (what it is,
+  // what it has, how its work is going) and, indented under it, one row
+  // per shape of work it runs.  The last four columns are the same for
+  // both, which is what keeps them readable side by side.
   body.innerHTML = `${stale}
     <div style="overflow-x:auto">
       <table class="ac-table">
-        <thead><tr>
-          <th>Resource</th><th>Site</th><th>Type</th>
-          <th>Cores</th><th>GPUs</th><th>Memory</th>
-          <th>Software</th><th>Node-hours</th><th>Active work</th>
-          <th>Status</th>
-        </tr></thead>
+        <thead>
+          <tr>
+            <th>Resource</th><th>Site</th><th colspan="4">Software</th>
+            <th colspan="2">Classes</th>
+            <th>Run</th><th>Done</th><th>Failed</th><th>Status</th>
+          </tr>
+          <tr class="ac-subhead">
+            <th></th><th>Mode</th><th>Nodes</th><th>Cores/node</th>
+            <th>GPUs/node</th><th>Mem/node</th><th>Runtime</th><th>Left</th>
+            <th></th><th></th><th></th><th></th>
+          </tr>
+        </thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
 }
 
-// A resource declares one MEMBER per shape of pilot it is willing to run,
-// and each member sits in the pool for its capability class (fed-cpu,
-// fed-gpu).  A federation that predates class pools reports none, and then
-// the resource row is the whole story -- exactly as before.
-function membersOf(r) {
-  const members = (r && r.members) || [];
-  return isArr(members) ? members.filter(m => m && typeof m === 'object') : [];
+// A resource runs one shape of work per capability class it serves, and
+// the federation reports one row per shape (`fed-cpu`, `fed-gpu`).  Three
+// payloads have to render the same table: one that names the serving
+// endpoint, the kind and the time left on every row; one that reports rows
+// without those fields (they come off the record instead); and one that
+// predates class pools and reports no rows at all -- then a single row is
+// derived from the resource's own fields, exactly as the CLI does it.
+function pilotsOf(r) {
+  r = r || {};
+  const list = isArr(r.members)
+             ? r.members.filter(m => m && typeof m === 'object') : [];
+
+  return (list.length ? list : [derivedPilot(r)]).map(m => pilotRow(r, m));
 }
 
-// The node-hour cell: `used / total h` plus a bar, or just what was used
-// when nothing declared a budget.  Shared by resource and member rows.
-function nodeHourCell(usage, bud) {
-  const used  = num(usage.node_hours_used, 0);
+function derivedPilot(r) {
+  const caps = r.capabilities || {};
+  const pool = r.pool || {};
+  const gpus = ('gpus_per_node' in pool) ? pool.gpus_per_node : caps.gpus;
+
+  return {
+    member       : 'default',
+    member_id    : r.name ? `${r.name}.default` : '',
+    'class'      : num(gpus, 0) ? 'gpu' : 'cpu',
+    pool_name    : r.pool_name || '',
+    nodes        : ('nodes' in pool) ? pool.nodes : 1,
+    cpus_per_node: ('cpus_per_node' in pool) ? pool.cpus_per_node : caps.cores,
+    gpus_per_node: gpus,
+    walltime_sec : pool.walltime_sec,
+    software     : caps.software || [],
+    attributes   : {site: r.site, mem_gb_per_node: caps.mem_gb},
+    budget       : r.budget || {},
+    usage        : r.usage || {},
+    liveness     : r.liveness || '',
+    state        : r.state || r.liveness || '',
+    derived      : true,
+  };
+}
+
+// One row, with the fields the table renders filled in: an allocation is
+// a single unit of work named after its serving endpoint, a login-mode
+// resource runs one shape per class, named `<endpoint>/<shape>`.
+function pilotRow(r, m) {
+  const kind = (m.pilot === 'endpoint' || m.pilot === 'submit') ? m.pilot
+             : (r.mode === 'allocation' ? 'endpoint' : 'submit');
+  const ep   = String(m.endpoint || r.endpoint || '');
+  const name = String(m.member || '');
+  const both = (ep && name) ? `${ep}/${name}` : '';
+
+  return Object.assign({}, m, {
+    pilot     : kind,
+    pilot_name: (kind === 'endpoint' ? ep : both)
+                || ep || name || String(r.name || ''),
+    mode      : kind === 'endpoint' ? 'alloc' : 'login',
+    state     : pilotState(r, m),
+  });
+}
+
+// A federation that derives a state word per row is believed, `idle` and
+// all.  An older one reports only liveness, so a shape that holds nothing
+// is read here: failing when what it started died, idle otherwise.
+function pilotState(r, m) {
+  if (m.state) return String(m.state);
+
+  const u = m.usage || {};
+  if (u.pilots_active === 0) {
+    return (u.pilot_error || u.pilot_failures) ? 'failing' : 'idle';
+  }
+
+  return String(m.liveness || r.state || r.liveness || '');
+}
+
+const STATE_RANK = {lost: 5, failing: 4, suspect: 3, ok: 2, idle: 1};
+
+// What a resource row says: the worst of its own state and its rows'.  A
+// word this build does not know outranks the ones it does -- news belongs
+// on the resource row.
+function worstState(words) {
+  const known = words.filter(Boolean).map(w => String(w).toLowerCase());
+  if (!known.length) return '';
+
+  return known.sort((a, b) => (STATE_RANK[a] || 6) - (STATE_RANK[b] || 6))
+              .pop();
+}
+
+// Node-hours are tooltip material now: `used / allowance`, or just what
+// was used when nothing declared an allowance.
+function nodeHourTip(usage, bud) {
+  const used  = num(usage.node_hours_used, NaN);
+  // a federation that breaks no node-hours down per row says nothing here
+  if (!Number.isFinite(used)) return '';
+
   const left  = num(usage.node_hours_remaining, NaN);
   let   total = num(bud.node_hours, NaN);
   if (!Number.isFinite(total)) {
     total = Number.isFinite(left) ? used + left : NaN;
   }
-  const frac = (Number.isFinite(total) && total > 0)
-             ? Math.max(0, Math.min(1, used / total)) : 0;
 
   return Number.isFinite(total)
-    ? `${fmtNum(used, 2)} / ${fmtNum(total, 1)} h
-       <div class="ac-bar${frac > 0.85 ? ' ac-hot' : ''}">
-         <i style="width:${(frac * 100).toFixed(1)}%"></i></div>`
-    : `${fmtNum(used, 2)} h <span style="color:var(--muted)">used</span>`;
+    ? `${fmtNum(used, 2)} of ${fmtNum(total, 1)} node-hours used`
+    : `${fmtNum(used, 2)} node-hours used`;
 }
 
-// A member's usage may not carry task counts at all (a federation that
-// does not break them down per member); an absent count is not zero.
+// Seconds as hours, the unit the runtime columns are read in.  Two
+// decimals always: these two columns are read down, not across.
+function hoursCell(sec) {
+  // Number(null) is 0, and an unreported time left is not zero hours
+  if (sec === null || sec === undefined || sec === '') return '–';
+  const v = num(sec, NaN);
+
+  return Number.isFinite(v) ? `${(v / 3600).toFixed(2)} h` : '–';
+}
+
+// A row's usage may not carry task counts at all (a federation that does
+// not break them down per shape); an absent count is not zero.
 function countCell(value) {
   return Number.isFinite(num(value, NaN)) ? String(num(value, 0)) : '–';
 }
 
-// The Status cell of a resource or a member row.  `state` is what the
-// federation derives -- every liveness value plus `failing`, a site that
-// answers but whose pilots die at submit; a federation that sends no
-// `state` still shows its `liveness`, exactly as this always did.
+// The Status cell of a resource row or one of its sub-rows.  `state` is
+// what the federation derives -- every liveness value, plus `idle` (it is
+// declared, nothing is running on it) and `failing` (a site that answers
+// but whose work dies at submit); a federation that sends no `state`
+// still shows its `liveness`, exactly as this always did.
 function statusCell(record, fallback) {
   const rec  = record || {};
   const alt  = fallback || {};
   const live = String(rec.state || rec.liveness
                       || alt.state || alt.liveness || '').toLowerCase();
-  const dot  = ['ok', 'suspect', 'lost', 'failing'].includes(live)
+  const dot  = ['ok', 'idle', 'suspect', 'lost', 'failing'].includes(live)
              ? live : '';
   const label = live === 'ok'       ? 'online'
+              : live === 'idle'     ? 'idle'
               : live === 'suspect'  ? 'unsteady'
               : live === 'lost'     ? 'offline'
               : live === 'failing'  ? 'failing' : 'unknown';
@@ -993,11 +1084,11 @@ function statusCell(record, fallback) {
     esc(label)}</span>`;
 }
 
-// The row under a member that cannot start work: the site is reachable but
-// everything submitted to it dies, so the row would otherwise look exactly
-// like an idle one.  The label is ATOMIC vocabulary; the reason itself is
-// server-authored text and rides in an `ac-detail` span, like a campaign's
-// own `detail` does.
+// The row under a sub-row that cannot start work: the site is reachable
+// but everything submitted to it dies, so the row would otherwise look
+// exactly like an idle one.  The label is ATOMIC vocabulary; the reason
+// itself is server-authored text and rides in an `ac-detail` span, like a
+// campaign's own `detail` does.
 function pilotErrorRow(m) {
   const usage = (m && m.usage) || {};
   const err   = usage.pilot_error;
@@ -1011,7 +1102,7 @@ function pilotErrorRow(m) {
                                      .toLocaleTimeString()}` : '';
 
   return `<tr class="ac-pilot-error">
-    <td colspan="10" title="${esc(text)}">! cannot start work here: <span
+    <td colspan="12" title="${esc(text)}">! cannot start work here: <span
       class="ac-detail">${esc(short)}</span>${esc(until)}</td>
   </tr>`;
 }
@@ -1022,64 +1113,105 @@ function softwareCell(list) {
     : '<span style="color:var(--muted)">–</span>';
 }
 
-function renderMemberRow(r, m) {
-  const attrs = m.attributes || {};
-  const nodes = num(m.nodes, 1);
-  const cores = nodes * num(m.cpus_per_node, 0);
-  const gpus  = nodes * num(m.gpus_per_node, 0);
-  const cls   = m['class'] || m.cls || '';
-  const pool  = m.pool_name || '';
-  const mem   = num(attrs.mem_gb_per_node, NaN);
-  const usage = m.usage || {};
+// The class pools a resource serves, as badges on its own row: the
+// placement classes stay visible without a column per sub-row.
+function classCell(pilots) {
+  const seen = [];
+  for (const p of pilots) {
+    const name = String(p.pool_name || p['class'] || p.cls || '');
+    if (name && !seen.includes(name)) seen.push(name);
+  }
 
-  // GPUs here are DECLARED, not reserved -- nothing pins one to a task.
-  const tip = [m.member_id ? `member ${m.member_id}` : '',
-               m.queue ? `queue ${m.queue}` : '',
-               gpus ? `${gpus} declared GPU(s), not reserved` : '']
-              .filter(Boolean).join(' · ');
-
-  return `<tr class="ac-member">
-    <td><span title="${esc(tip)}">└ ${esc(m.member || '?')}</span></td>
-    <td>${esc(attrs.site || r.site || '–')}</td>
-    <td>${esc([cls, pool].filter(Boolean).join(' / ') || '–')}</td>
-    <td class="ac-mono">${cores}</td>
-    <td class="ac-mono">${gpus}</td>
-    <td class="ac-mono">${Number.isFinite(mem) ? esc(mem) + ' GB' : '–'}</td>
-    <td>${softwareCell(m.software)}</td>
-    <td class="ac-mono" style="min-width:150px">${
-      nodeHourCell(usage, m.budget || {})}</td>
-    <td class="ac-mono">${countCell(usage.tasks_running)} running
-        · ${countCell(usage.tasks_done)} done</td>
-    <td>${statusCell(m, r)}</td>
-  </tr>` + pilotErrorRow(m);
+  return seen.length
+    ? seen.map(s => `<span class="ac-soft">${esc(s)}</span>`).join('')
+    : '<span style="color:var(--muted)">–</span>';
 }
 
-function renderResourceRow(r) {
+// What the resource has installed: the union over its sub-rows, falling
+// back to what the record itself declares.
+function softwareOf(r, pilots) {
+  const seen = [];
+  for (const p of pilots) {
+    for (const s of (isArr(p.software) ? p.software : [])) {
+      if (!seen.includes(String(s))) seen.push(String(s));
+    }
+  }
+
+  return seen.length ? seen : ((r.capabilities || {}).software || []);
+}
+
+const TASK_KEYS = ['tasks_running', 'tasks_done', 'tasks_failed'];
+
+// Task counts summed over the sub-rows -- only for a record that reports
+// none of its own: the record counts what is not placed yet as well, so a
+// sum would under-count it.
+function sumUsage(pilots) {
+  const out = {};
+  for (const key of TASK_KEYS) {
+    const seen = pilots.map(p => num((p.usage || {})[key], NaN))
+                       .filter(Number.isFinite);
+    if (seen.length) out[key] = seen.reduce((a, b) => a + b, 0);
+  }
+
+  return out;
+}
+
+function renderPilotRow(r, p) {
+  const attrs = p.attributes || {};
+  const usage = p.usage || {};
+  const mem   = num(attrs.mem_gb_per_node, NaN);
+  const gpus  = num(p.gpus_per_node, 0);
+
+  // GPUs here are DECLARED, not reserved -- nothing pins one to a task.
+  const tip = [p.member_id ? `id ${p.member_id}` : '',
+               attrs.site ? `site ${attrs.site}` : '',
+               p.queue ? `queue ${p.queue}` : '',
+               nodeHourTip(usage, p.budget || {}),
+               gpus ? `${gpus} declared GPU(s) per node, not reserved` : '']
+              .filter(Boolean).join(' · ');
+
+  return `<tr class="ac-pilot">
+    <td><span title="${esc(tip)}">└ ${esc(p.pilot_name || '?')}</span></td>
+    <td>${esc(p.mode || '–')}</td>
+    <td class="ac-mono">${countCell(p.nodes)}</td>
+    <td class="ac-mono">${countCell(p.cpus_per_node)}</td>
+    <td class="ac-mono">${countCell(p.gpus_per_node)}</td>
+    <td class="ac-mono">${Number.isFinite(mem) ? esc(mem) + ' GB' : '–'}</td>
+    <td class="ac-mono">${hoursCell(p.walltime_sec)}</td>
+    <td class="ac-mono">${hoursCell(p.remaining_sec)}</td>
+    <td class="ac-mono">${countCell(usage.tasks_running)}</td>
+    <td class="ac-mono">${countCell(usage.tasks_done)}</td>
+    <td class="ac-mono">${countCell(usage.tasks_failed)}</td>
+    <td>${statusCell(p, r)}</td>
+  </tr>` + pilotErrorRow(p);
+}
+
+function renderResourceRow(r, pilots) {
   r = r || {};
-  const caps  = r.capabilities || {};
-  const usage = r.usage || {};
-  const bud   = r.budget || {};
+  pilots = pilots || [];
 
-  const nh   = nodeHourCell(usage, bud);
-  const soft = softwareCell(caps.software);
+  const usage  = r.usage || {};
+  // the record counts the tasks nothing has placed yet as well, which no
+  // sub-row does -- so its own numbers win wherever it reports any
+  const counts = TASK_KEYS.some(k => k in usage) ? usage : sumUsage(pilots);
+  const state  = worstState([r.state || r.liveness]
+                            .concat(pilots.map(p => p.state)));
 
-  const kind = [r.kind, r.mode].filter(Boolean).join(' / ') || '–';
   // the only place an Orbit-internal name is allowed: a tooltip
-  const tip = r.endpoint ? `serving endpoint: ${r.endpoint}` : '';
+  const tip = [r.endpoint ? `serving endpoint: ${r.endpoint}` : '',
+               [r.kind, r.mode].filter(Boolean).join(' / '),
+               nodeHourTip(usage, r.budget || {})]
+              .filter(Boolean).join(' · ');
 
   return `<tr>
     <td><span class="ac-res-name" title="${esc(tip)}">${esc(r.name)}</span></td>
     <td>${esc(r.site || '–')}</td>
-    <td>${esc(kind)}</td>
-    <td class="ac-mono">${esc(caps.cores !== undefined ? caps.cores : '–')}</td>
-    <td class="ac-mono">${esc(caps.gpus !== undefined ? caps.gpus : 0)}</td>
-    <td class="ac-mono">${caps.mem_gb !== undefined
-                         ? esc(caps.mem_gb) + ' GB' : '–'}</td>
-    <td>${soft}</td>
-    <td class="ac-mono" style="min-width:150px">${nh}</td>
-    <td class="ac-mono">${num(usage.tasks_running, 0)} running
-        · ${num(usage.tasks_done, 0)} done</td>
-    <td>${statusCell(r)}</td>
+    <td colspan="4">${softwareCell(softwareOf(r, pilots))}</td>
+    <td colspan="2">${classCell(pilots)}</td>
+    <td class="ac-mono">${countCell(counts.tasks_running)}</td>
+    <td class="ac-mono">${countCell(counts.tasks_done)}</td>
+    <td class="ac-mono">${countCell(counts.tasks_failed)}</td>
+    <td>${statusCell({state: state})}</td>
   </tr>`;
 }
 
@@ -1739,8 +1871,8 @@ export const _internals = {
   EXAMPLES, esc, scalar, fmtNum, fmtBytes, fmtDuration, toEpoch,
   parseSweepValues, stateClass, stateBadge, stateWord, stateLabel,
   varyingKeys, legendLabel, paramsLabel, niceTicks, downsample,
-  renderPlot, renderFiles, renderResourceRow, renderMemberRow, membersOf,
-  placementOf, countCell, pickMetrics,
+  renderPlot, renderFiles, renderResourceRow, renderPilotRow, pilotsOf,
+  worstState, hoursCell, placementOf, countCell, pickMetrics,
   FAILED_HIDE_MS, isHidden, hideDueInMs, visibleCampaigns,
   PLOT_GEOMETRY: {PW, PH, PAD}
 };

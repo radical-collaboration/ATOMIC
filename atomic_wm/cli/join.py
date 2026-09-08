@@ -1103,7 +1103,7 @@ def connect_and_join(client: Client, args: argparse.Namespace,
     _check_stop(stop)
 
     if alloc:
-        info('allocation: %s node(s), %s s remaining'
+        info('allocation: %s node(s), %s s runtime'
              % (alloc.get('n_nodes'), alloc.get('runtime')))
 
     record = assemble_record(args, detected, alloc)

@@ -1,14 +1,17 @@
 """``atomic-resources`` -- list the resources in the ATOMIC federation.
 
-Reads ``GET /broker/federation/resources/default`` and renders a two-level
-table: one row per resource, then one indented row per **member** -- one
-shape of pilot the resource is willing to run, each of which sits in the
-capability class pool for its class (``fed-cpu``, ``fed-gpu``).  The
-resource row is the aggregate of its members.  ``--json`` prints the
-records as they came from the broker (for scripts and the demo's own
-checks).
+Reads ``GET /broker/federation/resources/default`` and renders two
+independent column sets: one row per resource -- what it is, where it is,
+what it has installed, which capability class pools it serves and how its
+work is going -- and, indented under it, one row per **pilot** the
+resource runs.  An allocation is a single pilot, named after its
+endpoint; a login-mode resource submits one shape of pilot per class it
+serves, each named ``<endpoint>/<shape>``, and a shape that holds no
+pilot right now reads ``idle``.  ``--json`` prints the records as they
+came from the broker (for scripts and the demo's own checks), node-hours
+and all.
 
-A GPU in a member's size is what the operator **declared**, not a
+A GPU in a pilot's size is what the operator **declared**, not a
 reservation: nothing pins a GPU to a task this round.
 
 Usage figures are refreshed by the federation on every call; when that
@@ -17,10 +20,11 @@ refresh fails the record keeps its last values and is flagged
 hidden, because a stale number still says more than a blank.
 
 The last column is the federation's derived ``state``: the endpoint's
-liveness (``ok`` / ``suspect`` / ``lost``) or ``failing`` -- reachable,
-but holding no pilot because the ones it submitted keep dying.  Such a
-row carries an indented ``! pilot: ...`` line with what the batch system
-actually said, which used to reach only the broker log.
+liveness (``ok`` / ``suspect`` / ``lost``), ``idle`` -- nothing running
+here -- or ``failing``: reachable, but holding no pilot because the ones
+it submitted keep dying.  Such a row carries an indented ``! pilot: ...``
+line with what the batch system actually said, which used to reach only
+the broker log.
 """
 
 import argparse
@@ -30,26 +34,45 @@ import time
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from ..client import Client, ClientError, add_connection_args, members_of
+from ..client import Client, ClientError, add_connection_args, pilots_of
 
 TOOL = 'atomic-resources'
 
-# column header, and the row key it renders
-COLUMNS = [('RESOURCE',   'resource'),
-           ('MEMBER',     'member'),
-           ('CLASS/POOL', 'class_pool'),
-           ('SITE',       'site'),
-           ('SIZE',       'size'),
-           ('SOFTWARE',   'software'),
-           ('NODE-H',     'node_hours'),
-           ('PILOTS',     'pilots'),
-           ('TASKS',      'tasks'),
-           ('LIVENESS',   'liveness')]
+# the two column sets: header, and the row key it renders
+RESOURCE_COLUMNS = [('RESOURCE', 'resource'),
+                    ('SITE',     'site'),
+                    ('SOFTWARE', 'software'),
+                    ('CLASSES',  'classes'),
+                    ('RUN',      'run'),
+                    ('DONE',     'done'),
+                    ('FAILED',   'failed'),
+                    ('STATE',    'state')]
+
+PILOT_COLUMNS = [('PILOT',   'pilot'),
+                 ('MODE',    'mode'),
+                 ('NODES',   'nodes'),
+                 ('CPN',     'cpn'),
+                 ('GPN',     'gpn'),
+                 ('MPN',     'mpn'),
+                 ('RUNTIME', 'runtime'),
+                 ('LEFT',    'left'),
+                 ('RUN',     'run'),
+                 ('DONE',    'done'),
+                 ('FAILED',  'failed'),
+                 ('STATE',   'state')]
 
 DASH = '-'
 
-# what an indented member row is prefixed with
+# what an indented pilot row is prefixed with (the header of the pilot
+# column set is indented by as much, minus the branch)
 BRANCH = '  └ '
+INDENT = '  '
+
+# a free-form name (`atomic-join --endpoint` takes any) is cut to this
+NAME_WIDTH = 24
+
+# how bad a state word is: the resource row shows the worst of its pilots'
+STATE_RANK = {'lost': 5, 'failing': 4, 'suspect': 3, 'ok': 2, 'idle': 1}
 
 
 # ---------------------------------------------------------------------------
@@ -91,90 +114,115 @@ def _num(value: Any, digits: int = 1) -> str:
     return str(value)
 
 
-def node_hours(record: Dict[str, Any]) -> str:
-    """``used/remaining`` node-hours of a resource or of one member.
+def hours(seconds: Any) -> str:
+    """Seconds as hours with two decimals; ``-`` when there are none."""
 
-    ``remaining`` is what the federation reports; if it does not (yet)
-    report one we derive it from the declared budget.  Both record shapes
-    carry ``usage`` and ``budget`` under the same keys, so one function
-    serves the resource row and the member rows.
-    """
-
-    usage = record.get('usage') or {}
-    used  = usage.get('node_hours_used')
-    left  = usage.get('node_hours_remaining')
-
-    if left is None:
-        budget = (record.get('budget') or {}).get('node_hours')
-        if budget is not None and isinstance(used, (int, float)):
-            left = max(0.0, float(budget) - float(used))
-        elif budget is not None and used is None:
-            left = budget
-
-    text = '%s/%s' % (_num(used, 2), _num(left, 2))
-
-    if usage.get('stale'):
-        text += '*'
-
-    return text
-
-
-def size_of(member: Dict[str, Any]) -> str:
-    """``1x128c+4g`` -- one pilot of this member: nodes x cores (+ GPUs)."""
-
-    nodes = member.get('nodes')
-    cpus  = member.get('cpus_per_node')
-
-    if nodes is None and cpus is None:
+    if seconds is None or isinstance(seconds, bool) \
+            or not isinstance(seconds, (int, float)):
         return DASH
 
-    text = '%sx%sc' % (_num(nodes), _num(cpus))
-    gpus = member.get('gpus_per_node') or 0
-
-    if isinstance(gpus, (int, float)) and gpus:
-        text += '+%sg' % _num(gpus)
-
-    return text
+    return '%.2f' % (float(seconds) / 3600.0)
 
 
-def class_pool(member: Dict[str, Any]) -> str:
-    """``gpu/fed-gpu`` -- the member's capability class and its pool."""
+def clip(name: str) -> str:
+    """A name the table has room for -- the rest is one ``…``."""
 
-    cls  = str(member.get('class') or member.get('cls') or '')
-    pool = str(member.get('pool_name') or '')
+    text = str(name)
 
-    if cls and pool:
-        return '%s/%s' % (cls, pool)
+    if len(text) <= NAME_WIDTH:
+        return text
 
-    return cls or pool or DASH
-
-
-def _tasks(usage: Dict[str, Any]) -> str:
-
-    return '%s/%s' % (_num(usage.get('tasks_running')),
-                      _num(usage.get('tasks_done')))
+    return text[:NAME_WIDTH - 1] + '…'
 
 
-def state_of(record: Dict[str, Any], fallback: Dict[str, Any] = None) -> str:
-    """The word the STATE column shows for a resource or a member.
+def worst_state(words: Sequence[str]) -> str:
+    """The state a resource row shows: the worst of the words handed in.
 
-    ``state`` is what the federation derives (every ``liveness`` value plus
-    ``failing`` -- reachable, but its pilots die at submit); a broker that
-    does not send one still has its ``liveness`` shown, exactly as before.
+    Anything the federation invented after this was written outranks the
+    words we know -- an unknown state is news, and news belongs on the
+    resource row.
     """
 
-    for source in (record, fallback or {}):
-        word = source.get('state') or source.get('liveness')
-        if word:
-            return str(word)
+    known = [w for w in words if w]
 
-    return DASH
+    if not known:
+        return DASH
+
+    return sorted(known, key=lambda w: (STATE_RANK.get(w, 6), w))[-1]
+
+
+TASK_KEYS = ('tasks_running', 'tasks_done', 'tasks_failed')
+
+
+def _tasks(usage: Dict[str, Any]) -> Dict[str, str]:
+    """The run / done / failed cells of either row kind."""
+
+    return {'run'   : _num(usage.get('tasks_running')),
+            'done'  : _num(usage.get('tasks_done')),
+            'failed': _num(usage.get('tasks_failed'))}
+
+
+def _summed(pilots: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Task counts summed over the pilot rows.
+
+    Only for a record that carries no usage of its own: the record counts
+    the tasks it has not placed yet too, so a sum would under-count.
+    """
+
+    out: Dict[str, Any] = {}
+
+    for key in TASK_KEYS:
+        seen = [(p.get('usage') or {}).get(key) for p in pilots]
+        seen = [v for v in seen
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if seen:
+            out[key] = sum(seen)
+
+    return out
+
+
+def classes_of(pilots: Sequence[Dict[str, Any]]) -> str:
+    """The class pools this resource serves, as badges: ``fed-cpu,fed-gpu``."""
+
+    names = []
+
+    for pilot in pilots:
+        name = str(pilot.get('pool_name') or pilot.get('class')
+                   or pilot.get('cls') or '')
+        if name and name not in names:
+            names.append(name)
+
+    return ','.join(names) if names else DASH
+
+
+def software_of(record: Dict[str, Any],
+                pilots: Sequence[Dict[str, Any]]) -> str:
+    """The union of what the pilot rows have installed."""
+
+    soft: List[str] = []
+
+    for pilot in pilots:
+        for name in pilot.get('software') or []:
+            if str(name) not in soft:
+                soft.append(str(name))
+
+    if not soft:
+        soft = [str(s) for s in (record.get('capabilities') or {})
+                                .get('software') or []]
+
+    return ','.join(soft) if soft else DASH
+
+
+def state_cell(word: str, usage: Dict[str, Any]) -> str:
+    """The state word, marked ``*`` when its numbers could not be refreshed."""
+
+    return (word or DASH) + ('*' if usage.get('stale') else '')
 
 
 def pilot_note(record: Dict[str, Any]) -> str:
     """The indented ``! pilot: ...`` line under a row, or ``''``.
 
-    Every pilot of this member failed at submit and only the broker log
+    Every pilot of this shape failed at submit and only the broker log
     said so -- this is that log line, on the row it belongs to.
     """
 
@@ -195,110 +243,127 @@ def pilot_note(record: Dict[str, Any]) -> str:
     return note
 
 
-def row(record: Dict[str, Any], members: Sequence[Dict[str, Any]]
-        ) -> Dict[str, str]:
-    """The aggregate row of one resource.
+def resource_row(record: Dict[str, Any],
+                 pilots: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """The row of one resource: what it is, and how its work is going.
 
-    ``SIZE`` names the member count -- the sizes themselves differ per
-    member and are shown on the member rows below.  A resource whose
-    members had to be derived (a broker without class pools) has exactly
-    one, and shows its size here instead.
+    The counts come from the record's own usage -- it counts the tasks
+    the class pool has not placed yet as well, which no pilot row does --
+    and are summed over the pilot rows only where the record carries no
+    usage at all.
     """
 
-    caps  = record.get('capabilities') or {}
-    usage = record.get('usage') or {}
-    soft  = caps.get('software') or []
-    lone  = len(members) == 1 and members[0].get('derived')
+    usage  = record.get('usage') or {}
+    counts = usage if any(k in usage for k in TASK_KEYS) \
+                   else _summed(pilots)
+    states = [str(record.get('state') or record.get('liveness') or '')]
+    states += [str(p.get('state') or '') for p in pilots]
 
-    return {
-        'resource'  : str(record.get('name', DASH)),
-        'member'    : '' if not lone else str(members[0].get('member') or ''),
-        'class_pool': '' if not lone else class_pool(members[0]),
-        'site'      : str(record.get('site') or DASH),
-        'size'      : size_of(members[0]) if lone else
-                      '%d member%s' % (len(members),
-                                       '' if len(members) == 1 else 's'),
-        'software'  : ','.join(str(s) for s in soft) if soft else DASH,
-        'node_hours': node_hours(record),
-        'pilots'    : _num(usage.get('pilots_active')),
-        'tasks'     : _tasks(usage),
-        'liveness'  : state_of(record),
-        # a lone derived member IS this row, so its pilot error belongs here
-        'note'      : pilot_note(members[0]) if lone else '',
+    row = {
+        'resource': clip(record.get('name') or DASH),
+        'site'    : str(record.get('site') or DASH),
+        'software': software_of(record, pilots),
+        'classes' : classes_of(pilots),
+        'state'   : state_cell(worst_state(states), usage),
+        'note'    : '',
     }
+    row.update(_tasks(counts))
+
+    return row
 
 
-def member_row(record: Dict[str, Any],
-               member: Dict[str, Any]) -> Dict[str, str]:
-    """One indented row per member of a resource."""
+def pilot_row(pilot: Dict[str, Any]) -> Dict[str, str]:
+    """One indented row per pilot the resource runs."""
 
-    usage = member.get('usage') or {}
-    attrs = member.get('attributes') or {}
-    soft  = member.get('software') or []
-    name  = str(member.get('member') or DASH)
+    usage = pilot.get('usage') or {}
 
-    return {
-        'resource'  : BRANCH + name,
-        'member'    : name,
-        'class_pool': class_pool(member),
-        'site'      : str(attrs.get('site') or record.get('site') or DASH),
-        'size'      : size_of(member),
-        'software'  : ','.join(str(s) for s in soft) if soft else DASH,
-        'node_hours': node_hours(member),
-        'pilots'    : _num(usage.get('pilots_active')),
-        'tasks'     : _tasks(usage),
-        'liveness'  : state_of(member, record),
-        'note'      : pilot_note(member),
+    row = {
+        'pilot'  : BRANCH + clip(pilot.get('pilot_name') or DASH),
+        'mode'   : str(pilot.get('mode') or DASH),
+        'nodes'  : _num(pilot.get('nodes')),
+        'cpn'    : _num(pilot.get('cpus_per_node')),
+        'gpn'    : _num(pilot.get('gpus_per_node')),
+        'mpn'    : _num(pilot.get('mem_gb_per_node')),
+        'runtime': hours(pilot.get('walltime_sec')),
+        'left'   : hours(pilot.get('remaining_sec')),
+        'state'  : state_cell(str(pilot.get('state') or ''), usage),
+        'note'   : pilot_note(pilot),
     }
+    row.update(_tasks(usage))
+
+    return row
 
 
-def rows_for(record: Dict[str, Any]) -> List[Dict[str, str]]:
-    """The rows one resource contributes: itself, then its members."""
+def rows_for(record: Dict[str, Any]) -> Dict[str, Any]:
+    """What one resource contributes: its own row, then its pilot rows."""
 
-    members = members_of(record)
-    out     = [row(record, members)]
+    pilots = pilots_of(record)
 
-    if len(members) == 1 and members[0].get('derived'):
-        # nothing was grouped -- the resource row IS the member row
-        return out
+    return {'resource': resource_row(record, pilots),
+            'pilots'  : [pilot_row(p) for p in pilots]}
 
-    return out + [member_row(record, m) for m in members]
+
+def _widths(rows: Sequence[Dict[str, str]],
+            columns: Sequence[Any]) -> Dict[str, int]:
+
+    return {key: max([len(head)] + [len(r[key]) for r in rows])
+            for head, key in columns}
+
+
+def _line(row: Dict[str, str], columns: Sequence[Any],
+          widths: Dict[str, int]) -> str:
+
+    return '  '.join(row[key].ljust(widths[key])
+                     for _, key in columns).rstrip()
 
 
 def render(records: Sequence[Dict[str, Any]]) -> str:
-    """The whole table (header + rows + legend)."""
+    """The whole table (both headers + rows + legend)."""
 
     if not records:
         return ('no resources in the federation -- join one with '
                 '`atomic-join --name … --mode …`')
 
-    rows: List[Dict[str, str]] = []
-    for record in records:
-        rows += rows_for(record)
+    blocks = [rows_for(record) for record in records]
+    res    = [b['resource'] for b in blocks]
+    pilots = [p for b in blocks for p in b['pilots']]
 
-    widths = {key: max([len(head)] + [len(r[key]) for r in rows])
-              for head, key in COLUMNS}
+    rwidth = _widths(res, RESOURCE_COLUMNS)
+    pwidth = _widths(pilots, PILOT_COLUMNS) if pilots else {}
 
-    lines = ['  '.join(head.ljust(widths[key]) for head, key in COLUMNS)]
+    # the pilot header sits where the pilot rows do, one indent in
+    pwidth['pilot'] = max(pwidth.get('pilot', 0), len(INDENT + 'PILOT'))
 
-    for r in rows:
-        lines.append('  '.join(r[key].ljust(widths[key])
-                               for _, key in COLUMNS).rstrip())
-        # the row's own bad news, under it and outside the columns: a
-        # quota or a queue error is far too long to be a table cell
-        if r.get('note'):
-            lines.append(r['note'])
+    lines = ['  '.join(head.ljust(rwidth[key])
+                       for head, key in RESOURCE_COLUMNS).rstrip()]
+
+    if pilots:
+        head = dict((key, name) for name, key in PILOT_COLUMNS)
+        head['pilot'] = INDENT + 'PILOT'
+        lines.append(_line(head, PILOT_COLUMNS, pwidth))
+
+    for block in blocks:
+        lines.append(_line(block['resource'], RESOURCE_COLUMNS, rwidth))
+        for row in block['pilots']:
+            lines.append(_line(row, PILOT_COLUMNS, pwidth))
+            # the row's own bad news, under it and outside the columns: a
+            # quota or a queue error is far too long to be a table cell
+            if row.get('note'):
+                lines.append(row['note'])
+
+    every = res + pilots
 
     lines.append('')
-    lines.append('SIZE: nodes x cores/node (+GPUs/node, declared -- not '
-                 'reserved)')
-    lines.append('NODE-H: used/remaining   TASKS: running/done')
+    lines.append('CPN/GPN/MPN: cores, GPUs and GB of memory per node '
+                 '(declared -- not reserved)')
+    lines.append('RUNTIME/LEFT: how long a pilot runs, and what is left '
+                 'of that, in hours')
 
-    if any('*' in r['node_hours'] for r in rows):
+    if any('*' in r['state'] for r in every):
         lines.append('*: usage could not be refreshed -- values are stale')
 
-    if any(r.get('note') for r in rows):
-        lines.append("!: no pilot of that member survived submission -- "
+    if any(r.get('note') for r in every):
+        lines.append("!: no pilot of that shape survived submission -- "
                      "the row's state is 'failing'")
 
     return '\n'.join(lines)

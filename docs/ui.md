@@ -37,42 +37,51 @@ Explorer has to work offline, so the charts are hand-rolled inline SVG.
 
 ### 1 · Resources — *demo step 2*
 
-A table of the federation's resources, one row each:
+A table of the federation's resources in two independent column sets.
+The resource row says what the resource is and how its work is going:
 
 | column | source |
 |---|---|
-| Resource (+ join mode badge) | `name`, `mode`; tooltip = serving endpoint |
+| Resource | `name`; tooltip = serving endpoint, `kind` / `mode`, node-hours used over the allowance |
 | Site | `site` |
-| Type | `kind` / `mode` |
-| Cores · GPUs · Memory | `capabilities.cores` / `.gpus` / `.mem_gb` |
-| Software | `capabilities.software` |
-| Node-hours | `usage.node_hours_used` over the allowance, with a bar |
-| Active work | `usage.tasks_running` / `usage.tasks_done` |
-| Status | `state` (else `liveness`) → green (online) / amber (unsteady) / red (offline, failing) |
+| Software | the union over its sub-rows, else `capabilities.software` |
+| Classes | the `pool_name` badges of its sub-rows (`fed-cpu`, `fed-gpu`) — the placement classes stay visible without a column per sub-row |
+| Run · Done · Failed | `usage.tasks_running` / `.tasks_done` / `.tasks_failed` — the record's own, which count what nothing has placed yet as well; summed over the sub-rows only where the record reports none |
+| Status | the worst state of the record and its sub-rows → green (online) / hollow (idle) / amber (unsteady) / red (offline, failing) |
 
-Underneath each resource sit its **members**, one indented `└ name`
-sub-row per entry in `members[]` — a resource declares one member per
-shape of pilot it runs, and each member lives in the pool for its
-capability class (`fed-cpu`, `fed-gpu`). The sub-row reuses the same ten
-columns: the *Type* cell becomes `class / pool_name`, *Cores*/*GPUs* are
-`nodes × cpus_per_node` / `nodes × gpus_per_node`, *Memory* is
-`attributes.mem_gb_per_node`, and *Software*, *Node-hours* and *Active
-work* come from the member's own `software`, `budget` and `usage`. The
-member id and queue are tooltip material, and a member declaring GPUs
-says so as *declared, not reserved* — nothing pins a GPU to a task this
-round. A member whose `usage` carries no task counts shows `–`, not a
-zero it cannot vouch for. A member the federation reports as `failing` —
-reachable, but every pilot it submits dies — says *failing* in red and is
-followed by one monospace `! cannot start work here:` line carrying its
-`usage.pilot_error` (server text, truncated, full text in the tooltip) and,
-while the dispatcher is backing off, when it retries.
-A record with no `members` (a federation that predates class
-pools) renders exactly as before: one row, no sub-rows.
+Underneath each resource sits one indented `└ name` sub-row per shape of
+work it runs — an entry of `members[]` on the wire. An allocation is one
+such shape, named after its serving endpoint (`ep_odo`); a login-mode
+resource runs one per capability class, named `<endpoint>/<shape>`
+(`ep_perlmutter/gpu`). The sub-row has its own column set, named by the
+second header line:
 
-The allowance is `budget.node_hours` where declared, otherwise
-`node_hours_used + node_hours_remaining`. The bar turns amber→red past
-85 % of the allowance. Rows appear and disappear as resources join and
-leave — that is demo step 2, shown live without touching the page.
+| column | source |
+|---|---|
+| Mode | `alloc` (the resource is the allocation) / `login` (it submits) |
+| Nodes · Cores/node · GPUs/node · Mem/node | `nodes`, `cpus_per_node`, `gpus_per_node`, `attributes.mem_gb_per_node` |
+| Runtime · Left | `walltime_sec`, `remaining_sec`, in hours |
+| Run · Done · Failed | that shape's own `usage` |
+| Status | its `state`, else what the resource reports |
+
+The wire id, the queue, the shape's own site and its node-hours are
+tooltip material, and a shape declaring GPUs says so as *declared, not
+reserved* — nothing pins a GPU to a task this round. A shape whose
+`usage` carries no task counts shows `–`, not a zero it cannot vouch
+for, and one that holds nothing right now reads *idle* behind a hollow
+dot. A shape the federation reports as `failing` — reachable, but
+everything it starts dies — says *failing* in red and is followed by one
+monospace `! cannot start work here:` line carrying its
+`usage.pilot_error` (server text, truncated, full text in the tooltip)
+and, while the dispatcher is backing off, when it retries. A record with
+no `members` (a federation that predates class pools) gets exactly one
+sub-row, derived from its own fields.
+
+The node-hour allowance in the tooltip is `budget.node_hours` where
+declared, otherwise `node_hours_used + node_hours_remaining`; the panel
+header adds up what the whole federation has used. Rows appear and
+disappear as resources join and leave — that is demo step 2, shown live
+without touching the page.
 
 Data: `GET /broker/federation/resources/default`, through
 `api.fetchRaw()`. No session is registered: the federation's `default`
@@ -260,8 +269,9 @@ Everything is sized for **1280×720 on a screen share**:
 - `node --check` on the module;
 - a fake-Explorer drive: a minimal `page`/`api` pair with canned JSON in
   the contract's shapes is handed to `init()`, and the HTML the module
-  writes is asserted on — the resource rows, their member sub-rows and
-  the node-hour bar, the stage chips with their `resource/member` labels
+  writes is asserted on — the resource rows, the sub-row per shape of
+  work they run (all three payload shapes, `idle` and the two column
+  sets), the stage chips with their `resource/member` labels
   and the STAGING/SKIPPED/INTERRUPTED
   vocabulary, the stage and campaign `reason`, both SVG charts and the
   terminal "no data" placeholder, the results drawer (files, sizes,

@@ -1,5 +1,7 @@
 """Unit tests for ``atomic_wm.client`` -- the CLIs' HTTP client."""
 
+import json
+
 import pytest
 
 from atomic_wm import client
@@ -315,41 +317,194 @@ def test_leave_can_ask_for_the_tasks_to_be_cancelled(broker):
     assert broker.calls[-1]['json'] == {'cancel_tasks': True}
 
 
-def test_members_of_returns_the_reported_members(broker):
+# ---------------------------------------------------------------------------
+# pilots_of: the three payload shapes it has to render
+# ---------------------------------------------------------------------------
 
-    record = {'name': 'local_b',
-              'members': [{'member': 'cpu', 'member_id': 'local_b.cpu'},
-                          {'member': 'gpu', 'member_id': 'local_b.gpu'}]}
+# shape 1: the federation names the endpoint, the pilot kind and the time
+# left per row, and derives `idle` itself
+SHAPED = {
+    'name': 'perlmutter', 'endpoint': 'ep_perlmutter', 'mode': 'login',
+    'site': 'NERSC', 'state': 'ok',
+    'members': [
+        {'member': 'cpu', 'member_id': 'perlmutter.cpu',
+         'endpoint': 'ep_perlmutter', 'pilot': 'submit', 'class': 'cpu',
+         'pool_name': 'fed-cpu', 'nodes': 4, 'cpus_per_node': 128,
+         'gpus_per_node': 0, 'walltime_sec': 3600, 'remaining_sec': 2520,
+         'attributes': {'site': 'NERSC', 'mem_gb_per_node': 512},
+         'usage': {'tasks_running': 4, 'tasks_done': 9, 'tasks_failed': 1,
+                   'pilots_active': 2},
+         'liveness': 'ok', 'state': 'ok'},
+        {'member': 'gpu', 'member_id': 'perlmutter.gpu',
+         'endpoint': 'ep_perlmutter', 'pilot': 'submit', 'class': 'gpu',
+         'pool_name': 'fed-gpu', 'nodes': 1, 'cpus_per_node': 64,
+         'gpus_per_node': 4, 'walltime_sec': 1800, 'remaining_sec': None,
+         'attributes': {'site': 'NERSC', 'mem_gb_per_node': 256},
+         'usage': {'tasks_running': 0, 'tasks_done': 2, 'tasks_failed': 0,
+                   'pilots_active': 0},
+         'liveness': 'ok', 'state': 'idle'}]}
 
-    assert [m['member_id'] for m in client.members_of(record)] \
-        == ['local_b.cpu', 'local_b.gpu']
-    assert not any(m.get('derived') for m in client.members_of(record))
+ALLOCATED = {
+    'name': 'odo', 'endpoint': 'ep_odo', 'mode': 'allocation',
+    'site': 'OLCF', 'state': 'ok',
+    'members': [
+        {'member': 'default', 'member_id': 'odo.default',
+         'endpoint': 'ep_odo', 'pilot': 'endpoint', 'class': 'gpu',
+         'pool_name': 'fed-gpu', 'nodes': 2, 'cpus_per_node': 112,
+         'gpus_per_node': 8, 'walltime_sec': 5400, 'remaining_sec': 4140,
+         'attributes': {'site': 'OLCF', 'mem_gb_per_node': 256},
+         'usage': {'tasks_running': 0, 'tasks_done': 3, 'tasks_failed': 0,
+                   'pilots_active': 1},
+         'liveness': 'ok', 'state': 'ok'}]}
+
+# shape 2: the same two resources, from a federation that reports rows
+# without `endpoint`, `pilot`, `remaining_sec` or a state word
+UNSHAPED = {
+    'name': 'perlmutter', 'endpoint': 'ep_perlmutter', 'mode': 'login',
+    'site': 'NERSC', 'liveness': 'ok',
+    'members': [
+        {'member': 'cpu', 'member_id': 'perlmutter.cpu', 'class': 'cpu',
+         'pool_name': 'fed-cpu', 'nodes': 4, 'cpus_per_node': 128,
+         'gpus_per_node': 0, 'walltime_sec': 3600,
+         'attributes': {'mem_gb_per_node': 512},
+         'usage': {'tasks_running': 4, 'tasks_done': 9, 'tasks_failed': 1,
+                   'pilots_active': 2},
+         'liveness': 'ok'},
+        {'member': 'gpu', 'member_id': 'perlmutter.gpu', 'class': 'gpu',
+         'pool_name': 'fed-gpu', 'nodes': 1, 'cpus_per_node': 64,
+         'gpus_per_node': 4, 'walltime_sec': 1800,
+         'attributes': {'mem_gb_per_node': 256},
+         'usage': {'tasks_running': 0, 'tasks_done': 2, 'tasks_failed': 0,
+                   'pilots_active': 0},
+         'liveness': 'ok'}]}
+
+UNSHAPED_ALLOC = {
+    'name': 'odo', 'endpoint': 'ep_odo', 'mode': 'allocation',
+    'site': 'OLCF', 'liveness': 'ok',
+    'members': [
+        {'member': 'default', 'member_id': 'odo.default', 'class': 'gpu',
+         'pool_name': 'fed-gpu', 'nodes': 2, 'cpus_per_node': 112,
+         'gpus_per_node': 8, 'walltime_sec': 5400,
+         'attributes': {'mem_gb_per_node': 256},
+         'usage': {'tasks_running': 0, 'tasks_done': 3, 'tasks_failed': 0,
+                   'pilots_active': 1},
+         'liveness': 'ok'}]}
+
+# shape 3: a record from a broker that predates class pools -- no rows
+FLAT = {'name': 'local_a', 'mode': 'allocation', 'endpoint': 'ep_local_a',
+        'site': 'Rutgers', 'kind': 'workstation',
+        'pool_name': 'fed-local_a',
+        'capabilities': {'cores': 4, 'gpus': 0, 'mem_gb': 8.0,
+                         'software': ['lammps']},
+        'budget': {'node_hours': 4.0},
+        'usage': {'pilots_active': 1, 'tasks_failed': 2},
+        'liveness': 'ok'}
 
 
-def test_members_of_derives_one_member_for_an_old_record():
+def test_pilots_of_takes_shape_one_as_it_comes():
 
-    # a broker that predates class pools reports no members at all; the
+    cpu, gpu = client.pilots_of(SHAPED)
+
+    assert cpu['pilot_name']    == 'ep_perlmutter/cpu'
+    assert cpu['pilot']         == 'submit'
+    assert cpu['mode']          == 'login'
+    assert cpu['remaining_sec'] == 2520.0
+    assert cpu['state']         == 'ok'
+    assert cpu['mem_gb_per_node'] == 512
+
+    # the federation says this shape holds no pilot: believed, not derived
+    assert gpu['pilot_name']    == 'ep_perlmutter/gpu'
+    assert gpu['state']         == 'idle'
+    assert gpu['remaining_sec'] is None
+    assert not any(p.get('derived') for p in (cpu, gpu))
+
+
+def test_pilots_of_names_an_allocation_after_its_endpoint():
+
+    pilot, = client.pilots_of(ALLOCATED)
+
+    assert pilot['pilot_name']    == 'ep_odo'
+    assert pilot['pilot']         == 'endpoint'
+    assert pilot['mode']          == 'alloc'
+    assert pilot['remaining_sec'] == 4140.0
+    assert pilot['usage']['tasks_failed'] == 0
+
+
+def test_pilots_of_fills_shape_two_in_from_the_record():
+
+    cpu, gpu = client.pilots_of(UNSHAPED)
+
+    # no `endpoint` on the row: the record's serves both
+    assert cpu['pilot_name']    == 'ep_perlmutter/cpu'
+    assert gpu['pilot_name']    == 'ep_perlmutter/gpu'
+    # no `pilot` on the row: login mode means the pilots are submitted
+    assert [p['pilot'] for p in (cpu, gpu)] == ['submit', 'submit']
+    # nothing reports a time left, and none is invented
+    assert cpu['remaining_sec'] is None
+    # ... and the shape that holds no pilot and has not failed is idle
+    assert cpu['state'] == 'ok'
+    assert gpu['state'] == 'idle'
+
+
+def test_pilots_of_derives_the_kind_from_an_allocation_record():
+
+    pilot, = client.pilots_of(UNSHAPED_ALLOC)
+
+    assert pilot['pilot_name'] == 'ep_odo'
+    assert pilot['pilot']      == 'endpoint'
+    assert pilot['mode']       == 'alloc'
+    assert pilot['state']      == 'ok'
+
+
+def test_a_failing_shape_is_not_called_idle():
+
+    record = json.loads(json.dumps(UNSHAPED))
+    record['members'][1]['usage'].update({'pilot_error'   : 'quota',
+                                          'pilot_failures': 5})
+    record['state'] = 'failing'
+
+    assert client.pilots_of(record)[1]['state'] == 'failing'
+
+
+def test_pilots_of_derives_one_row_for_an_old_record():
+
+    # a broker that predates class pools reports no rows at all; the
     # single derived one keeps every reader working
-    record = {'name': 'local_a', 'mode': 'allocation',
-              'site': 'Rutgers', 'kind': 'workstation',
-              'pool_name': 'fed-local_a',
-              'capabilities': {'cores': 4, 'gpus': 0, 'mem_gb': 8.0,
-                               'software': ['lammps']},
-              'budget': {'node_hours': 4.0},
-              'usage': {'pilots_active': 1},
-              'liveness': 'ok'}
+    pilot, = client.pilots_of(FLAT)
 
-    member, = client.members_of(record)
+    assert pilot['member']        == 'default'
+    assert pilot['member_id']     == 'local_a.default'
+    assert pilot['pilot_name']    == 'ep_local_a'
+    assert pilot['pilot']         == 'endpoint'
+    assert pilot['mode']          == 'alloc'
+    assert pilot['class']         == 'cpu'
+    assert pilot['software']      == ['lammps']
+    assert pilot['budget']        == {'node_hours': 4.0}
+    assert pilot['shared_fs']     is True
+    assert pilot['derived']       is True
+    assert pilot['remaining_sec'] is None
+    assert pilot['state']         == 'ok'
+    assert pilot['mem_gb_per_node']                == 8.0
+    assert pilot['attributes']['site']             == 'Rutgers'
+    assert pilot['attributes']['mem_gb_per_node']  == 8.0
+    # `tasks_failed` is on every shape, and travels untouched
+    assert pilot['usage']['tasks_failed'] == 2
 
-    assert member['member']        == 'default'
-    assert member['member_id']     == 'local_a.default'
-    assert member['class']         == 'cpu'
-    assert member['software']      == ['lammps']
-    assert member['budget']        == {'node_hours': 4.0}
-    assert member['shared_fs']     is True
-    assert member['derived']       is True
-    assert member['attributes']['site']            == 'Rutgers'
-    assert member['attributes']['mem_gb_per_node'] == 8.0
+
+def test_pilots_of_tolerates_a_record_without_a_name():
+
+    # no name, no endpoint: the row is left with the only word there is
+    assert client.pilots_of({})[0]['pilot_name'] == 'default'
+    assert client.pilots_of({})[0]['member_id']  == ''
+    assert client.pilots_of(None)[0]['member']   == 'default'
+
+
+def test_members_of_is_still_the_same_call():
+
+    # kept as an alias for one release
+    assert client.members_of is client.pilots_of
+    assert [m['member_id'] for m in client.members_of(SHAPED)] \
+        == ['perlmutter.cpu', 'perlmutter.gpu']
 
 
 def test_member_id_joins_resource_and_member():

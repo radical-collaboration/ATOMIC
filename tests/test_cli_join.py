@@ -476,7 +476,9 @@ def test_join_reports_the_allocation_and_the_returned_budget(broker, proc,
     assert broker.joined[0]['capabilities']['cores'] == 16   # detected
 
     out = capsys.readouterr().out
-    assert '2 node(s), 7200 s remaining' in out
+    # the allocation's runtime, which is what `runtime` is -- it was
+    # labelled "remaining" here for a while, and it is not that
+    assert '2 node(s), 7200 s runtime' in out
     # ... and the budget printed is the one the federation came back with
     assert 'node-hours   : 2.0 (derived from the allocation)' in out
 
@@ -1535,11 +1537,13 @@ def test_resources_table(broker, capsys):
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert 'RESOURCE' in out and 'NODE-H' in out and 'LIVENESS' in out
+    assert 'RESOURCE' in out and 'PILOT' in out and 'STATE' in out
     assert 'local_a' in out
-    assert '1.25/2.75' in out                    # node-hours used/remaining
-    assert '3/12' in out                         # tasks running/done
+    assert '  └ ep_local_a' in out               # the allocation's own row
+    assert '3    12    -' in out                 # tasks run / done / failed
     assert 'lammps' in out
+    # node-hours left the table -- they live on in `--json`
+    assert '1.25' not in out
 
 
 def test_resources_marks_stale_usage(broker, capsys):
@@ -1551,22 +1555,8 @@ def test_resources_marks_stale_usage(broker, capsys):
     resources.main(['--broker', 'https://127.0.0.1:8013', '--token', ''])
     out = capsys.readouterr().out
 
-    assert '1.25/2.75*' in out
+    assert 'ok*' in out
     assert 'stale' in out
-
-
-def test_resources_derives_remaining_node_hours():
-
-    record = json.loads(json.dumps(RECORD))
-    record['usage'].pop('node_hours_remaining')
-
-    assert resources.node_hours(record) == '1.25/2.75'
-
-    record['usage'] = {}
-    assert resources.node_hours(record) == '-/4'
-
-    record.pop('budget')
-    assert resources.node_hours(record) == '-/-'
 
 
 def test_resources_json(broker, capsys):

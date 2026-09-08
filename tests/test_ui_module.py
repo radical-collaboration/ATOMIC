@@ -13,7 +13,8 @@ Three levels:
   `css()` return non-empty strings, and the three panel containers exist;
 * a fake-Explorer drive -- a minimal `page` / `api` pair (canned JSON, no
   network, no DOM library) is handed to `init()`, and the HTML the module
-  writes into the page is asserted on: resources table, node-hour bar,
+  writes into the page is asserted on: the two column sets of the
+  resources table, the sub-row per shape of work a resource runs,
   stage chips labelled with their resource, the two SVG charts, the
   submit round-trip, the poll cadence (5 s hidden / 2 s while running),
   the notification nudge, the results drawer, stale-data retention, and
@@ -114,11 +115,12 @@ const RESOURCES = { resources: [
     usage: { node_hours_used: 1.9, node_hours_remaining: 0.1,
              tasks_running: 0, tasks_done: 3 },
     liveness: 'suspect',
-    // two members in two capability class pools
+    // three shapes of work in two capability class pools
     members: [
       { member: 'cpu', member_id: 'local_b.cpu', class: 'cpu',
         pool_name: 'fed-cpu', queue: 'local', nodes: 1, cpus_per_node: 2,
         gpus_per_node: 0, software: ['pytorch'],
+        walltime_sec: 1800, remaining_sec: 900,
         attributes: { site: 'NERSC', mem_gb_per_node: 16 },
         budget: { node_hours: 1.0 },
         usage: { node_hours_used: 0.5, node_hours_remaining: 0.5,
@@ -127,6 +129,8 @@ const RESOURCES = { resources: [
       { member: 'gpu', member_id: 'local_b.gpu', class: 'gpu',
         pool_name: 'fed-gpu', queue: 'local', nodes: 1, cpus_per_node: 1,
         gpus_per_node: 1, software: ['pytorch'],
+        // this federation reports no time left for it
+        walltime_sec: 3600, remaining_sec: null,
         attributes: { site: 'PSC' },
         budget: { node_hours: 1.0 },
         // reachable, but every pilot it submits dies at submit time: the
@@ -137,12 +141,12 @@ const RESOURCES = { resources: [
                             + 'exceeded"',
                  pilot_failures: 5, paused_until: NOW + 60 },
         liveness: 'ok', state: 'failing' },
-      // a member whose name and site carry markup, and whose usage
-      // carries no task counts at all
+      // a shape whose name and site carry markup, whose usage carries no
+      // task counts at all, and which holds nothing right now: idle
       { member: '<b>x"y', member_id: 'local_b.<b>x"y', class: 'cpu',
         pool_name: 'fed-cpu', nodes: 1, cpus_per_node: 1,
         software: [], attributes: { site: '"><script>' },
-        budget: {}, usage: {}, liveness: 'ok' } ] },
+        budget: {}, usage: { pilots_active: 0 }, liveness: 'ok' } ] },
 ] };
 
 // `m1`/`m2` are the MEMBERS the poll reported for the two stages; a null
@@ -304,63 +308,88 @@ for (const p of ['/broker/federation/resources/default', 'campaigns/default',
 const res = page.html('.ac-resources-body');
 check(res.includes('local_a') && res.includes('local_b'), 'resources missing');
 check(res.includes('lammps'), 'software list missing');
-check(/width:\s*12\.5%/.test(res), 'node-hour bar is not 0.5/4.0 for local_a');
-check(res.includes('ac-dot ok') && res.includes('ac-dot suspect'),
+check(res.includes('0.5 of 4 node-hours used'),
+      'node-hours are not in the local_a tooltip');
+check(res.includes('ac-dot ok') && res.includes('ac-dot idle'),
       'status dots missing');
 check(res.includes('serving endpoint: ep_local_a'),
       'endpoint name missing from the tooltip');
 
-// --- member sub-rows ------------------------------------------------------
-// local_b declares two members in two class pools; local_a declares none
-// and must render exactly as before (one row, no sub-rows)
-check((res.match(/class="ac-member"/g) || []).length === 3,
-      'expected three member sub-rows, got '
-      + (res.match(/class="ac-member"/g) || []).length);
-// a member name / site out of a join spec is data, not markup
+// --- the two column sets --------------------------------------------------
+check(/<th>Resource<\/th>/.test(res)
+      && /<th colspan="4">Software<\/th>/.test(res)
+      && /<th colspan="2">Classes<\/th>/.test(res)
+      && /<th>Failed<\/th>/.test(res),
+      'the resource header is not the resource column set');
+check(/class="ac-subhead"/.test(res)
+      && /<th>Mode<\/th>/.test(res) && /<th>Runtime<\/th>/.test(res)
+      && /<th>Left<\/th>/.test(res) && /<th>Mem\/node<\/th>/.test(res),
+      'the sub-row header is not the second column set');
+
+// --- sub-rows -------------------------------------------------------------
+// local_b runs three shapes in two class pools; local_a declares none, so
+// one row is derived from its own fields -- four sub-rows in all
+check((res.match(/class="ac-pilot"/g) || []).length === 4,
+      'expected four sub-rows, got '
+      + (res.match(/class="ac-pilot"/g) || []).length);
+// a name / site out of a join spec is data, not markup
 check(!/<b>x/.test(res) && !/<script>/.test(res),
-      'a member name or site was rendered as markup');
+      'a name or a site was rendered as markup');
 check(res.includes('&lt;b&gt;') || res.includes('&lt;'),
-      'a hostile member name was not escaped at all');
-// no task counts reported for that member: '–', not a zero we invented
+      'a hostile name was not escaped at all');
+// no task counts reported for that shape: '–', not a zero we invented
 check(m._internals.countCell(undefined) === '–'
       && m._internals.countCell(0) === '0'
       && m._internals.countCell(3) === '3',
       'an absent task count must render as a dash, not 0');
-check(res.includes('└ cpu') && res.includes('└ gpu'),
-      'member sub-rows are not labelled with the member name');
-check(res.includes('cpu / fed-cpu') && res.includes('gpu / fed-gpu'),
-      'member sub-rows do not name the class and its pool');
-check(res.includes('PSC'), "a member's own site is not rendered");
-check(/member local_b\.gpu/.test(res),
-      'the member id is not in the sub-row tooltip');
-check(/declared GPU\(s\), not reserved/.test(res),
+// an allocation is one unit of work, named after its serving endpoint; a
+// login-mode resource runs one per class, named <endpoint>/<shape>
+check(res.includes('└ ep_local_a'), 'the derived sub-row is not named');
+check(res.includes('└ ep_local_b/cpu') && res.includes('└ ep_local_b/gpu'),
+      'sub-rows are not named after the endpoint and the shape');
+check(res.includes('>alloc<') && res.includes('>login<'),
+      'the mode column does not read alloc / login');
+check(res.includes('fed-cpu') && res.includes('fed-gpu'),
+      'the class pools are not badged on the resource row');
+check(res.includes('0.50 h'),
+      'the runtime column is not hours with two decimals');
+check(res.includes('PSC'), "a shape's own site is not in its tooltip");
+check(/id local_b\.gpu/.test(res),
+      'the wire id is not in the sub-row tooltip');
+check(/declared GPU\(s\) per node, not reserved/.test(res),
       'the GPU tooltip must say declared, not reserved');
-check((res.match(/width:100\.0%/) || []).length >= 1,
-      "the gpu member's node-hour bar is not full (1.4 of 1.4 h)");
+check(m._internals.worstState(['ok', 'idle', 'suspect']) === 'suspect'
+      && m._internals.worstState(['idle', 'ok']) === 'ok'
+      && m._internals.worstState(['idle']) === 'idle'
+      && m._internals.worstState([]) === '',
+      'a resource row does not show the worst state of its sub-rows');
+check(m._internals.hoursCell(5400) === '1.50 h'
+      && m._internals.hoursCell(null) === '–',
+      'hours are not two decimals, or a missing one is not a dash');
 check((res.match(/allocation/g) || []).length === 1,
-      'the join mode is rendered twice (badge + Type column)');
+      'the join mode belongs in the tooltip, once');
 
-// --- a member whose pilots die at submit ----------------------------------
+// --- a shape whose work dies at submit ------------------------------------
 // this is the line that was missing when a site failed every submit for
-// half an hour and the table said the member was fine
+// half an hour and the table said the row was fine
 check(res.includes('ac-dot failing') && res.includes('ac-fail-label'),
-      'a failing member does not get the failing state badge');
+      'a failing sub-row does not get the failing state badge');
 check((res.match(/class="ac-pilot-error"/g) || []).length === 1,
       'exactly one pilot-error row was expected, got '
       + (res.match(/class="ac-pilot-error"/g) || []).length);
 check(/! cannot start work here:/.test(res),
-      'the failing member has no plain-language label');
+      'the failing sub-row has no plain-language label');
 check(/ac-detail">psij error: \[Errno 122\]/.test(res),
-      'the reason is not under the member row (in an ac-detail span)');
+      'the reason is not under the sub-row (in an ac-detail span)');
 check(/retrying after/.test(res),
       'the backoff deadline is not rendered');
 // the reason is server text: it must be escaped, not injected
 check(!/"Disk quota exceeded"/.test(res)
       && res.includes('&quot;Disk quota'),
       'the reason was not escaped');
-// a member with no error says nothing at all
+// a shape with no error says nothing at all
 check(!/undefined/.test(res),
-      'a healthy member rendered an empty pilot-error row');
+      'a healthy sub-row rendered an empty pilot-error row');
 check(!/NaN|undefined/.test(res), 'resources HTML contains NaN/undefined');
 
 const camp = page.html('.ac-campaigns-body');
@@ -391,9 +420,14 @@ check(m._internals.placementOf({resource: 'r', member: null}) === 'r',
       'a stage with a resource and no member must show the resource');
 check(m._internals.placementOf({resource: 'r', member: 'gpu'}) === 'r/gpu',
       'placement must read resource/member');
-check(m._internals.membersOf({}).length === 0
-      && m._internals.membersOf({members: [{member: 'x'}]}).length === 1,
-      'membersOf does not tolerate a record without members');
+// a record that reports no rows of its own still gets exactly one, and a
+// record that reports some is passed through
+check(m._internals.pilotsOf({}).length === 1
+      && m._internals.pilotsOf({members: [{member: 'x'}]}).length === 1
+      && m._internals.pilotsOf({endpoint: 'ep_a', mode: 'login',
+                                members: [{member: 'x'}, {member: 'y'}]})
+                     .map(p => p.pilot_name).join() === 'ep_a/x,ep_a/y',
+      'pilotsOf does not render the three payload shapes');
 check(camp.includes('stage did not finish'),
       'the stage `reason` is not in the chip tooltip');
 check(camp.includes('stopped while the service restarted'),

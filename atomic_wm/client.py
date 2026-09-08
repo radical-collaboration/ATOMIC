@@ -301,9 +301,10 @@ class Client:
     def fed_resources(self) -> List[Dict[str, Any]]:
         """``GET /broker/federation/resources/default`` → resources list.
 
-        Each record carries its ``members`` (with their own ``usage``)
-        next to the resource-wide aggregate; :func:`members_of` renders
-        the one from the other for a broker that predates class pools.
+        Each record carries one entry per pilot shape (with its own
+        ``usage``) next to the resource-wide aggregate;
+        :func:`pilots_of` renders the one from the other for a broker
+        that predates class pools.
         """
 
         data = self.request('GET', self._fed('resources/%s' % DEFAULT_SID))
@@ -400,23 +401,140 @@ def _int(value: Any, default: int) -> int:
         return default
 
 
-def members_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The members of one resource record, deriving one where there is none.
+def _float(value: Any) -> Optional[float]:
+    """A float from whatever a record carried; ``None`` for anything else."""
 
-    A federation that knows about capability classes reports a ``members``
-    list, each entry carrying its own class, pool, size, software, budget
-    and usage.  A record from a broker that predates class pools carries
-    none -- so exactly one member is derived from the resource-wide fields,
-    which keeps the table (and everything else reading members) working
-    against either.  A derived member is flagged ``derived: True``; it has
-    no authoritative member id.
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pilot_kind(record: Dict[str, Any], member: Dict[str, Any]) -> str:
+    """``'endpoint'`` or ``'submit'`` -- how this pilot comes into being.
+
+    A federation that says so per row is believed; an older one only says
+    it per resource, where ``allocation`` mode means the endpoint runs
+    inside the allocation and *is* the pilot.
     """
 
-    record  = record or {}
-    members = record.get('members')
+    kind = str(member.get('pilot') or '')
 
-    if isinstance(members, list) and members:
-        return [dict(m) for m in members if isinstance(m, dict)]
+    if kind in ('endpoint', 'submit'):
+        return kind
+
+    return 'endpoint' if str(record.get('mode') or '') == 'allocation' \
+                      else 'submit'
+
+
+def _pilot_name(record: Dict[str, Any], member: Dict[str, Any],
+                kind: str) -> str:
+    """What a pilot row is called.
+
+    An allocation is one pilot and carries the endpoint's name; a
+    login-mode resource submits one pilot shape per class, and each shape
+    is named ``<endpoint>/<shape>`` so two shapes of the same endpoint
+    stay apart.
+    """
+
+    ep   = str(member.get('endpoint') or record.get('endpoint') or '')
+    name = str(member.get('member') or '')
+
+    if kind == 'endpoint':
+        return ep or name or str(record.get('name') or '')
+
+    if ep and name:
+        return '%s/%s' % (ep, name)
+
+    return ep or name or str(record.get('name') or '')
+
+
+def _pilot_state(record: Dict[str, Any], member: Dict[str, Any]) -> str:
+    """The state word of one pilot row.
+
+    A federation that derives one per row (Orbit 122) is believed --
+    including its ``idle``.  An older one reports only liveness, so a
+    shape that holds no pilot is read here: ``failing`` when its pilots
+    died at submit, ``idle`` otherwise -- it is declared, it is simply
+    not running anything.
+    """
+
+    word = member.get('state')
+
+    if word:
+        return str(word)
+
+    usage  = member.get('usage') or {}
+    active = usage.get('pilots_active')
+    failed = usage.get('pilot_error') or usage.get('pilot_failures')
+
+    if active == 0 and not isinstance(active, bool):
+        return 'failing' if failed else 'idle'
+
+    return str(member.get('liveness') or record.get('state')
+               or record.get('liveness') or '')
+
+
+def pilots_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The pilot rows of one resource record, deriving one where needed.
+
+    A resource declares one shape of pilot per capability class it serves,
+    and the federation reports one row per shape (the wire calls a row a
+    ``member``).  Three payloads have to render the same table:
+
+    * a federation that names the endpoint, the pilot kind and the time
+      left per row -- everything is taken as it comes;
+    * one that reports rows without those fields -- the kind comes from
+      the record's mode, ``left`` is unknown, and a row without a live
+      pilot is ``idle``;
+    * one that predates class pools and reports no rows at all -- exactly
+      one row is derived from the resource-wide fields, flagged
+      ``derived: True``.
+
+    Every row carries the keys the table renders (``pilot_name``,
+    ``pilot``, ``mode``, ``remaining_sec``, ``mem_gb_per_node``,
+    ``state``) next to whatever the federation sent.
+    """
+
+    record = record or {}
+    rows   = record.get('members')
+
+    if isinstance(rows, list) and rows:
+        rows = [dict(m) for m in rows if isinstance(m, dict)]
+    else:
+        rows = _derived_pilots(record)
+
+    out = []
+    for member in rows:
+        kind  = _pilot_kind(record, member)
+        attrs = member.get('attributes') or {}
+
+        member.update({
+            'endpoint'       : member.get('endpoint')
+                               or record.get('endpoint') or '',
+            'pilot'          : kind,
+            'pilot_name'     : _pilot_name(record, member, kind),
+            'mode'           : 'alloc' if kind == 'endpoint' else 'login',
+            'remaining_sec'  : _float(member.get('remaining_sec')),
+            'mem_gb_per_node': attrs.get('mem_gb_per_node',
+                                         member.get('mem_gb_per_node')),
+            'state'          : _pilot_state(record, member),
+        })
+        out.append(member)
+
+    return out
+
+
+# the name `pilots_of` took over from; kept as an alias for one release,
+# so an older caller (and the odd script) keeps working
+members_of = pilots_of
+
+
+def _derived_pilots(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The single pilot row of a record that reports none of its own."""
 
     caps = record.get('capabilities') or {}
     pool = record.get('pool') or {}

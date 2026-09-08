@@ -245,25 +245,41 @@ resource queued; a full teardown (`demo/2026_09_08/down.sh`) asks for the
 cancel explicitly.  The federation answers with `members_removed`,
 `tasks_requeued` and `tasks_failed`, which the CLI prints.
 
-`atomic-resources` prints a two-level table — one row per resource
-(site, member count, the aggregate software, node-hours, pilots, tasks,
-liveness) followed by one indented row per member with its own
-class/pool, size (`nodes x cores/node (+GPUs/node)`), software,
-node-hours, pilots and tasks — or the raw records with `--json`, which
-now carry `members`.  A resource whose federation reports no members
-renders as a single row, exactly as before.  A `*` behind the node-hours
-means the federation could not refresh usage for that row and is showing
-its last known values (`"stale": true`).
+`atomic-resources` prints two independent column sets: a resource row —
+name, site, the software union, the class pools it serves, and its tasks
+run/done/failed with the worst state of its pilots — and, indented under
+it, one row per **pilot**:
+
+```
+RESOURCE    SITE   SOFTWARE        CLASSES          RUN  DONE  FAILED  STATE
+  PILOT                MODE   NODES  CPN  GPN  MPN  RUNTIME  LEFT  RUN  DONE  FAILED  STATE
+odo         OLCF   lammps,pytorch  fed-gpu          0    3     0       ok
+  └ ep_odo             alloc  2      112  8    256  1.50     1.15  0    3     0       ok
+perlmutter  NERSC  lammps,pytorch  fed-cpu,fed-gpu  4    11    1       ok
+  └ ep_perlmutter/cpu  login  4      128  0    512  1.00     0.70  4    9     1       ok
+  └ ep_perlmutter/gpu  login  1      64   4    256  0.50     -     0    2     0       idle
+```
+
+An allocation is one pilot and carries the endpoint's name; a login-mode
+resource submits one pilot shape per class it serves, named
+`<endpoint>/<shape>`, and a shape that holds no pilot right now reads
+`idle`.  `CPN` / `GPN` / `MPN` are cores, GPUs and GB of memory **per
+node**, declared — nothing reserves them; `RUNTIME` and `LEFT` are hours.
+A name longer than 24 characters is cut with `…`.  Node-hours are not in
+the table; `--json` prints the raw records, budget, node-hours, `members`
+and all.  A `*` behind a state word means the federation could not
+refresh that row's usage and is showing its last known values
+(`"stale": true`).
 
 The last column is the federation's derived `state` — the endpoint's
-liveness (`ok` / `suspect` / `lost`) or `failing`: reachable, but holding
-no pilot because the ones it submitted keep dying.  A `failing` row is
-followed by an indented `! pilot: <reason>` line carrying what the batch
-system actually said (plus `(paused until HH:MM:SS)` while the dispatcher
-has stopped trying), so a site that fails every submit is visible in the
-table instead of only in the broker log.  `--json` carries the same
-under each member's `usage`: `pilot_error`, `pilot_failures`,
-`paused_until`.
+liveness (`ok` / `suspect` / `lost`), `idle`, or `failing`: reachable,
+but holding no pilot because the ones it submitted keep dying.  A
+`failing` row is followed by an indented `! pilot: <reason>` line
+carrying what the batch system actually said (plus
+`(paused until HH:MM:SS)` while the dispatcher has stopped trying), so a
+site that fails every submit is visible in the table instead of only in
+the broker log.  `--json` carries the same under that row's `usage`:
+`pilot_error`, `pilot_failures`, `paused_until`.
 
 ## Bootstrapping a machine
 
