@@ -157,21 +157,38 @@ step_stop_broker() {
 }
 
 # --------------------------------------------------------------------------
-# Pilots and endpoints that outlived their parents.  Scoped to this
-# demo's names by default: `ep_<name>` is the joined endpoint,
-# `fed-<name>_<pid>` the dispatcher's child endpoint for a pilot.
+# Pilots and endpoints that outlived their parents.  A process is the
+# demo's when its command line carries
+#   - `ep_<name>` for ANY demo resource name (not only the one this
+#     shell was sourced for: `down.sh` without --resource on r3 must
+#     still take r3's endpoint down),
+#   - `fed-<class>_<name>.<member>_p.<id>`, the dispatcher's child
+#     endpoint for a pilot -- the `fed-` prefix is the federation's alone,
+#     so every `-n fed-…` is ours (that covers the psij launch wrapper and
+#     the dragon launcher lines too),
+#   - or the demo broker's port in its --url.
+# The user's own brokers (8000/8003) and their endpoints match none of
+# these.  --all-endpoints drops the scoping.
+demo_process_pattern() {
+    local names
+    names="$(printf '%s' "$ATOMIC_DEMO_KNOWN" | tr ' ' '|')"
+    printf '%s' "radical-orbit-endpoint.*(ep_($names)( |$)|-n +fed-|--url +https://[^ ]*:$ATOMIC_DEMO_BROKER_PORT)"
+}
+
 step_sweep_endpoints() {
-    local pattern names
+    local pattern
 
     if [ "$KILL_ALL_ENDPOINTS" -eq 1 ]; then
         pattern='radical-orbit-endpoint'
     else
-        names="$(IFS='|'; printf '%s' "${ATOMIC_DEMO_RESOURCES[*]}")"
-        pattern="radical-orbit-endpoint.*(ep_|fed-)($names)"
+        pattern="$(demo_process_pattern)"
     fi
 
+    # SIGTERM first, so the endpoints get to tell the broker; whatever is
+    # still there after the grace period is killed outright (-9), and a
+    # last pass catches anything a dying parent re-spawned meanwhile.
     local sig
-    for sig in TERM KILL; do
+    for sig in TERM KILL KILL; do
 
         local pids
         pids="$(pgrep -f "$pattern" 2> /dev/null || true)"
@@ -184,7 +201,7 @@ step_sweep_endpoints() {
         # shellcheck disable=SC2086
         kill -"$sig" $pids 2> /dev/null || true
 
-        sleep 3
+        [ "$sig" = TERM ] && sleep 3 || sleep 1
     done
 }
 
@@ -203,13 +220,13 @@ step_verify() {
         return 0
     fi
 
-    local names
-    names="$(IFS='|'; printf '%s' "${ATOMIC_DEMO_RESOURCES[*]}")"
+    local pattern
+    pattern="$(demo_process_pattern)"
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         if printf '%s' "$line" \
-               | grep -Eq ":$ATOMIC_DEMO_BROKER_PORT|--port +$ATOMIC_DEMO_BROKER_PORT|($names)"
+               | grep -Eq "--port +$ATOMIC_DEMO_BROKER_PORT|$pattern"
         then
             demo_warn "demo process survived teardown: $line"
             mine=1

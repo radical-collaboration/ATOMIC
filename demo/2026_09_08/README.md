@@ -100,15 +100,19 @@ Without a flag they use `$ATOMIC_DEMO_RESOURCE`, and failing that
 
 | name | host | site | broker | scratch base |
 |---|---|---|---|---|
-| `local` | the laptop (broker host) | Rutgers | `https://127.0.0.1:8010` | `/tmp/atomic-demo` |
-| `local_a` `local_b` `local_c` | the laptop's three fake resources | Rutgers | `https://127.0.0.1:8010` | `/tmp/atomic-demo` |
-| `r3` | the Rutgers workstation — also the distributed run's broker host | Rutgers | binds `0.0.0.0:8010`, dials its own FQDN/IP | `/tmp/atomic-demo` |
-| `perlmutter` | NERSC | NERSC | `https://$ATOMIC_DEMO_BROKER_HOST:8010` — must be exported | `$PSCRATCH/atomic-demo` (else `$SCRATCH`) |
-| `odo` | OLCF's Slurm test system | OLCF | same | `$MEMBERWORK/atomic-demo` |
+| `local` | the laptop | Rutgers | radical.3 (a broker started here binds `127.0.0.1`) | `/tmp/atomic-demo` |
+| `local_a` `local_b` `local_c` | the laptop's three fake resources | Rutgers | radical.3 | `/tmp/atomic-demo` |
+| `r3` | radical.3, the RADICAL lab server — the demo's broker host | Rutgers | binds `0.0.0.0:8010` | `/tmp/atomic-demo` |
+| `perlmutter` | NERSC | NERSC | radical.3 | `$PSCRATCH/atomic-demo` (else `$SCRATCH`) |
+| `odo` | OLCF's Slurm test system (project `fus183`) | OLCF | radical.3 | `$HOME/tmp/atomic-demo` |
 
-On the remote hosts `ATOMIC_DEMO_BROKER_HOST` has no default (`r3` is an
-ssh alias on the laptop, not a DNS name): `broker.sh` on r3 prints the
-FQDN/IP to export, and `join.sh`/`submit.sh` refuse until it is set.
+**The broker is radical.3 for every resource** — `https://95.217.193.116:8010`
+— unless `ATOMIC_DEMO_BROKER_HOST` says otherwise. The laptop's fake
+resources are no exception: `join.sh local_a` joins the real broker. Only
+`broker.sh --resource local` and `up.sh` switch themselves to
+`127.0.0.1`, since a laptop broker binds loopback and is reachable
+nowhere else; to join or submit against that one, export
+`ATOMIC_DEMO_BROKER_HOST=127.0.0.1` (broker.sh prints the line).
 `ATOMIC_DEMO_BROKER_BIND` is the listen address (broker.sh only);
 `ATOMIC_DEMO_SCRATCH_BASE` overrides the scratch base anywhere.
 
@@ -502,7 +506,7 @@ The stack knobs, all read from the environment (see `env.sh`):
 
 ```
 ATOMIC_DEMO_RESOURCE             the resource, when no flag is given
-ATOMIC_DEMO_BROKER_HOST          the host clients dial (remote resources: export it)
+ATOMIC_DEMO_BROKER_HOST          the host clients dial (default: radical.3)
 ATOMIC_DEMO_BROKER_BIND          the address broker.sh listens on (0.0.0.0 on r3)
 ATOMIC_DEMO_SCRATCH_BASE         where task scratch goes on this machine
 ATOMIC_DEMO_ORBIT_REPO / _REF    the radical.orbit pin
@@ -513,7 +517,7 @@ ATOMIC_DEMO_SRC                  where the demo keeps its own clones
 ATOMIC_DEMO_FORCE_CLONE=1        ignore local checkouts, always clone
 ATOMIC_DEMO_HOME                 where venv + clones live on an HPC site
                                  (perlmutter: $SCRATCH/demo, odo:
-                                 $MEMBERWORK/demo; home dirs are quota'd)
+                                 $HOME/tmp/demo; home dirs are quota'd)
 ATOMIC_DEMO_PYTHON               interpreter used to create the venv
 ATOMIC_DEMO_PYTHON_MODULE        environment module loaded first (perlmutter:
                                  python/3.12-26.1.0, odo: cray-python)
@@ -639,8 +643,8 @@ demo/2026_09_08/join.sh      r3              # r3 joins itself
 ```
 
 `broker.sh` binds all interfaces and ends with a `remote :` block: the
-`export ATOMIC_DEMO_BROKER_HOST=...` line and the `scp` of the broker
-cert that Perlmutter and Odo need.
+`scp` of the broker cert that Perlmutter and Odo need (they dial
+radical.3 by default, nothing to export).
 
 ### On Perlmutter / Odo
 
@@ -649,8 +653,7 @@ the broker's `broker_cert.pem` to `~/.radical/orbit/` there (or export
 `RADICAL_ORBIT_BROKER_CERT`), then:
 
 ```bash
-export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP printed by broker.sh on r3>
-# no ssh key for GitHub on this host?  then also:
+# no ssh key for GitHub on this host?  then:
 #   export ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
 #   export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-collaboration/ATOMIC.git
 

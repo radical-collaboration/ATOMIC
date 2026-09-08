@@ -56,6 +56,15 @@ unset _demo_res _demo_argv _demo_i
 
 DEMO_TOOL='broker.sh'
 
+# a broker bound to loopback is reachable on loopback only: dial it there,
+# whatever the default broker host is (radical.3 for every resource)
+if [ "$ATOMIC_DEMO_BROKER_BIND" = '127.0.0.1' ] \
+        && [ "$ATOMIC_DEMO_BROKER_HOST" != '127.0.0.1' ]; then
+    ATOMIC_DEMO_BROKER_HOST='127.0.0.1'
+    export ATOMIC_DEMO_BROKER_HOST
+    export RADICAL_ORBIT_BROKER_URL="https://127.0.0.1:$ATOMIC_DEMO_BROKER_PORT"
+fi
+
 # --------------------------------------------------------------------------
 usage() {
     cat <<EOF
@@ -235,8 +244,14 @@ step_start_broker() {
 step_report() {
     demo_hint "Explorer: $RADICAL_ORBIT_BROKER_URL/ (self-signed cert)"
     demo_hint "logs    : $ATOMIC_DEMO_BROKER_LOG"
-    demo_hint "next    : demo/2026_09_08/join.sh RESOURCE" \
-              "(${ATOMIC_DEMO_RESOURCES[*]})"
+    if [ "$ATOMIC_DEMO_BROKER_BIND" = '127.0.0.1' ]; then
+        demo_hint "next    : ATOMIC_DEMO_BROKER_HOST=127.0.0.1" \
+                  "demo/2026_09_08/join.sh RESOURCE (${ATOMIC_DEMO_RESOURCES[*]})"
+        demo_hint "          (the default broker is radical.3; this one is loopback-only)"
+    else
+        demo_hint "next    : demo/2026_09_08/join.sh RESOURCE" \
+                  "(${ATOMIC_DEMO_RESOURCES[*]})"
+    fi
     demo_hint "teardown: demo/2026_09_08/down.sh"
 }
 

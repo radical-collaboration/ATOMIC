@@ -117,7 +117,7 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # and clone defaults below derive from it.  Empty = laptop/r3 defaults.
 case "${1:-${ATOMIC_DEMO_RESOURCE:-local}}" in
     perlmutter) : "${ATOMIC_DEMO_HOME:=${SCRATCH:-${PSCRATCH:-$HOME}}/demo}" ;;
-    odo)        : "${ATOMIC_DEMO_HOME:=${MEMBERWORK:-$HOME}/demo}"           ;;
+    odo)        : "${ATOMIC_DEMO_HOME:=$HOME/tmp/demo}"                      ;;
     *)          : "${ATOMIC_DEMO_HOME:=}"                                    ;;
 esac
 
@@ -422,18 +422,14 @@ demo_load_python_module() {
     fi
 }
 
-# the name this machine is reachable under from elsewhere: the FQDN if
-# it has a domain part, else the first non-loopback IPv4 -- the same
-# choice radical.orbit makes when advertising a wildcard-bound broker
-demo_own_host() {
-    local fqdn ip
-    fqdn="$(hostname -f 2> /dev/null || true)"
-    case "$fqdn" in
-        *.*) printf '%s\n' "$fqdn"; return 0 ;;
-    esac
-    ip="$(hostname -I 2> /dev/null | awk '{print $1}')"
-    printf '%s\n' "${ip:-${fqdn:-127.0.0.1}}"
-}
+# The demo's broker lives on radical.3, the RADICAL lab server -- so that
+# is the broker every resource dials unless $ATOMIC_DEMO_BROKER_HOST says
+# otherwise, the laptop's fake resources included (they can join the
+# real broker like any other resource).  A broker started on the laptop
+# itself binds loopback and broker.sh switches this to 127.0.0.1 for its
+# own run; up.sh does the same for the all-local cycle.
+ATOMIC_DEMO_BROKER_DEFAULT_HOST='95.217.193.116'
+: "${ATOMIC_DEMO_BROKER_HOST:=$ATOMIC_DEMO_BROKER_DEFAULT_HOST}"
 
 case "$ATOMIC_DEMO_RESOURCE" in
 
@@ -445,7 +441,8 @@ case "$ATOMIC_DEMO_RESOURCE" in
         ATOMIC_DEMO_SITE='Rutgers'
         ATOMIC_DEMO_RESOURCES=(local_a local_b local_c)
         ATOMIC_DEMO_PILOT_RESOURCES=(local_a)
-        : "${ATOMIC_DEMO_BROKER_HOST:=127.0.0.1}"
+        # a broker started here listens on loopback only
+        : "${ATOMIC_DEMO_BROKER_BIND:=127.0.0.1}"
         : "${ATOMIC_DEMO_SCRATCH_BASE:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}"
         ;;
 
@@ -458,11 +455,9 @@ case "$ATOMIC_DEMO_RESOURCE" in
         ATOMIC_DEMO_MODE_WHY='r3 is a workstation -- the endpoint is the resource'
         ATOMIC_DEMO_RESOURCES=(r3)
         ATOMIC_DEMO_PILOT_RESOURCES=(r3)
-        # this IS the broker host: bind every interface, advertise the
-        # machine's own routable name ('r3' is the laptop's ssh alias and
-        # does not resolve here)
+        # this IS the broker host: bind every interface ('r3' is the
+        # laptop's ssh alias and does not resolve here, hence no name)
         : "${ATOMIC_DEMO_BROKER_BIND:=0.0.0.0}"
-        : "${ATOMIC_DEMO_BROKER_HOST:=$(demo_own_host)}"
         : "${ATOMIC_DEMO_SCRATCH_BASE:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}"
         ;;
 
@@ -474,7 +469,6 @@ case "$ATOMIC_DEMO_RESOURCE" in
         # contained conda python (verified 2026-09-08: 3.12-26.1.0 exists)
         : "${ATOMIC_DEMO_PYTHON_MODULE:=python/3.12-26.1.0}"
         demo_load_python_module
-        : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
         if   [ -n "${PSCRATCH:-}" ]; then
             : "${ATOMIC_DEMO_SCRATCH_BASE:=$PSCRATCH/atomic-demo}"
         elif [ -n "${SCRATCH:-}" ]; then
@@ -491,14 +485,9 @@ case "$ATOMIC_DEMO_RESOURCE" in
         # 3.11) -- not verified on Odo yet, override if it is not enough
         : "${ATOMIC_DEMO_PYTHON_MODULE:=cray-python}"
         demo_load_python_module
-        : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
-        # OLCF hands out $MEMBERWORK/<project> on Lustre; without it we
-        # cannot guess the project, so say so rather than guess
-        if [ -n "${MEMBERWORK:-}" ]; then
-            : "${ATOMIC_DEMO_SCRATCH_BASE:=$MEMBERWORK/atomic-demo}"
-        else
-            : "${ATOMIC_DEMO_SCRATCH_BASE:=TODO(Odo Lustre scratch, e.g. /lustre/orion/<project>/scratch/\$USER/atomic-demo)}"
-        fi
+        # $HOME/tmp for now (2026-09-08): $MEMBERWORK is not set in the
+        # allocation shell, and the Odo home has room.  Project: fus183.
+        : "${ATOMIC_DEMO_SCRATCH_BASE:=$HOME/tmp/atomic-demo}"
         ;;
 esac
 
@@ -544,11 +533,8 @@ demo_drop_path PYTHONPATH "$ATOMIC_SRC/src"
 # Two different things:
 #   ATOMIC_DEMO_BROKER_BIND  the address the broker LISTENS on (broker.sh
 #                            only): 127.0.0.1 on the laptop, 0.0.0.0 on r3
-#   ATOMIC_DEMO_BROKER_HOST  the name clients and endpoints DIAL: set per
-#                            resource above -- 127.0.0.1 on the laptop,
-#                            r3's own routable name on r3, and on the
-#                            remote resources whatever you export (there
-#                            is no sane default: 'r3' is an ssh alias).
+#   ATOMIC_DEMO_BROKER_HOST  the name clients and endpoints DIAL: radical.3
+#                            everywhere unless exported (see above)
 # Pilots do not use either: the broker hands them its own advertised
 # URL, which for a wildcard bind is its FQDN (or outbound IP).
 # A non-default port: the user's own brokers live on 8000/8003.
@@ -1072,6 +1058,7 @@ demo_join_args() {
                 local q_cpu='TODO(CPU queue/partition)'
                 local q_gpu='TODO(GPU queue/partition)'
                 local acct='TODO(allocation/project id)'
+                [ "$name" = odo ] && acct='fus183'
                 local base="$ATOMIC_DEMO_SCRATCH_BASE/$name"
 
                 DEMO_JOIN_ARGS=(

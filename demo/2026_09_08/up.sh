@@ -21,6 +21,11 @@
 set -euo pipefail
 
 # up.sh is the laptop orchestrator: `local`, always
+# the all-local cycle runs its own loopback broker; the default broker
+# host (radical.3) is for resources joining the real run
+: "${ATOMIC_DEMO_BROKER_HOST:=127.0.0.1}"
+export ATOMIC_DEMO_BROKER_HOST
+
 # shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" local
 
