@@ -653,12 +653,14 @@ export ATOMIC_DEMO_PLUGINS
 export RADICAL_ORBIT_LOG_LVL='INFO'
 export RADICAL_ORBIT_RHAPSODY_BACKEND='concurrent'
 
-# The campaign runner rewrites a bare `atomic-fake-*` argv[0] into an
-# absolute path using this prefix, so a pilot whose python environment
-# does not have atomic-wm installed still finds the workload tools.  The
-# *broker* process needs it (that is where the task command is built),
-# and it inherits it from here.
-export ATOMIC_TOOL_PREFIX="$VE/bin"
+# NOT set: ATOMIC_TOOL_PREFIX would make the campaign runner rewrite a
+# bare `atomic-fake-*` command to an absolute path in the BROKER's venv
+# (/home/merzky/radical/radical.orbit/ve3/bin/...), which does not exist
+# on Odo or Perlmutter -- every remote train task failed with exit 1
+# (2026-09-08).  Every pilot's venv has atomic-wm installed (join.sh
+# ensures the stack on the joining host) and its bin is first on PATH,
+# so the bare name resolves on the host that runs the task.
+unset ATOMIC_TOOL_PREFIX
 
 # RADICAL_LOG_LVL: the user's shell exports DEBUG_9, which the endpoint's
 # --log-level default rejects.  RADICAL_ORBIT_LOG_FILE: pilots inherit it

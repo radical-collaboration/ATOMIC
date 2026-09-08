@@ -431,7 +431,7 @@ check_env_vars() {
     ok "scratch    : $ATOMIC_DEMO_TMP"
     ok "run dir    : $RUN_DIR"
     ok "rhapsody   : $RADICAL_ORBIT_RHAPSODY_BACKEND"
-    ok "tool prefix: $ATOMIC_TOOL_PREFIX"
+    ok "tool prefix: ${ATOMIC_TOOL_PREFIX:-(unset: pilots resolve atomic-fake-* on their own PATH)}"
 
     if [ -z "${RADICAL_ORBIT_TOKEN:-}" ] \
        && [ -z "${RADICAL_ORBIT_BROKER_TOKEN:-}" ]; then

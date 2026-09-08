@@ -202,8 +202,10 @@ step_isolate_state() {
     for d in "$RADICAL_ORBIT_FEDERATION_STATE" "$ATOMIC_CAMPAIGN_STATE" \
              "$ATOMIC_STORE_ROOT"; do
         [ -d "$d" ] && [ -n "$(ls -A "$d" 2> /dev/null || true)" ] || continue
+        # copy+remove, not mv: /tmp is another filesystem than the run
+        # dir, and a cross-device mv of a tree is not atomic
         mkdir -p "$bak/demo"
-        mv "$d" "$bak/demo/$(basename "$d")"
+        cp -a "$d" "$bak/demo/" && rm -rf "$d"
         moved=1
     done
     mkdir -p "$RADICAL_ORBIT_FEDERATION_STATE" "$ATOMIC_CAMPAIGN_STATE" \
