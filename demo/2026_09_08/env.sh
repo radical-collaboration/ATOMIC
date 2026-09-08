@@ -89,14 +89,14 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # (no ssh key on the host -> use https):
 #
 #   ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
-#   ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-cybertools/ATOMIC.git
+#   ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-collaboration/ATOMIC.git
 #
 # A leading `git+` (pip's spelling) is accepted and stripped for git.
 
 : "${ATOMIC_DEMO_ORBIT_REPO:=git+ssh://git@github.com/radical-cybertools/radical.orbit.git}"
 : "${ATOMIC_DEMO_ORBIT_REF:=feature/atomic-federation}"
 
-: "${ATOMIC_DEMO_ATOMIC_REPO:=git+ssh://git@github.com/radical-cybertools/ATOMIC.git}"
+: "${ATOMIC_DEMO_ATOMIC_REPO:=git+ssh://git@github.com/radical-collaboration/ATOMIC.git}"
 : "${ATOMIC_DEMO_ATOMIC_REF:=feature/demo-wm}"
 
 # Pinned PyPI requirements installed on top of the two git refs.

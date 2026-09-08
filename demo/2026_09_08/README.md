@@ -147,7 +147,7 @@ broker host, on every resource host and on the laptop:
 |---|---|
 | `ATOMIC_DEMO_ORBIT_REPO` | `git+ssh://git@github.com/radical-cybertools/radical.orbit.git` |
 | `ATOMIC_DEMO_ORBIT_REF` | `feature/atomic-federation` |
-| `ATOMIC_DEMO_ATOMIC_REPO` | `git+ssh://git@github.com/radical-cybertools/ATOMIC.git` |
+| `ATOMIC_DEMO_ATOMIC_REPO` | `git+ssh://git@github.com/radical-collaboration/ATOMIC.git` |
 | `ATOMIC_DEMO_ATOMIC_REF` | `feature/demo-wm` |
 | `ATOMIC_DEMO_PIP_PINS` | `rhapsody-py==0.4.0 opentelemetry-sdk==1.43.0` |
 
@@ -167,7 +167,7 @@ one silently changing meaning.
 
 ```bash
 export ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
-export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-cybertools/ATOMIC.git
+export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-collaboration/ATOMIC.git
 ```
 
 **The venv** — `$ATOMIC_DEMO_VE`, defaulting to `$ORBIT_SRC/ve3` where
@@ -640,7 +640,7 @@ the broker's `broker_cert.pem` to `~/.radical/orbit/` there (or export
 export ATOMIC_DEMO_BROKER_HOST=<r3 host name>
 # no ssh key for GitHub on this host?  then also:
 #   export ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
-#   export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-cybertools/ATOMIC.git
+#   export ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-collaboration/ATOMIC.git
 
 salloc -N 1 ...                                   # <- the recommended path
 demo/2026_09_08/join.sh perlmutter                # inside the allocation
