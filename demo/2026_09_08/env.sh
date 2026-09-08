@@ -115,14 +115,19 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # `down.sh` on Perlmutter tears Perlmutter down, not the laptop's
 # local_* (which is what the built-in default `local` would mean).  An
 # explicit argument or $ATOMIC_DEMO_RESOURCE always wins.
-ATOMIC_DEMO_RESOURCE_FROM=''
+# ATOMIC_DEMO_RESOURCE_FROM records where the name came from: 'arg',
+# 'env', 'run/resource' or 'default' -- down.sh will not tear the
+# built-in default's resources down on a host that never joined them.
+ATOMIC_DEMO_RESOURCE_FROM='default'
 case "${1:-}" in
     ''|*/*|*.sh)
-        if [ -z "${ATOMIC_DEMO_RESOURCE:-}" ] \
-                && [ -r "$ATOMIC_DEMO_DIR/run/resource" ]; then
+        if [ -n "${ATOMIC_DEMO_RESOURCE:-}" ]; then
+            ATOMIC_DEMO_RESOURCE_FROM='env'
+        elif [ -r "$ATOMIC_DEMO_DIR/run/resource" ]; then
             ATOMIC_DEMO_RESOURCE="$(head -n 1 "$ATOMIC_DEMO_DIR/run/resource")"
             ATOMIC_DEMO_RESOURCE_FROM='run/resource'
         fi ;;
+    *)  ATOMIC_DEMO_RESOURCE_FROM='arg' ;;
 esac
 
 # The demo's *home* on an HPC site: where its venv and clones live.  HPC
@@ -582,14 +587,15 @@ if [ -z "${ATOMIC_DEMO_PILOT_RESOURCES+set}" ]; then
     fi
 fi
 
-export ATOMIC_DEMO_RESOURCE ATOMIC_DEMO_HOST ATOMIC_DEMO_SITE
+export ATOMIC_DEMO_RESOURCE ATOMIC_DEMO_RESOURCE_FROM
+export ATOMIC_DEMO_HOST ATOMIC_DEMO_SITE
 export ATOMIC_DEMO_MODE ATOMIC_DEMO_SCRATCH_BASE
 
 # say it out loud away from the laptop, where it is the whole question
 case "$ATOMIC_DEMO_HOST" in
     laptop) : ;;
     *)      demo_log "resource: $ATOMIC_DEMO_RESOURCE" \
-                     "(host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE)${ATOMIC_DEMO_RESOURCE_FROM:+ [from run/resource]}"
+                     "(host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE) [$ATOMIC_DEMO_RESOURCE_FROM]"
             demo_log "mode    : $ATOMIC_DEMO_MODE --" \
                      "$ATOMIC_DEMO_MODE_WHY"
             demo_log "scratch : $ATOMIC_DEMO_SCRATCH_BASE" ;;

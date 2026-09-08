@@ -22,7 +22,7 @@ set -euo pipefail
 # --resource is env.sh's one parameter, and env.sh must be sourced before
 # parse_args can use demo_die -- so pick it out of argv here.  parse_args
 # below sees (and skips) it again.
-_demo_res="${ATOMIC_DEMO_RESOURCE:-local}"
+_demo_res="${ATOMIC_DEMO_RESOURCE:-}"
 _demo_argv=("$@")
 _demo_i=0
 while [ "$_demo_i" -lt "${#_demo_argv[@]}" ]; do
@@ -35,7 +35,7 @@ done
 
 # shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" \
-       "${_demo_res:-local}"
+       "${_demo_res:-}"
 
 unset _demo_res _demo_argv _demo_i
 

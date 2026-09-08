@@ -22,7 +22,7 @@ set -euo pipefail
 # --resource is env.sh's one parameter, and env.sh must be sourced before
 # parse_args can use demo_die -- so pick it out of argv here.  parse_args
 # below sees (and skips) it again.
-_demo_res="${ATOMIC_DEMO_RESOURCE:-local}"
+_demo_res="${ATOMIC_DEMO_RESOURCE:-}"
 _demo_argv=("$@")
 _demo_i=0
 while [ "$_demo_i" -lt "${#_demo_argv[@]}" ]; do
@@ -35,7 +35,7 @@ done
 
 # shellcheck source=demo/2026_09_08/env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" \
-       "${_demo_res:-local}"
+       "${_demo_res:-}"
 
 unset _demo_res _demo_argv _demo_i
 
@@ -126,7 +126,16 @@ step_leave() {
         esac
     done
 
-    for name in "${ATOMIC_DEMO_RESOURCES[@]}" "${joined[@]}"; do
+    # the built-in default (`local`, nobody said otherwise and no join or
+    # broker ran from this checkout) names the laptop's three fake
+    # resources; on any other host only the join records count
+    local selected=()
+    if [ "$ATOMIC_DEMO_RESOURCE_FROM" != default ] \
+            || [ "${#joined[@]}" -eq 0 ]; then
+        selected=("${ATOMIC_DEMO_RESOURCES[@]}")
+    fi
+
+    for name in "${selected[@]}" "${joined[@]}"; do
         case " ${names[*]:-} " in
             *" $name "*) ;;
             *) names+=("$name") ;;
@@ -135,7 +144,11 @@ step_leave() {
 
     for name in "${names[@]}"; do
 
-        demo_log "leave   : $name"
+        local why="resource $ATOMIC_DEMO_RESOURCE ($ATOMIC_DEMO_RESOURCE_FROM)"
+        case " ${joined[*]:-} " in
+            *" $name "*) why='join record on this host' ;;
+        esac
+        demo_log "leave   : $name ($why)"
 
         # atomic-leave talks to the broker, stops the endpoint child and
         # kills the pilots of this resource's members.  A broker that is
