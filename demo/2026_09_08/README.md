@@ -512,6 +512,8 @@ ATOMIC_DEMO_VE                   the venv everything is installed into
 ATOMIC_DEMO_SRC                  where the demo keeps its own clones
 ATOMIC_DEMO_FORCE_CLONE=1        ignore local checkouts, always clone
 ATOMIC_DEMO_PYTHON               interpreter used to create the venv
+ATOMIC_DEMO_PYTHON_MODULE        environment module loaded first (perlmutter:
+                                 python/3.12-26.1.0, odo: cray-python)
 ```
 
 `source demo/2026_09_08/env.sh` in your own shell to get the same environment

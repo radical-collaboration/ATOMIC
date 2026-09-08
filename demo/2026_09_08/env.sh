@@ -122,9 +122,14 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # interpreter used to *create* the venv (>= 3.10); ignored once it exists
 : "${ATOMIC_DEMO_PYTHON:=python3}"
 
+# environment module providing that python, loaded per resource below
+# (perlmutter: NERSC's python module; odo: cray-python); empty = none
+: "${ATOMIC_DEMO_PYTHON_MODULE:=}"
+
 export ATOMIC_DEMO_ORBIT_REPO  ATOMIC_DEMO_ORBIT_REF
 export ATOMIC_DEMO_ATOMIC_REPO ATOMIC_DEMO_ATOMIC_REF
 export ATOMIC_DEMO_SRC ATOMIC_DEMO_FORCE_CLONE ATOMIC_DEMO_PYTHON
+export ATOMIC_DEMO_PYTHON_MODULE
 export ATOMIC_DEMO_PIP_PINS
 
 # --------------------------------------------------------------------------
@@ -369,6 +374,41 @@ else
     ATOMIC_DEMO_MODE_WHY='no SLURM_JOB_ID -- this looks like a login node'
 fi
 
+# demo_load_python_module -- `module load $ATOMIC_DEMO_PYTHON_MODULE` on
+# hosts whose system python is too old for the stack.  Idempotent, so it
+# runs on every source: the venv's python is a symlink into the module
+# tree, which must be on the path on reruns too.  Non-interactive shells
+# have no `module` function until lmod's init is sourced.
+demo_load_python_module() {
+    local mod="${ATOMIC_DEMO_PYTHON_MODULE:-}" init
+
+    [ -n "$mod" ] || return 0
+
+    if ! type module > /dev/null 2>&1; then
+        for init in /usr/share/lmod/lmod/init/bash \
+                    /opt/cray/pe/lmod/lmod/init/bash \
+                    /etc/profile.d/lmod.sh \
+                    /usr/share/Modules/init/bash; do
+            [ -r "$init" ] || continue
+            # shellcheck disable=SC1090
+            . "$init" && break
+        done
+    fi
+
+    if ! type module > /dev/null 2>&1; then
+        demo_warn "no 'module' command here -- cannot load $mod;" \
+                  'set $ATOMIC_DEMO_PYTHON to a python >= 3.10 instead'
+        return 0
+    fi
+
+    if module load "$mod" > /dev/null 2>&1; then
+        demo_log "module  : loaded $mod ($(python3 -V 2>&1))"
+    else
+        demo_warn "module load $mod failed -- set \$ATOMIC_DEMO_PYTHON_MODULE" \
+                  'or $ATOMIC_DEMO_PYTHON'
+    fi
+}
+
 # the name this machine is reachable under from elsewhere: the FQDN if
 # it has a domain part, else the first non-loopback IPv4 -- the same
 # choice radical.orbit makes when advertising a wildcard-bound broker
@@ -417,6 +457,10 @@ case "$ATOMIC_DEMO_RESOURCE" in
         ATOMIC_DEMO_HOST='perlmutter'
         ATOMIC_DEMO_SITE='NERSC'
         ATOMIC_DEMO_RESOURCES=(perlmutter)
+        # the system python3 is 3.6; NERSC's python module is a self-
+        # contained conda python (verified 2026-09-08: 3.12-26.1.0 exists)
+        : "${ATOMIC_DEMO_PYTHON_MODULE:=python/3.12-26.1.0}"
+        demo_load_python_module
         : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
         if   [ -n "${PSCRATCH:-}" ]; then
             : "${ATOMIC_DEMO_SCRATCH_BASE:=$PSCRATCH/atomic-demo}"
@@ -430,6 +474,10 @@ case "$ATOMIC_DEMO_RESOURCE" in
     odo) ATOMIC_DEMO_HOST='odo'
         ATOMIC_DEMO_SITE='OLCF'
         ATOMIC_DEMO_RESOURCES=(odo)
+        # OLCF Cray systems ship cray-python (>= 3.9; the current one is
+        # 3.11) -- not verified on Odo yet, override if it is not enough
+        : "${ATOMIC_DEMO_PYTHON_MODULE:=cray-python}"
+        demo_load_python_module
         : "${ATOMIC_DEMO_BROKER_HOST:=TODO(export ATOMIC_DEMO_BROKER_HOST=<FQDN or IP of the broker host, as printed by broker.sh>)}"
         # OLCF hands out $MEMBERWORK/<project> on Lustre; without it we
         # cannot guess the project, so say so rather than guess
