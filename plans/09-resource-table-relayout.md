@@ -1,6 +1,6 @@
 # P9 — resource table: resources and their pilots, no "member"
 
-Status: revised after review round 1, 2026-09-08. Repo `feature/demo-wm`.
+Status: revised after review round 2, 2026-09-08 -- ready to implement. Repo `feature/demo-wm`.
 Companion: Orbit plan 122 (payload contract; endpoint adoption).
 
 ## Problem
@@ -26,8 +26,10 @@ Two independent column sets: a **resource row** and, indented under it,
 
 - Resource row: name, site, software (union over its pilot rows), class
   badges (`fed-cpu`, `fed-gpu`) so the placement classes stay visible
-  without a per-row column, then run/done/failed summed and the worst state
-  of its pilot rows.
+  without a per-row column, then run/done/failed from the **record's own
+  usage** (it counts unplaced tasks too; pilot rows count placed tasks
+  only, so a sum would under-count) and the worst state of its pilot rows.
+  Sum the pilot rows only when the record carries no usage.
 - Pilot row, one per federation member: name, mode, nodes, cpn, gpn, mpn,
   runtime, left, run, done, failed, state.
   - allocation mode: exactly one row, named after the endpoint (`ep_odo`,
@@ -46,7 +48,7 @@ Two independent column sets: a **resource row** and, indented under it,
 |---|---|---|
 | mode | record `mode` | `alloc` / `login` |
 | #nodes, #cpn, #gpn | member `nodes`, `cpus_per_node`, `gpus_per_node` | integers |
-| #mpn | `attributes.mem_gb_per_node` | GB, integer |
+| #mpn | `attributes.mem_gb_per_node` (shape 3: `caps.mem_gb`) | GB, integer; `-` when absent |
 | runtime | `walltime_sec` | hours, 2 decimals |
 | left | `remaining_sec` | hours, 2 decimals; `-` when null |
 | #run / #done / #failed | usage `tasks_running/done/failed` | integers |
@@ -77,11 +79,13 @@ move to the tooltip (UI) and stay in `--json`.
 1. `atomic_wm/client.py`: `pilots_of` with the three shapes; `members_of`
    kept as a thin alias for one release.
 2. `atomic_wm/cli/resources.py`: the two column sets above.
-3. `atomic_wm/ui/atomic_campaign.js`, resources panel (~lines 882-935):
-   same layout, `.ac-pilot` rows replacing `.ac-member`, `idle` style,
-   `pilotErrorRow` kept.
-4. Docs: `docs/join.md` resources sample (lines ~248-256), demo README
-   table sample; `join.py` prints `runtime` as "s remaining" — fix that
+3. `atomic_wm/ui/atomic_campaign.js`, resources panel (~lines 905-1055,
+   `renderMemberRow`/`pilotErrorRow`): same layout, `.ac-pilot` rows
+   replacing `.ac-member`, `idle` added to `statusCell`'s state list with an
+   `.ac-dot.idle` rule, `pilotErrorRow` kept.
+4. Docs: `docs/join.md` resources sample (lines ~248-262), `docs/ui.md`
+   resources panel (53-69, written in "member" terms), demo README table
+   sample; `join.py:1106` prints `runtime` as "s remaining" — fix that
    label while here.
 
 ## Tests
@@ -94,7 +98,7 @@ move to the tooltip (UI) and stay in `--json`.
   truncation; `tests/test_cli_resources.py` header list and the `└ cpu`
   prefixes are rewritten on purpose;
 - UI: `tests/test_ui_module.py` resource-panel assertions (three sub-rows
-  at ~308-312) rewritten to the pilot rows;
+  at ~313-332) rewritten to the pilot rows;
 - `--json` pass-through unchanged; `smoke.py`, `up.sh` use `--json` and
   `member`, unaffected.
 
