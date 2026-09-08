@@ -289,9 +289,38 @@ class Campaign:
             self.state  = DONE
             self.reason = None
             self.detail = None
+        if self.state in (FAILED, CANCELED) and not self.reason:
+            self._explain_rollup()
         if self.finished_at is None:
             self.finished_at = time.time()
         return self.state
+
+    def _explain_rollup(self) -> None:
+        """Give a rolled-up FAILED/CANCELED campaign its own reason.
+
+        The demo card and ``atomic-campaign status`` show the *campaign's*
+        reason, so a campaign that failed only because its workflows did
+        must repeat what they said -- verbatim, since a workflow reason is
+        already an on-screen phrase ("stage 'md': no resources have joined
+        the federation yet").  Workflows that failed for different reasons
+        cannot be summed up in one phrase, so they are counted instead and
+        the per-workflow reasons stay where they are.
+
+        Never called when a reason is already set: cancel, interrupt and
+        the driver's own ``_terminate`` all know better than the roll-up.
+        """
+
+        bad = [wf for wf in self.workflows if wf.state in (FAILED, CANCELED)]
+        if not bad:
+            return
+        reasons = {wf.reason for wf in bad}
+        if len(reasons) == 1 and bad[0].reason:
+            self.reason = bad[0].reason
+            self.detail = self.detail or bad[0].detail
+        else:
+            self.reason = '%d of %d workflows failed' % (len(bad),
+                                                         len(self.workflows))
+            self.detail = self.detail or bad[0].detail or bad[0].reason
 
 
 # --------------------------------------------------------------------------

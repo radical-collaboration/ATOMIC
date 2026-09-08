@@ -239,6 +239,29 @@ class TestStatus:
         out = capsys.readouterr().out
         assert 'md:RUNNING' in out and 'md:RUNNING@' not in out
 
+    def test_a_failed_workflow_explains_itself_under_the_table(self, client,
+                                                               capsys):
+        # the campaign reason is the roll-up; the per-workflow lines say
+        # which workflow hit what, without widening the table
+        camp = _campaign('FAILED')
+        camp['reason'] = "stage 'md': no resources have joined the " \
+                         'federation yet'
+        camp['workflows'][0]['reason'] = camp['reason']
+        client.campaign.return_value = camp
+
+        cli.main(['--broker', 'https://x', 'status', 'cmp-1234'])
+        out = capsys.readouterr().out
+        assert 'reason: %s' % camp['reason'] in out
+        assert '  wf-000: %s' % camp['reason'] in out
+
+    def test_a_done_workflow_gets_no_extra_line(self, client, capsys):
+        camp = _campaign('DONE')
+        camp['workflows'][0]['reason'] = 'left over from an earlier state'
+        client.campaign.return_value = camp
+
+        cli.main(['--broker', 'https://x', 'status', 'cmp-1234'])
+        assert 'left over' not in capsys.readouterr().out
+
     def test_status_json(self, client, capsys):
         client.campaign.return_value = _campaign('DONE')
         assert cli.main(['--broker', 'https://x', 'status', 'cmp-1234',

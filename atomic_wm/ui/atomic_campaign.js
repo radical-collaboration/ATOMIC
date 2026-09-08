@@ -43,6 +43,13 @@ const POLL_IDLE_MS = 5000;   // otherwise
 // poll tick into fifty requests
 const MAX_DETAIL = 6;
 
+// A campaign that FAILED is retired from the page this long after it
+// finished: the demo screen must not accumulate red cards nobody is going
+// to talk about any more.  DONE / CANCELED / INTERRUPTED cards stay.  This
+// is display only -- `atomic-campaign list/status` and the REST surface
+// still know every campaign.
+const FAILED_HIDE_MS = 30000;
+
 // series colours; defined as CSS variables in css() so they track the
 // Explorer palette and stay legible on the dark background
 const SERIES_COLOURS = ['var(--ac-s1)', 'var(--ac-s2)', 'var(--ac-s3)',
@@ -211,6 +218,8 @@ function stateOf(page) {
           campEver   : false,
           storeRoot  : null,
           openResults: {},       // cid -> bool
+          termSeen   : {},       // cid -> ms, first poll that saw it terminal
+          hideTimer  : null,     // re-render when a FAILED card is due to go
           lastRender : 0};
     STATE.set(page, st);
   }
@@ -335,6 +344,14 @@ export function css() {
       margin: 2px 0 10px;
       font-size: .82rem;
       color: #fb7185;
+    }
+    /* the technical half of the story, under the phrase: what the
+       federation actually said, which member failed on what */
+    .ac-detail {
+      margin: -8px 0 10px;
+      font-size: .74rem;
+      color: var(--muted);
+      word-break: break-word;
     }
 
     /* ---- resources table ---- */
@@ -780,6 +797,56 @@ function hasFinishedStage(obj) {
                     && w.stages.some(s => stateClass(s && s.state) === 'st-done'));
 }
 
+// When a campaign finished, in ms.  `finished_at` is the record's own word
+// for it; a record that carries none is aged from the first poll that saw
+// it terminal, which is never earlier than the truth and so never retires
+// a card too soon.
+function finishedAtMs(item, st) {
+  const t1 = toEpoch(firstOf(item.detail, ['finished_at', 'ended_at',
+                                           'completed_at']))
+          || toEpoch(firstOf(item.summary, ['finished_at', 'ended_at',
+                                            'completed_at']));
+  if (t1) return t1 * 1000;
+
+  const cid = cidOf(item.summary) || cidOf(item.detail);
+  if (!st.termSeen[cid]) st.termSeen[cid] = Date.now();
+  return st.termSeen[cid];
+}
+
+// how long a FAILED card still has on screen (Infinity: it stays)
+function hideDueInMs(item, st) {
+  if (campaignState(item) !== 'FAILED') return Infinity;
+  return FAILED_HIDE_MS - (Date.now() - finishedAtMs(item, st));
+}
+
+function isHidden(item, st) {
+  return hideDueInMs(item, st) <= 0;
+}
+
+// the campaigns the page actually shows -- see FAILED_HIDE_MS
+function visibleCampaigns(st) {
+  return st.campaigns.filter(c => !isHidden(c, st));
+}
+
+// A FAILED card must vanish on its own, so re-render when the next one is
+// due rather than waiting for the poll that happens to follow it.
+function scheduleHideTick(page, st) {
+  if (st.hideTimer) {
+    clearTimeout(st.hideTimer);
+    st.hideTimer = null;
+  }
+  let soonest = Infinity;
+  for (const c of st.campaigns) {
+    const left = hideDueInMs(c, st);
+    if (left > 0 && left < soonest) soonest = left;
+  }
+  if (!Number.isFinite(soonest)) return;
+  st.hideTimer = setTimeout(() => {
+    st.hideTimer = null;
+    if (page.isConnected) render(page);
+  }, soonest + 50);
+}
+
 // ---------------------------------------------------------------------------
 // rendering
 // ---------------------------------------------------------------------------
@@ -789,10 +856,12 @@ function render(page) {
   renderResources(page, st);
   renderCampaigns(page, st);
 
+  scheduleHideTick(page, st);
+
   const sum = page.querySelector('.ac-summary');
   if (sum) {
     const nres = st.resources.length;
-    const ncmp = st.campaigns.length;
+    const ncmp = visibleCampaigns(st).length;
     sum.textContent = (st.fedError && !nres)
       ? 'no federation'
       : `${nres} resource${nres === 1 ? '' : 's'} · `
@@ -1088,14 +1157,17 @@ function renderCampaigns(page, st) {
     if (count) count.textContent = '';
     return;
   }
-  if (!st.campaigns.length) {
+  // a FAILED campaign leaves the page FAILED_HIDE_MS after it finished
+  const shown = visibleCampaigns(st);
+
+  if (!shown.length) {
     body.innerHTML = '<div class="ac-note">No campaigns yet — submit '
                    + 'one above.</div>';
     if (count) count.textContent = '';
     return;
   }
   if (count) {
-    const running = st.campaigns.filter(
+    const running = shown.filter(
       c => campaignState(c) === 'RUNNING').length;
     count.textContent = running ? `· ${running} running` : '';
   }
@@ -1105,7 +1177,7 @@ function renderCampaigns(page, st) {
     + `⚠ showing the last known campaigns — refresh failed</div>` : '';
 
   body.innerHTML = stale
-                 + st.campaigns.map(c => renderCampaign(c, st)).join('');
+                 + shown.map(c => renderCampaign(c, st)).join('');
 }
 
 function renderCampaign(item, st) {
@@ -1151,6 +1223,16 @@ function renderCampaign(item, st) {
     ? firstOf(item.detail, ['reason']) || firstOf(item.summary, ['reason'])
     : null;
 
+  // The technical half of the same story: `Campaign.detail` -- what the
+  // federation actually said, e.g. which member failed on what.  Shown
+  // dimmer, under the phrase, and only when it adds something.  (Careful:
+  // `item.detail` is the fetched campaign *document*; the record's own
+  // field is the `detail` inside it.)
+  const said = reason
+    ? firstOf(item.detail, ['detail']) || firstOf(item.summary, ['detail'])
+    : null;
+  const extra = (said && String(said) !== String(reason)) ? said : null;
+
   return `<div class="ac-camp">
     <div class="ac-camp-head">
       <span class="ac-camp-name">${esc(name)}</span>
@@ -1161,6 +1243,7 @@ function renderCampaign(item, st) {
       <span class="ac-camp-actions">${cancel}</span>
     </div>
     ${reason ? `<div class="ac-reason">${esc(reason)}</div>` : ''}
+    ${extra ? `<div class="ac-detail">${esc(extra)}</div>` : ''}
     ${rows}
     ${plots}
     ${results}
@@ -1215,6 +1298,10 @@ function renderWorkflowRow(w, colour) {
     // WorkflowInstance and Campaign all carry it); `error` is tolerated
     const why = firstOf(s, ['reason', 'error']);
     if (why) bits.push(String(why));
+    // ... and `StageRun.detail`, the technical text behind that phrase --
+    // for a refused submit that is the per-member list of what was missing
+    const said = firstOf(s, ['detail']);
+    if (said && String(said) !== String(why)) bits.push(String(said));
     // The chip's job in the demo is to name the resource the stage ran on;
     // but a failed / skipped / staging chip must still say so in words, not
     // only in colour.
@@ -1601,5 +1688,6 @@ export const _internals = {
   varyingKeys, legendLabel, paramsLabel, niceTicks, downsample,
   renderPlot, renderFiles, renderResourceRow, renderMemberRow, membersOf,
   placementOf, countCell, pickMetrics,
+  FAILED_HIDE_MS, isHidden, hideDueInMs, visibleCampaigns,
   PLOT_GEOMETRY: {PW, PH, PAD}
 };

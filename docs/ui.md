@@ -96,10 +96,23 @@ button — the demo never sends a request it knows is broken.
 
 One card per campaign, newest first (at most six are detailed per poll).
 
+A campaign that ended **FAILED** leaves the page `FAILED_HIDE_MS` (30 s,
+a named constant at the top of the module) after it finished, so the demo
+screen does not accumulate red cards nobody will talk about again. The age
+is taken from the record's `finished_at`; a record without one is aged from
+the first poll that saw it terminal, which never retires a card too early.
+A re-render is scheduled for the moment the next card is due, so it goes
+without anybody touching the page. DONE, CANCELED and INTERRUPTED cards
+stay. This is **display only** — `atomic-campaign list/status` and the REST
+routes still know every campaign.
+
 - **header** — workflow name, state badge, short campaign id, elapsed
   time, workflow count, and a `⊘ Stop` button while it runs
   (`POST cancel/default/{cid}`). A campaign that ended FAILED,
-  INTERRUPTED or CANCELED shows its `reason` under the header.
+  INTERRUPTED or CANCELED shows its `reason` under the header, and — when
+  it says something the phrase does not — its `detail` on a second, dimmer
+  line below (that is where a refused submit's per-member texts live:
+  `local_a.default: software missing: pytorch`).
 - **one row per workflow** — the sweep params (`temperature=600`) with
   the workflow's series colour, then the stage chips `md ▸ train`.
   Each chip is coloured by stage state and **labelled with the placement
@@ -113,8 +126,10 @@ One card per campaign, newest first (at most six are detailed per poll).
   shows its state word instead and is not an error. Where colour alone
   would not be honest (a failed, skipped or staging chip) the state is
   spelled out next to the placement. The chip's tooltip carries the task
-  id, state, capability class, exit code and the stage's `reason` — the
-  class stays out of the chip itself, which is already tight at 720p.
+  id, state, capability class, exit code, the stage's `reason` and its
+  `detail` (the technical text behind the phrase — for a refused submit,
+  which resource failed on what) — the class stays out of the chip itself,
+  which is already tight at 720p.
 
   | state | style | word |
   |---|---|---|
@@ -177,10 +192,11 @@ unavailable*, *submit failed* — and puts the server's own wording in the
 element's `title`, where it is available for debugging without ending up
 on the projector.
 
-The one exception is the campaign's own `reason`, which the campaign
-plugin writes for a human and the page shows verbatim. **P4 should
+The one exception is the campaign's own `reason` and `detail`, which the
+campaign plugin writes for a human and the page shows verbatim. **P4 should
 therefore keep `reason` strings free of Orbit vocabulary** — e.g. prefer
-"the service restarted" over "broker shutting down".
+"the service restarted" over "broker shutting down" — and keep `detail`
+about resources, since it is now on screen too (dimmer, under the reason).
 
 ## Reading the code
 
@@ -250,7 +266,9 @@ Everything is sized for **1280×720 on a screen share**:
   cadence (hidden → 5 s, then 2 s once a campaign is running), the
   coalescing of a notification burst into one 250 ms nudge, the
   "no federation" and "service unavailable" fallbacks, stale-data
-  retention on a failed poll, and the vocabulary rule;
+  retention on a failed poll, the retiring of a FAILED card 30 s after it
+  finished (and the keeping of DONE/CANCELED/INTERRUPTED ones), and the
+  vocabulary rule;
 - an equality comparison of the bundled `vacancy-classifier` spec (dumped
   from `_internals` by node) against `examples/workflow_vacancy.json`.
 

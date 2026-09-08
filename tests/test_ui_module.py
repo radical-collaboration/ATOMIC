@@ -173,9 +173,12 @@ const DEAD = {
   campaign_id: 'camp.000', name: 'vacancy-md-only', state: 'INTERRUPTED',
   created_at: NOW - 900, finished_at: NOW - 800,
   reason: 'stopped while the service restarted',
+  detail: 'local_b.gpu: node_hours 0.000 < 1.000',
   workflows: [ wf('wf.x', 300, 'INTERRUPTED', 'local_a', 'SKIPPED', null,
                   'stage did not finish') ],
 };
+DEAD.workflows[0].stages[0].detail = 'no resource satisfies requirements: '
+                                   + 'local_b.gpu: node_hours 0.000 < 1.000';
 
 function md(temp) {
   const step = [], energy = [];
@@ -368,6 +371,11 @@ check(camp.includes('stage did not finish'),
       'the stage `reason` is not in the chip tooltip');
 check(camp.includes('stopped while the service restarted'),
       'the campaign-level `reason` is not shown for INTERRUPTED');
+// the technical half of the story rides under the phrase, dimmer
+check(/class="ac-detail"[^>]*>[^<]*node_hours 0\.000/.test(camp),
+      'the campaign-level `detail` is not shown under the reason');
+check(/title="[^"]*node_hours 0\.000/.test(camp),
+      "the stage `detail` is not in the chip tooltip");
 check(camp.includes('<svg'), 'no svg chart rendered');
 check((camp.match(/<polyline/g) || []).length >= 3,
       'expected at least 3 polylines (2 md series + 1 train series)');
@@ -380,10 +388,13 @@ check(!/NaN|undefined|\[object Object\]/.test(camp),
       'campaign HTML contains NaN/undefined');
 
 // on-screen vocabulary: Orbit internals only ever inside attributes.  (The
-// campaign's own `reason` is server-authored prose and is exempt -- it is
-// stripped here with the elements the module wraps it in.)
-const visible = (res + camp + tmpl).replace(/<div class="ac-reason">[^<]*<\/div>/g, ' ')
-                                   .replace(/<[^>]*>/g, ' ');
+// campaign's own `reason` and `detail` are server-authored text and are
+// exempt -- they are stripped here with the elements the module wraps them
+// in.)
+const visible = (res + camp + tmpl)
+  .replace(/<div class="ac-reason">[^<]*<\/div>/g, ' ')
+  .replace(/<div class="ac-detail">[^<]*<\/div>/g, ' ')
+  .replace(/<[^>]*>/g, ' ');
 for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher', 'namespace']) {
   check(!new RegExp(w, 'i').test(visible),
         `forbidden word "${w}" in visible text`);
@@ -493,8 +504,57 @@ check(r4.includes('last known resources') && c4.includes('last known campaigns')
 check(!/dispatcher/i.test((r4 + c4).replace(/<[^>]*>/g, ' ')),
       'the raw poll error leaked into visible text');
 
+// --- a FAILED campaign retires from the page after 30 s --------------------
+// display only: the CLI and the REST surface keep every campaign
+const OLDFAIL = { campaign_id: 'camp.old', name: 'gone-soon', state: 'FAILED',
+                  created_at: NOW - 600, finished_at: NOW - 120,
+                  reason: "stage 'md': no resources have joined the "
+                        + 'federation yet',
+                  workflows: [] };
+const NEWFAIL = { ...OLDFAIL, campaign_id: 'camp.new', name: 'still-here',
+                  finished_at: NOW - 3 };
+const page5 = new Page();
+const api5  = { ...api,
+                fetch: async (p, o = {}) => {
+                  if (p === 'campaigns/default' && o.method !== 'POST')
+                    return { campaigns: [OLDFAIL, NEWFAIL] };
+                  if (p === 'campaign/default/camp.old') return OLDFAIL;
+                  if (p === 'campaign/default/camp.new') return NEWFAIL;
+                  if (p.startsWith('results/default/camp.'))
+                    return { workflows: [] };
+                  return api.fetch(p, o);
+                } };
+await m.init(page5, api5);
+const c5 = page5.html('.ac-campaigns-body');
+check(!c5.includes('gone-soon'),
+      'a FAILED campaign older than 30 s is still on the page');
+check(c5.includes('still-here'),
+      'a FAILED campaign that just finished was hidden too early');
+
 // --- pure helpers ----------------------------------------------------------
 const I = m._internals;
+check(I.FAILED_HIDE_MS === 30000, 'FAILED_HIDE_MS is not 30 s');
+const hst = {termSeen: {}};
+const fin = (state, ago) => ({summary: {campaign_id: 'c.' + state + ago,
+                                        state, finished_at: NOW - ago}});
+check(I.isHidden(fin('FAILED', 31), hst) === true,
+      'a FAILED campaign is not hidden 31 s after it finished');
+check(I.isHidden(fin('FAILED', 5), hst) === false,
+      'a FAILED campaign is hidden 5 s after it finished');
+for (const keep of ['DONE', 'CANCELED', 'INTERRUPTED', 'RUNNING']) {
+  check(I.isHidden(fin(keep, 900), hst) === false,
+        `a ${keep} campaign must never be hidden`);
+}
+// no finished_at: aged from the first poll that saw it terminal, so it
+// stays for another 30 s rather than vanishing on sight
+const nofin = {summary: {campaign_id: 'c.nofin', state: 'FAILED'}};
+check(I.isHidden(nofin, hst) === false,
+      'a FAILED campaign without finished_at was hidden immediately');
+check(typeof hst.termSeen['c.nofin'] === 'number',
+      'the first sighting of a terminal campaign was not remembered');
+check(I.visibleCampaigns({termSeen: {},
+                          campaigns: [fin('FAILED', 31), fin('DONE', 31)]})
+       .length === 1, 'visibleCampaigns does not drop the retired card');
 check(JSON.stringify(I.parseSweepValues('300, 600,900')) === '[300,600,900]',
       'parseSweepValues does not parse numbers');
 check(JSON.stringify(I.parseSweepValues('a, b ,')) === '["a","b"]',

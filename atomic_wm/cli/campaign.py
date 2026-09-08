@@ -156,8 +156,26 @@ def print_campaign(camp: Dict[str, Any]) -> None:
     if rows:
         print()
         _print_table(rows, ['WORKFLOW', 'PARAMS', 'STATE', 'STAGES'])
+        _print_workflow_reasons(camp)
     else:
         print('(no workflows)')
+
+
+# ---------------------------------------------------------------------------
+def _print_workflow_reasons(camp: Dict[str, Any]) -> None:
+    """One indented line per failed workflow, right under the table.
+
+    The table itself is on screen during the demo, so a fifth column of
+    prose would push the placements out of view -- the explanation goes
+    below the table instead, where it can be as long as it needs to be.
+    """
+
+    for wf in camp.get('workflows') or []:
+        if str(wf.get('state') or '') not in ('FAILED', 'CANCELED'):
+            continue
+        reason = wf.get('reason')
+        if reason:
+            print('  %s: %s' % (wf.get('id') or '?', reason))
 
 
 # ---------------------------------------------------------------------------

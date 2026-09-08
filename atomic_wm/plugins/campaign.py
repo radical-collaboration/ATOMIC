@@ -42,8 +42,9 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationCallError,
                                         FederationUnavailable, TaskNotFound,
                                         REASON_INCOMPLETE, REASON_NOT_STARTED,
-                                        REASON_NO_RESOURCE, REASON_NO_STATUS,
-                                        REASON_STOPPED)
+                                        REASON_NO_RESOURCE,
+                                        REASON_NO_RESOURCES_JOINED,
+                                        REASON_NO_STATUS, REASON_STOPPED)
 from atomic_wm.campaign.state   import (Campaign, CANCELED, FAILED,
                                         STATE_FILE,
                                         TERMINAL_STATES, default_state_root,
@@ -58,6 +59,10 @@ FEDERATION_PLUGIN = 'federation'
 DISPATCHER_PLUGIN = 'task_dispatcher'
 
 _JSON_HEADERS = {'content-type': 'application/json'}
+
+# how many per-member texts a 409's on-screen reason still spells out (past
+# that only the count fits on a card; the full list stays in `detail`)
+MAX_REASON_MEMBERS = 3
 
 
 # --------------------------------------------------------------------------
@@ -167,16 +172,60 @@ class _FederationAPI(FederationAPI):
             {'task': task, 'requirements': requirements})
         if status >= 400:
             detail = self._detail(data)
-            raise FederationCallError(
-                self._submit_reason(status, detail),
-                detail or 'HTTP %d' % status)
+            reason = self._submit_reason(status, detail, data)
+            if status == 409:
+                detail = self._submit_detail(detail, data)
+            raise FederationCallError(reason, detail or 'HTTP %d' % status)
         return data if isinstance(data, dict) else {}
 
     @staticmethod
-    def _submit_reason(status: int, detail: str) -> str:
+    def _member_reasons(data: Any) -> Dict[str, Any]:
+        """The 409 body's ``reasons`` map: member id -> why it lost.
+
+        Empty when the federation has no members at all -- which is the
+        one case a 409 does not blame the requirements for.
+        """
+
+        reasons = data.get('reasons') if isinstance(data, dict) else None
+        return reasons if isinstance(reasons, dict) else {}
+
+    @classmethod
+    def _member_parts(cls, data: Any) -> List[str]:
+        """``['a.cpu: gpus 0 < 1', 'b.gpu: node_hours exhausted']``.
+
+        Sorted by member id so the same refusal always reads the same way;
+        a value that is not a string is JSON-dumped rather than dropped.
+        """
+
+        parts = []
+        reasons = cls._member_reasons(data)
+        for member_id in sorted(reasons):
+            text = reasons[member_id]
+            if not isinstance(text, str):
+                text = json.dumps(text, default=str)
+            parts.append('%s: %s' % (member_id, text))
+        return parts
+
+    @classmethod
+    def _submit_reason(cls, status: int, detail: str,
+                       data: Any = None) -> str:
         """Which on-screen phrase a failed submit deserves.
 
-        409 is the federation's own "no class has an eligible member".
+        409 is the federation's own "no class has an eligible member", and
+        its ``reasons`` map tells the two stories apart: an empty one means
+        nothing has joined yet (nobody to satisfy anything), a filled one
+        means the resources that did join do not match.  Saying the second
+        when the first is true sends whoever watches the demo hunting a
+        requirement instead of joining a resource.
+
+        In the second case the phrase alone is not enough on screen -- "no
+        resource satisfies the stage requirements" leaves the audience
+        guessing *what* was missing -- so the per-member texts ride along
+        in brackets while the federation is small enough for that to fit
+        (they are the federation's own words about resources: ``gpus
+        0 < 1``, ``software missing: pytorch``).  Past MAX_REASON_MEMBERS
+        only the count is named and the list stays in ``detail``.
+
         A 400 is ambiguous -- it is also what a malformed body earns --
         so only the dispatcher's two placement refusals are reported as a
         missing resource; every other 400 is a broken call, and saying
@@ -185,7 +234,13 @@ class _FederationAPI(FederationAPI):
         """
 
         if status == 409:
-            return REASON_NO_RESOURCE
+            parts = cls._member_parts(data)
+            if not parts:
+                return REASON_NO_RESOURCES_JOINED
+            if len(parts) <= MAX_REASON_MEMBERS:
+                return '%s (%s)' % (REASON_NO_RESOURCE, '; '.join(parts))
+            return '%s (%d resources checked)' % (REASON_NO_RESOURCE,
+                                                  len(parts))
 
         if status == 400:
             text = (detail or '').lower()
@@ -194,6 +249,22 @@ class _FederationAPI(FederationAPI):
                 return REASON_NO_RESOURCE
 
         return REASON_NOT_STARTED
+
+    @classmethod
+    def _submit_detail(cls, detail: str, data: Any) -> str:
+        """Fold the 409's per-member reasons into the technical detail.
+
+        ``no resource satisfies requirements: a.cpu: gpus 0 < 1;
+        b.gpu: node_hours exhausted`` -- the phrase on screen says *that*
+        no resource matched, this says which one failed on what.  Sorted
+        by member id so the same refusal always reads the same way.
+        """
+
+        parts = cls._member_parts(data)
+        if not parts:
+            return detail
+        listed = '; '.join(parts)
+        return '%s: %s' % (detail, listed) if detail else listed
 
     async def task(self, task_id: str) -> Dict[str, Any]:
 

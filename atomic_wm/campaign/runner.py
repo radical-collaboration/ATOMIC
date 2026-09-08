@@ -58,6 +58,9 @@ REASON_NO_STATUS   = 'the stage status could not be read'
 REASON_STOPPED     = 'the campaign was stopped'
 REASON_INCOMPLETE  = 'the stage did not complete'
 REASON_STAGE_IN    = 'the input file could not be placed on the resource'
+# an empty federation is a different story from one whose resources do not
+# match the stage -- and on stage it calls for a different fix
+REASON_NO_RESOURCES_JOINED = 'no resources have joined the federation yet'
 
 
 # --------------------------------------------------------------------------

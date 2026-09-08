@@ -22,7 +22,9 @@ from starlette.testclient import TestClient
 
 from atomic_wm.campaign.runner  import (FederationCallError, TaskNotFound,
                                         REASON_NOT_STARTED,
-                                        REASON_NO_RESOURCE, REASON_NO_STATUS)
+                                        REASON_NO_RESOURCE,
+                                        REASON_NO_RESOURCES_JOINED,
+                                        REASON_NO_STATUS)
 from atomic_wm.campaign.state   import REASON_INTERRUPTED
 from atomic_wm.plugins.campaign import PluginAtomicCampaign, _FederationAPI
 
@@ -404,15 +406,76 @@ class TestErrorMapping:
         assert 'dispatcher' in exc.value.detail          # kept for the log
         assert 'dispatcher' not in exc.value.reason
 
-    def test_409_no_resource_is_its_own_phrase(self, tmp_path):
+    def test_409_no_resource_names_the_members_that_lost(self, tmp_path):
+        # the phrase alone leaves the audience guessing what was missing,
+        # so a small federation's per-member texts ride on the reason
         api, _ = self._api(tmp_path, {
             ('POST', '/federation/submit/default'):
                 (409, {'detail': 'no resource satisfies requirements: '
-                                 'res-a lacks software lammps'})})
+                                 'res-a lacks software lammps',
+                       'reasons': {'res-a.cpu': 'software missing: lammps'}})})
         with pytest.raises(FederationCallError) as exc:
             asyncio.run(api.submit({'task_id': 't'}, {'cores': 99}))
-        assert exc.value.reason == REASON_NO_RESOURCE
+        assert exc.value.reason == '%s (res-a.cpu: software missing: lammps)' \
+                                   % REASON_NO_RESOURCE
         assert 'lammps' in exc.value.detail
+
+    def test_a_big_federation_only_gets_a_count_on_screen(self, tmp_path):
+        reasons = {'r%d.cpu' % n: 'gpus 0 < 1' for n in range(4)}
+        api, _  = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                (409, {'detail': 'no resource satisfies requirements',
+                       'reasons': reasons})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't'}, {'gpus': 1}))
+        assert exc.value.reason == '%s (4 resources checked)' \
+                                   % REASON_NO_RESOURCE
+        # the list is not lost, it just does not fit on a card
+        assert exc.value.detail.count('gpus 0 < 1') == 4
+
+    def test_409_with_no_member_reasons_means_nothing_joined(self, tmp_path):
+        # an empty `reasons` map is how the federation says it has no
+        # members at all -- there is no requirement to go fix
+        for body in ({'detail': 'no resource satisfies requirements',
+                      'reasons': {}},
+                     {'detail': 'no resource satisfies requirements'}):
+            api, _ = self._api(tmp_path, {
+                ('POST', '/federation/submit/default'): (409, body)})
+            with pytest.raises(FederationCallError) as exc:
+                asyncio.run(api.submit({'task_id': 't'}, {'cores': 1}))
+            assert exc.value.reason == REASON_NO_RESOURCES_JOINED
+            assert exc.value.detail == 'no resource satisfies requirements'
+
+    def test_409_member_reasons_are_listed_in_the_detail(self, tmp_path):
+        api, _ = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                (409, {'detail': 'no resource satisfies requirements',
+                       'reasons': {'b.gpu': 'node_hours exhausted',
+                                   'a.cpu': 'gpus 0 < 1',
+                                   'c.cpu': {'gpus': [0, 1]}}})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't'}, {'gpus': 1}))
+        # sorted by member id, `member: why` joined by '; ', non-strings
+        # rendered as JSON -- the same list on screen and in the detail
+        listed = ('a.cpu: gpus 0 < 1; b.gpu: node_hours exhausted; '
+                  'c.cpu: {"gpus": [0, 1]}')
+        assert exc.value.reason == '%s (%s)' % (REASON_NO_RESOURCE, listed)
+        assert exc.value.detail == \
+            'no resource satisfies requirements: %s' % listed
+
+    def test_the_empty_federation_reason_reaches_the_campaign(self, tmp_path):
+        # end to end: an empty federation must explain itself on the
+        # campaign, not just on the stage that hit it
+        host = FakeHost(plugins={'federation': object()}, responses={
+            ('POST', '/federation/submit/default'):
+                (409, {'detail': 'no resource satisfies requirements',
+                       'reasons': {}})})
+        _, plugin = _make_plugin(tmp_path, host=host)
+        client = _request(plugin)
+        camp = _wait_terminal(client, _submit(client).json()['campaign_id'])
+        assert camp['state'] == 'FAILED'
+        assert camp['reason'] == "stage 'md': %s" % REASON_NO_RESOURCES_JOINED
+        assert camp['workflows'][0]['reason'] == camp['reason']
 
     def test_404_task_lookup_raises_task_not_found(self, tmp_path):
         api, _ = self._api(tmp_path, {

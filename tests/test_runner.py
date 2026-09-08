@@ -22,8 +22,9 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         TaskNotFound, MAX_POLL_FAILURES,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS,
                                         REASON_STAGE_IN, REASON_STOPPED)
-from atomic_wm.campaign.state   import (Campaign, load_campaigns,
-                                        save_campaigns)
+from atomic_wm.campaign.state   import (CANCELED, Campaign, DONE, FAILED,
+                                        PENDING, RUNNING, WorkflowInstance,
+                                        load_campaigns, save_campaigns)
 from atomic_wm.campaign.store   import ResultStore
 
 
@@ -818,3 +819,57 @@ class TestStoreLayout:
     def test_unsafe_path_components_are_rejected(self, tmp_path):
         with pytest.raises(ValueError):
             _store(tmp_path).stage_dir('..', 'wf-000', 'md')
+
+
+# ---------------------------------------------------------------------------
+class TestCampaignRollup:
+    """A rolled-up FAILED campaign must say *why* -- the card and the CLI
+    show the campaign's own reason, not the workflows'."""
+
+    def _camp(self, *wfs):
+        return Campaign(campaign_id='cmp-r', name='demo',
+                        workflows=list(wfs))
+
+    def _wf(self, wid, state, reason=None, detail=None):
+        return WorkflowInstance(id=wid, state=state, reason=reason,
+                                detail=detail)
+
+    def test_one_shared_reason_becomes_the_campaigns_own(self):
+        why  = "stage 'md': no resources have joined the federation yet"
+        camp = self._camp(self._wf('wf-000', FAILED, why, 'HTTP 409'),
+                          self._wf('wf-001', FAILED, why, 'HTTP 409'))
+        assert camp.refresh_state() == FAILED
+        assert camp.reason == why
+        assert camp.detail == 'HTTP 409'
+
+    def test_different_reasons_are_counted_instead(self):
+        camp = self._camp(self._wf('wf-000', FAILED, 'a', 'detail a'),
+                          self._wf('wf-001', FAILED, 'b'),
+                          self._wf('wf-002', DONE))
+        assert camp.refresh_state() == FAILED
+        assert camp.reason == '2 of 3 workflows failed'
+        assert camp.detail == 'detail a'
+
+    def test_a_failed_workflow_without_a_reason_is_counted(self):
+        camp = self._camp(self._wf('wf-000', FAILED))
+        assert camp.refresh_state() == FAILED
+        assert camp.reason == '1 of 1 workflows failed'
+
+    def test_an_explicit_reason_is_never_overwritten(self):
+        camp = self._camp(self._wf('wf-000', CANCELED, 'stage stopped'))
+        camp.reason = 'the campaign was stopped'
+        assert camp.refresh_state() == CANCELED
+        assert camp.reason == 'the campaign was stopped'
+
+    def test_a_running_campaign_gets_no_reason(self):
+        camp = self._camp(self._wf('wf-000', PENDING))
+        assert camp.refresh_state() == RUNNING
+        assert camp.reason is None
+        assert camp.finished_at is None
+
+    def test_done_clears_a_reason_that_arrived_too_late(self):
+        camp = self._camp(self._wf('wf-000', DONE))
+        camp.reason, camp.detail = 'the campaign was stopped', 'cancel'
+        assert camp.refresh_state() == DONE
+        assert camp.reason is None
+        assert camp.detail is None

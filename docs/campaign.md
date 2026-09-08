@@ -95,7 +95,10 @@ dispatchers or plugins:
 | reason | when |
 |---|---|
 | `the resource federation is not available` | the federation is not hosted |
-| `no resource satisfies the stage requirements` | federation `submit` said 409 (no class has an eligible member), or 400 with a *placement* refusal — `no member satisfies …` / `… exceed every pilot_size …` |
+| `no resource satisfies the stage requirements (a.cpu: gpus 0 < 1)` | federation `submit` said 409 **with** a non-empty `reasons` map (resources joined, none matches). The map (`member_id` → why that member lost) rides along in brackets for up to three members — the phrase alone leaves the audience guessing *what* was missing — and becomes `(N resources checked)` beyond that. Either way the full list is in `detail`, as `no resource satisfies requirements: a.cpu: gpus 0 < 1; b.gpu: node_hours exhausted` |
+| `no resource satisfies the stage requirements` | 400 with a *placement* refusal — `no member satisfies …` / `… exceed every pilot_size …` (no per-member map to quote) |
+| `no resources have joined the federation yet` | federation `submit` said 409 with an **empty** (or absent) `reasons` map — the federation has no members at all, so there is no requirement to go fix |
+| `N of M workflows failed` | the campaign roll-up, when its failed workflows do not share one reason (they keep their own; `detail` carries the first one's) |
 | `the stage could not be started` | any other submit failure, including a 400 that is not a placement refusal (a malformed body earns a 400 too, and blaming the resources for it would send the reader looking in the wrong place) |
 | `the stage failed on resource <name>` | the task ended FAILED / non-zero **and** a poll had confirmed the placement (`member_id`) |
 | `the stage failed` | the task ended FAILED / non-zero before any poll named a member — the resource on the record is still the advisory one |
@@ -109,8 +112,12 @@ dispatchers or plugins:
 
 Whatever ORBIT actually said (a task's `error`, a plugin's `detail`, an
 exception) is kept in the sibling **`detail`** field and in the log — never
-in `reason`. `StageRun.to_dict()` also exposes `reason` as `error` for the
-Explorer module. Keep new failure paths inside this set.
+in `reason`. The one thing that crosses over is the 409's per-member texts:
+they are the federation's own words *about resources* (`gpus 0 < 1`,
+`software missing: pytorch`), they carry no ORBIT vocabulary, and without
+them the screen says only that nothing matched. `StageRun.to_dict()` also
+exposes `reason` as `error` for the Explorer module. Keep new failure paths
+inside this set.
 
 ### Results
 
@@ -175,7 +182,15 @@ further JSON ones — are listed under `files[stage]` by name and size only.
      is written.
 4. **Finish.** A stage failure fails its workflow (`reason` kept) and skips
    its remaining stages; other workflows carry on. The campaign is `DONE`
-   when every workflow is, `FAILED`/`CANCELED` otherwise. An orderly
+   when every workflow is, `FAILED`/`CANCELED` otherwise. A campaign that
+   ends `FAILED`/`CANCELED` from that roll-up and has no reason of its own
+   takes one from its workflows: their shared reason **verbatim** (so the
+   card reads `stage 'md': no resources have joined the federation yet`),
+   or `N of M workflows failed` when they disagree — the card and
+   `atomic-campaign status` show the *campaign's* reason, so a campaign
+   that failed only because its workflows did has to repeat what they
+   said. A reason set by cancel, interrupt or the driver always wins, and
+   `DONE` still clears any reason a late cancel left behind. An orderly
    service shutdown stamps every unfinished campaign `INTERRUPTED` *before*
    cancelling its driver, so a restart shows "interrupted", not "stopped" —
    nobody asked for it to stop.
@@ -262,7 +277,10 @@ stay numbers. Connection flags are the shared `--broker` / `--token` /
 `status` prints one row per workflow — id, parameters, state, and the
 per-stage `stage:STATE@resource/member` chips (the placement is the one
 the last poll reported; a stage the class pool has not placed yet shows
-neither). `--wait` polls until the campaign
+neither). The campaign's own `reason` is printed above the table, and each
+`FAILED`/`CANCELED` workflow gets one indented `  wf-000: <reason>` line
+below it — prose in a fifth column would push the placements off a demo
+screen. `--wait` polls until the campaign
 is terminal; `--timeout SEC` bounds the wait so a script never hangs.
 
 Exit codes: `0` success · `1` error or a campaign that did not finish
