@@ -78,6 +78,9 @@ usage: broker.sh [--resource local|r3] [options]
                      or 'local').  'local' = the laptop (127.0.0.1:8010),
                      'r3' = the distributed run's broker host.
 
+  --keep-state       keep the federation, campaign and results state of
+                     the previous run (default: a fresh broker starts with
+                     an empty federation -- resources re-join).
   --skip-install     do not touch the venv at all (fast iteration; the
                      first run on a host must install)
   --reinstall        pip install both packages even when the venv's stamp
@@ -100,6 +103,8 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+KEEP_STATE=0
+
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -107,6 +112,7 @@ parse_args() {
                             # already consumed, before env.sh was sourced
                             case "$1" in --resource) shift 2 ;; *) shift ;; esac
                             ;;
+            --keep-state)   KEEP_STATE=1; shift ;;
             --skip-install) ATOMIC_DEMO_SKIP_INSTALL=1; shift ;;
             --reinstall)    ATOMIC_DEMO_REINSTALL=1   ; shift ;;
             --plugins)      [ $# -ge 2 ] || demo_die '--plugins needs a value'
@@ -169,25 +175,42 @@ step_install() {
 # and stale sessions are replayed at broker start -- so move it aside.
 step_isolate_state() {
     local src="$ATOMIC_DEMO_DISPATCHER_STATE"
-
-    if [ ! -d "$src" ]; then
-        demo_log 'state   : no dispatcher state to back up'
-        mkdir -p "$src"
-        return 0
-    fi
-
-    if [ -z "$(ls -A "$src" 2> /dev/null || true)" ]; then
-        demo_log 'state   : dispatcher state already empty'
-        return 0
-    fi
-
     local bak="$RUN_DIR/state.bak-$(date '+%Y%m%d-%H%M%S')"
 
-    mv "$src" "$bak"
-    mkdir -p "$src"
-    printf '%s\n' "$bak" > "$ATOMIC_DEMO_STATE_BAK"
+    if [ -d "$src" ] && [ -n "$(ls -A "$src" 2> /dev/null || true)" ]; then
+        mv "$src" "$bak"
+        mkdir -p "$src"
+        printf '%s\n' "$bak" > "$ATOMIC_DEMO_STATE_BAK"
+        demo_log "state   : dispatcher state moved to $bak (down.sh restores it)"
+    else
+        demo_log 'state   : no dispatcher state to back up'
+        mkdir -p "$src"
+    fi
 
-    demo_log "state   : dispatcher state moved to $bak (down.sh restores it)"
+    # The demo's own state -- federation records, campaigns, results --
+    # persists across broker restarts by design (restart replay).  For a
+    # demo that is the wrong default: a resource whose endpoint died with
+    # the old broker comes back as 'lost' and a campaign list full of
+    # yesterday's runs is not a clean screen.  Moved aside, kept for
+    # forensics, never restored.  --keep-state opts out.
+    if [ "$KEEP_STATE" -eq 1 ]; then
+        demo_log 'state   : keeping federation/campaign/results state (--keep-state)'
+        return 0
+    fi
+
+    local d moved=0
+    for d in "$RADICAL_ORBIT_FEDERATION_STATE" "$ATOMIC_CAMPAIGN_STATE" \
+             "$ATOMIC_STORE_ROOT"; do
+        [ -d "$d" ] && [ -n "$(ls -A "$d" 2> /dev/null || true)" ] || continue
+        mkdir -p "$bak/demo"
+        mv "$d" "$bak/demo/$(basename "$d")"
+        moved=1
+    done
+    mkdir -p "$RADICAL_ORBIT_FEDERATION_STATE" "$ATOMIC_CAMPAIGN_STATE" \
+             "$ATOMIC_STORE_ROOT"
+    if [ "$moved" -eq 1 ]; then
+        demo_log "state   : federation/campaign/results of the previous run moved to $bak/demo (fresh federation; --keep-state keeps it)"
+    fi
 }
 
 # --------------------------------------------------------------------------
