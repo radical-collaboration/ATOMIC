@@ -169,6 +169,15 @@ esac
 export ATOMIC_DEMO_ORBIT_REPO  ATOMIC_DEMO_ORBIT_REF
 export ATOMIC_DEMO_ATOMIC_REPO ATOMIC_DEMO_ATOMIC_REF
 export ATOMIC_DEMO_HOME ATOMIC_DEMO_SRC ATOMIC_DEMO_FORCE_CLONE
+
+# On a site with a demo home, keep radical.orbit's psij tree (job launch
+# scripts, stdout/stderr capture) there as well: it defaults to $HOME,
+# and a full Perlmutter home made every pilot submit fail with "Disk
+# quota exceeded" (2026-09-08) -- silently, from the user's point of view.
+if [ -n "$ATOMIC_DEMO_HOME" ]; then
+    : "${RADICAL_ORBIT_PSIJ_DIR:=$ATOMIC_DEMO_HOME/psij}"
+    export RADICAL_ORBIT_PSIJ_DIR
+fi
 export ATOMIC_DEMO_PYTHON
 export ATOMIC_DEMO_PYTHON_MODULE
 export ATOMIC_DEMO_PIP_PINS
