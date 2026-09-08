@@ -875,7 +875,8 @@ def load_demo_env(env_sh: Optional[str] = None) -> List[str]:
 
     try:
         proc = subprocess.run(
-            ['bash', '-c', 'source "$1" > /dev/null 2>&1; env -0', '_', env_sh],
+            ['bash', '-c', 'source "$1" "$2" > /dev/null 2>&1; env -0',
+             '_', env_sh, os.environ.get('ATOMIC_DEMO_RESOURCE', 'local')],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
     except (OSError, subprocess.SubprocessError) as e:
         warn('could not read %s (%s) -- pass --broker explicitly' % (env_sh, e))

@@ -68,3 +68,21 @@ Branches: radical.orbit `feature/atomic-federation`, atomic `feature/demo-wm`. N
 - 2026-09-07 18:15 merge-resolution review: PR-ready; 2 cleanups committed + pushed (#125 updated). Tuesday prerequisites recorded in demo/local/README: remote members need shared_fs=false + explicit scratch_base; use allocation mode (psij executor detected on the broker host). PR watches armed (#123 #124 #125).
 - 2026-09-07 21:14 PR watches: no review activity on #123/#124/#125 all evening; letting the watches expire overnight instead of re-arming (re-arm on the next "continue").
 - 2026-09-08 00:35 demo/local split into broker.sh / join.sh / submit.sh (+ up.sh orchestrator); automated + manual paths verified.
+
+## 2026-09-08 — demo harness: self-installing pinned stack, resource selector, Odo
+
+- `demo/2026_09_08/env.sh` pins `radical.orbit@feature/atomic-federation` and
+  `ATOMIC@feature/demo-wm`; `ensure_stack` uses a clean pinned checkout if
+  present, otherwise clones under `/tmp/atomic-demo/src`, `git pull --ff-only`
+  per run, reinstalls only when the commit changed (stamp in the venv) or
+  `--reinstall`. Trigger: broker on host three died with "No plugin matches
+  'federation'" because it installed from a checkout on the wrong branch.
+- Single resource selector (`local|local_a|local_b|local_c|r3|perlmutter|odo`)
+  passed through all role scripts; `$SLURM_JOB_ID` picks allocation vs login
+  mode; Bridges replaced by Odo; `TODO(...)` placeholders for real
+  queue/account/scratch (join refuses until filled).
+- Fixed: pilot-wait list was hard-pinned to `local_a` for every resource.
+- README opens with the presentation-facing overview (slides link, steps↔slides
+  table, real vs simulated).
+- Verified: fast path cycle DONE in 78 s; forced fresh-venv clone 94 s, rerun
+  7 s "up to date"; wrong-branch checkout refused; 57 helper tests pass.

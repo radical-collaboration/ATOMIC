@@ -1,14 +1,30 @@
 # shellcheck shell=bash
 #
-# demo/2026_09_08/env.sh -- environment for the ATOMIC WM localhost demo.
+# demo/2026_09_08/env.sh -- environment for the ATOMIC WM demo.
 #
-#   source demo/2026_09_08/env.sh
+#   source demo/2026_09_08/env.sh [RESOURCE]
 #
-# Sourced by every script in demo/2026_09_08/ -- the per-role ones
-# (broker.sh, join.sh, submit.sh), the orchestrator (up.sh), down.sh and
-# check_env.sh -- and meant to be sourced into an interactive shell as
-# well: after that, `atomic-resources`, `atomic-campaign ...` and friends
-# talk to the demo broker without any further flags.
+# ONE positional parameter: the resource this shell is about.  Known
+# names, and what each of them means:
+#
+#   local                the laptop broker host (the default)
+#   local_a local_b local_c   the laptop demo's three fake resources
+#   r3                   the Rutgers workstation -- also the broker host
+#                        of the distributed run
+#   perlmutter           NERSC
+#   odo                  OLCF's Slurm test system
+#
+# Nobody is expected to source this by hand: the role scripts do it, and
+# each of them takes the resource from its own command line --
+# `join.sh <resource>`, `broker.sh|submit.sh|down.sh|check_env.sh
+# --resource <name>` -- or from $ATOMIC_DEMO_RESOURCE, defaulting to
+# `local`.  Sourcing it into an interactive shell works too, and after
+# that `atomic-resources`, `atomic-campaign ...` and friends talk to that
+# resource's broker without any further flags.
+#
+# The name decides: the broker URL, the site, the scratch base, which
+# resources are joinable from this host, and the `atomic-join` arguments.
+# Everything else in this file is the same everywhere.
 #
 # This file is the single home of the demo's environment *and* of the
 # bash helpers more than one of those scripts needs; nothing below is
@@ -19,16 +35,20 @@
 #
 #   * PATH must carry $VE/bin so psij-launched pilots resolve
 #     `radical-orbit-endpoint-wrapper.sh` by name,
-#   * PYTHONPATH must carry $ORBIT_SRC/src so broker/endpoint/clients run
-#     the feature branch (it does NOT reach pilots -- they run the code
-#     `up.sh` installs into ve3),
 #   * RADICAL_LOG_LVL must be unset (the user's shell exports DEBUG_9,
 #     which the endpoint's --log-level rejects); use RADICAL_ORBIT_LOG_LVL,
 #   * RADICAL_ORBIT_LOG_FILE must not be exported (pilots would inherit it),
 #   * TLS is mandatory even for a --no-auth broker.
 #
+# There is deliberately NO `PYTHONPATH=$ORBIT_SRC/src` any more: every
+# role -- broker, endpoints, pilots, CLIs -- runs the *installed*
+# packages, so all of them run the same pinned code.  See "the pinned
+# software stack" below.
+#
 # Deliberately no `set -euo pipefail` here: this file is sourced, and a
-# stray non-zero return must not kill an interactive shell.
+# stray non-zero return must not kill an interactive shell.  Nothing here
+# installs, clones or starts anything at source time -- `ensure_stack`
+# does that, and only the role scripts call it.
 
 # --------------------------------------------------------------------------
 # locations
@@ -40,12 +60,97 @@ else
     ATOMIC_DEMO_DIR="$(cd "$(dirname "$0")" > /dev/null && pwd)"
 fi
 
-# repo roots -- override ORBIT_SRC/VE before sourcing to point elsewhere
+# The atomic checkout these scripts live in.  It is a *candidate* install
+# source (see ensure_stack), never an implicit one: if it is not on the
+# pinned ref, the pinned ref is cloned and installed instead.
 ATOMIC_SRC="$(cd "$ATOMIC_DEMO_DIR/../.." > /dev/null && pwd)"
-: "${ORBIT_SRC:=/home/merzky/radical/radical.orbit}"
-: "${VE:=$ORBIT_SRC/ve3}"
 
-export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC VE
+# likewise for radical.orbit -- override ORBIT_SRC to point elsewhere
+: "${ORBIT_SRC:=/home/merzky/radical/radical.orbit}"
+
+export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
+
+# --------------------------------------------------------------------------
+# the pinned software stack
+# --------------------------------------------------------------------------
+#
+# THIS is the demo stack.  The demo does not run "whatever happens to be
+# checked out on this host" -- it runs these two refs, on the broker host,
+# on every resource host, and on the laptop.  The demo date directory
+# (demo/2026_09_08/) is the pin: when the refs move on, a later demo gets
+# its own directory rather than this one silently changing meaning.
+#
+# On 2026-09-08 the broker host "three" had radical.orbit checked out on
+# `devel`, the old broker.sh installed *that*, and the broker died with
+# "No plugin matches 'federation'".  Hence: pins, and an install that
+# ignores a checkout which is not on the pinned ref.
+#
+# Both refs are pushed.  Override the *_REPO variables to switch transport
+# (no ssh key on the host -> use https):
+#
+#   ATOMIC_DEMO_ORBIT_REPO=https://github.com/radical-cybertools/radical.orbit.git
+#   ATOMIC_DEMO_ATOMIC_REPO=https://github.com/radical-cybertools/ATOMIC.git
+#
+# A leading `git+` (pip's spelling) is accepted and stripped for git.
+
+: "${ATOMIC_DEMO_ORBIT_REPO:=git+ssh://git@github.com/radical-cybertools/radical.orbit.git}"
+: "${ATOMIC_DEMO_ORBIT_REF:=feature/atomic-federation}"
+
+: "${ATOMIC_DEMO_ATOMIC_REPO:=git+ssh://git@github.com/radical-cybertools/ATOMIC.git}"
+: "${ATOMIC_DEMO_ATOMIC_REF:=feature/demo-wm}"
+
+# Pinned PyPI requirements installed on top of the two git refs.
+#
+# radical.orbit's requirements.txt asks for a bare `rhapsody-py`, so a
+# fresh venv gets the newest release (0.5.0) -- and rhapsody does not
+# declare its opentelemetry dependency at all.  Either way a pilot's
+# session init then dies with "No module named 'opentelemetry'" and every
+# task FAILS; the laptop venv only worked because something else had
+# pulled opentelemetry in.  So both are pinned to what this demo was
+# validated with.  Found on 2026-09-08, building a venv from scratch.
+: "${ATOMIC_DEMO_PIP_PINS:=rhapsody-py==0.4.0 opentelemetry-sdk==1.43.0}"
+
+# where ensure_stack keeps its own clones of the two pinned refs.  They
+# are a *cache*: cloned once, `git pull --ff-only` on every run, and
+# re-installed only when HEAD moved.  `down.sh --wipe` keeps them.
+: "${ATOMIC_DEMO_SRC:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}/src}"
+
+# 1 = ignore a local checkout even when it is clean and on the pinned ref,
+# and always install from the clone (what a fresh host does anyway)
+: "${ATOMIC_DEMO_FORCE_CLONE:=0}"
+
+# interpreter used to *create* the venv (>= 3.10); ignored once it exists
+: "${ATOMIC_DEMO_PYTHON:=python3}"
+
+export ATOMIC_DEMO_ORBIT_REPO  ATOMIC_DEMO_ORBIT_REF
+export ATOMIC_DEMO_ATOMIC_REPO ATOMIC_DEMO_ATOMIC_REF
+export ATOMIC_DEMO_SRC ATOMIC_DEMO_FORCE_CLONE ATOMIC_DEMO_PYTHON
+export ATOMIC_DEMO_PIP_PINS
+
+# --------------------------------------------------------------------------
+# the venv -- the one place the pinned stack is installed
+# --------------------------------------------------------------------------
+#
+# Default: the orbit venv when this host has one (the laptop), a venv of
+# the demo's own otherwise (any other host).  ensure_stack creates it if
+# it is missing.  $VE is the older name of the same thing and still works.
+
+if [ -n "${VE:-}" ]; then
+    : "${ATOMIC_DEMO_VE:=$VE}"
+fi
+
+if [ -z "${ATOMIC_DEMO_VE:-}" ]; then
+    if [ -d "$ORBIT_SRC/ve3" ]; then ATOMIC_DEMO_VE="$ORBIT_SRC/ve3"
+    else                             ATOMIC_DEMO_VE="$HOME/.atomic-demo/ve"
+    fi
+fi
+
+VE="$ATOMIC_DEMO_VE"
+
+export ATOMIC_DEMO_VE VE
+
+# the record of what ensure_stack put into that venv
+ATOMIC_DEMO_STAMP="$VE/atomic-demo.stamp"
 
 # --------------------------------------------------------------------------
 # helpers (prefixed: this file lands in interactive shells)
@@ -106,6 +211,32 @@ demo_prepend_path() {
 
     if [ -z "$cur" ]; then eval "export $var=\"\$val\""
     else                   eval "export $var=\"\$val:\$cur\""
+    fi
+}
+
+# demo_drop_path VAR VALUE -- remove VALUE from a ':'-list, if present.
+# Used on PYTHONPATH: a shell that still carries $ORBIT_SRC/src would
+# shadow the *installed* radical.orbit with a checkout of unknown branch,
+# which is precisely the failure this demo directory was pinned against.
+demo_drop_path() {
+    local var="$1" val="$2" cur='' out='' part=''
+
+    eval "cur=\${$var:-}"
+
+    [ -n "$cur" ] || return 0
+
+    local IFS=':'
+    for part in $cur; do
+        [ "$part" = "$val" ] && continue
+        [ -z "$part" ]       && continue
+        if [ -z "$out" ]; then out="$part"
+        else                   out="$out:$part"
+        fi
+    done
+    unset IFS
+
+    if [ -z "$out" ]; then eval "unset $var"
+    else                   eval "export $var=\"\$out\""
     fi
 }
 
@@ -180,28 +311,159 @@ demo_mkdirs() {
              "$ATOMIC_STORE_ROOT"              \
              "$ATOMIC_WM_STATE"
 
+    # an unresolved scratch base is a TODO, not a directory name
+    case "$ATOMIC_DEMO_SCRATCH_BASE" in
+        *'TODO('*) return 0 ;;
+    esac
+
     for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
-        mkdir -p "$ATOMIC_DEMO_TMP/$name"
+        mkdir -p "$ATOMIC_DEMO_SCRATCH_BASE/$name"
     done
 }
+
+# --------------------------------------------------------------------------
+# which resource is this shell about?
+# --------------------------------------------------------------------------
+#
+# `source env.sh RESOURCE`, $ATOMIC_DEMO_RESOURCE, or `local`.  The role
+# scripts pass their own `--resource` (join.sh: its positional resource)
+# straight through, so the name reaches here from one place only.
+#
+# Mode is *detected*, never configured: $SLURM_JOB_ID set means this
+# shell is inside an allocation, so the endpoint IS the resource ->
+# `allocation` mode, one implicit member, its pilot starts at join.
+# Unset means a login node -> `login` mode, one member per pilot shape,
+# pilots submitted on demand.  local_* and r3 have a fixed mode by
+# nature (fake resources on a laptop / a workstation with no batch
+# system); the detection drives perlmutter and odo.
+
+ATOMIC_DEMO_KNOWN='local local_a local_b local_c r3 perlmutter odo'
+
+# a sourced *path* is not a resource name (smoke.py sources this file)
+case "${1:-}" in
+    ''|*/*|*.sh) : ;;
+    *)           ATOMIC_DEMO_RESOURCE="$1" ;;
+esac
+
+: "${ATOMIC_DEMO_RESOURCE:=local}"
+
+case " $ATOMIC_DEMO_KNOWN " in
+    *" $ATOMIC_DEMO_RESOURCE "*) : ;;
+    *) demo_warn "unknown resource '$ATOMIC_DEMO_RESOURCE' -- known:" \
+                 "$ATOMIC_DEMO_KNOWN; falling back to 'local'"
+       ATOMIC_DEMO_RESOURCE='local' ;;
+esac
+
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    ATOMIC_DEMO_MODE='allocation'
+    ATOMIC_DEMO_MODE_WHY="inside a Slurm allocation (SLURM_JOB_ID=$SLURM_JOB_ID)"
+else
+    ATOMIC_DEMO_MODE='login'
+    ATOMIC_DEMO_MODE_WHY='no SLURM_JOB_ID -- this looks like a login node'
+fi
+
+case "$ATOMIC_DEMO_RESOURCE" in
+
+    # the laptop: three fake resources against a loopback broker.  Their
+    # modes are baked into demo_join_args (local_a allocation, local_b and
+    # local_c login) -- the detection above does not apply to them.
+    local|local_a|local_b|local_c)
+        ATOMIC_DEMO_HOST='laptop'
+        ATOMIC_DEMO_SITE='Rutgers'
+        ATOMIC_DEMO_RESOURCES=(local_a local_b local_c)
+        ATOMIC_DEMO_PILOT_RESOURCES=(local_a)
+        : "${ATOMIC_DEMO_BROKER_HOST:=127.0.0.1}"
+        : "${ATOMIC_DEMO_SCRATCH_BASE:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}"
+        ;;
+
+    # the Rutgers workstation.  It hosts the broker of the distributed
+    # run, and joins itself as a resource -- a workstation with no batch
+    # system, so allocation mode regardless of what was detected.
+    r3) ATOMIC_DEMO_HOST='r3'
+        ATOMIC_DEMO_SITE='Rutgers'
+        ATOMIC_DEMO_MODE='allocation'
+        ATOMIC_DEMO_MODE_WHY='r3 is a workstation -- the endpoint is the resource'
+        ATOMIC_DEMO_RESOURCES=(r3)
+        ATOMIC_DEMO_PILOT_RESOURCES=(r3)
+        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        : "${ATOMIC_DEMO_SCRATCH_BASE:=${ATOMIC_DEMO_TMP:-/tmp/atomic-demo}}"
+        ;;
+
+    perlmutter)
+        ATOMIC_DEMO_HOST='perlmutter'
+        ATOMIC_DEMO_SITE='NERSC'
+        ATOMIC_DEMO_RESOURCES=(perlmutter)
+        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        if   [ -n "${PSCRATCH:-}" ]; then
+            : "${ATOMIC_DEMO_SCRATCH_BASE:=$PSCRATCH/atomic-demo}"
+        elif [ -n "${SCRATCH:-}" ]; then
+            : "${ATOMIC_DEMO_SCRATCH_BASE:=$SCRATCH/atomic-demo}"
+        else
+            : "${ATOMIC_DEMO_SCRATCH_BASE:=TODO(neither \$PSCRATCH nor \$SCRATCH is set -- give the Perlmutter scratch path)}"
+        fi
+        ;;
+
+    odo) ATOMIC_DEMO_HOST='odo'
+        ATOMIC_DEMO_SITE='OLCF'
+        ATOMIC_DEMO_RESOURCES=(odo)
+        : "${ATOMIC_DEMO_BROKER_HOST:=r3}"
+        # OLCF hands out $MEMBERWORK/<project> on Lustre; without it we
+        # cannot guess the project, so say so rather than guess
+        if [ -n "${MEMBERWORK:-}" ]; then
+            : "${ATOMIC_DEMO_SCRATCH_BASE:=$MEMBERWORK/atomic-demo}"
+        else
+            : "${ATOMIC_DEMO_SCRATCH_BASE:=TODO(Odo Lustre scratch, e.g. /lustre/orion/<project>/scratch/\$USER/atomic-demo)}"
+        fi
+        ;;
+esac
+
+# Resources that must show a live pilot before the smoke test starts.
+# An allocation-mode join starts its pilot right away; a login-mode
+# member has min_pilots=0 and only starts one when the first task
+# arrives, so it is never waited for.  The laptop and r3 set this
+# themselves above.
+if [ -z "${ATOMIC_DEMO_PILOT_RESOURCES+set}" ]; then
+    if [ "$ATOMIC_DEMO_MODE" = 'allocation' ]; then
+        ATOMIC_DEMO_PILOT_RESOURCES=("${ATOMIC_DEMO_RESOURCES[@]}")
+    else
+        ATOMIC_DEMO_PILOT_RESOURCES=()
+    fi
+fi
+
+export ATOMIC_DEMO_RESOURCE ATOMIC_DEMO_HOST ATOMIC_DEMO_SITE
+export ATOMIC_DEMO_MODE ATOMIC_DEMO_SCRATCH_BASE
+
+# say it out loud away from the laptop, where it is the whole question
+case "$ATOMIC_DEMO_HOST" in
+    laptop) : ;;
+    *)      demo_log "resource: $ATOMIC_DEMO_RESOURCE" \
+                     "(host $ATOMIC_DEMO_HOST, site $ATOMIC_DEMO_SITE)"
+            demo_log "mode    : $ATOMIC_DEMO_MODE --" \
+                     "$ATOMIC_DEMO_MODE_WHY"
+            demo_log "scratch : $ATOMIC_DEMO_SCRATCH_BASE" ;;
+esac
 
 # --------------------------------------------------------------------------
 # interpreter / path
 # --------------------------------------------------------------------------
 
-demo_prepend_path PATH       "$VE/bin"
-demo_prepend_path PYTHONPATH "$ORBIT_SRC/src"
+demo_prepend_path PATH "$VE/bin"
+
+demo_drop_path PYTHONPATH "$ORBIT_SRC/src"
+demo_drop_path PYTHONPATH "$ATOMIC_SRC/src"
 
 # --------------------------------------------------------------------------
 # broker
 # --------------------------------------------------------------------------
 
-# a non-default port: the user's own brokers live on 8000/8003
-: "${ATOMIC_DEMO_BROKER_HOST:=127.0.0.1}"
+# $ATOMIC_DEMO_BROKER_HOST is set per resource above: 127.0.0.1 on the
+# laptop, the r3 host name everywhere else (the distributed run's broker
+# lives on r3).  Set it once in your environment to point elsewhere.
+# A non-default port: the user's own brokers live on 8000/8003.
 : "${ATOMIC_DEMO_BROKER_PORT:=8010}"
 
 # the advertised broker URL is the literal bind host -- 0.0.0.0 would
-# advertise the FQDN to pilots, so bind to 127.0.0.1 and say so
+# advertise the FQDN to pilots, so bind to a routable name and say so
 export ATOMIC_DEMO_BROKER_HOST ATOMIC_DEMO_BROKER_PORT
 export RADICAL_ORBIT_BROKER_URL="https://$ATOMIC_DEMO_BROKER_HOST:$ATOMIC_DEMO_BROKER_PORT"
 export RADICAL_ORBIT_BROKER_CERT="$HOME/.radical/orbit/broker_cert.pem"
@@ -266,7 +528,7 @@ export RUN_DIR="$ATOMIC_DEMO_DIR/run"
 
 ATOMIC_DEMO_BROKER_LOG="$RUN_DIR/broker.log"
 ATOMIC_DEMO_BROKER_PID="$RUN_DIR/broker.pid"
-ATOMIC_DEMO_PIP_LOG="$RUN_DIR/pip.log"
+ATOMIC_DEMO_INSTALL_LOG="$RUN_DIR/install.log"
 ATOMIC_DEMO_SMOKE_LOG="$RUN_DIR/smoke.log"
 
 # pointer file written by up.sh, read by down.sh
@@ -277,6 +539,316 @@ ATOMIC_DEMO_STATE_BAK="$RUN_DIR/state.bak.latest"
 # variable itself is overridable so the harness can be exercised without
 # touching a live dispatcher's state.
 : "${ATOMIC_DEMO_DISPATCHER_STATE:=$HOME/.radical/orbit/task_dispatcher/state}"
+
+# --------------------------------------------------------------------------
+# ensure_stack -- put the pinned stack into $VE, on any host
+# --------------------------------------------------------------------------
+#
+# Called by broker.sh, join.sh and submit.sh (and, through broker.sh, by
+# up.sh).  All four take `--skip-install`; the three role scripts also
+# take `--reinstall`.
+#
+# Per package, in order:
+#
+#   1. a local checkout ($ORBIT_SRC for radical.orbit, the checkout these
+#      scripts live in for atomic-wm) is used only if it is on the pinned
+#      ref AND has no modified tracked files AND ATOMIC_DEMO_FORCE_CLONE
+#      is not 1.  It is never fetched, checked out, stashed or otherwise
+#      touched -- it is the developer's working tree, not ours,
+#   2. otherwise the pinned ref is cloned into $ATOMIC_DEMO_SRC/<repo>
+#      (once) and `git pull --ff-only`ed (every run).  A pull that fails
+#      -- no network on a login node -- is a warning, not an error: the
+#      clone on disk is still a pinned stack,
+#   3. the resolved commit is compared against $VE/atomic-demo.stamp and
+#      pip runs only if it moved (or the venv lacks the package, or
+#      --reinstall).  That is the fast path: an unchanged stack costs one
+#      `git pull` and one `git rev-parse` per package.
+#
+# Everything goes into $RUN_DIR/install.log.
+
+# demo_git_url URL -- pip's `git+<url>` spelling turned into a git URL
+demo_git_url() {
+    printf '%s\n' "${1#git+}"
+}
+
+# demo_stamp_get PKG FIELD -- the recorded value, empty when unknown
+demo_stamp_get() {
+    local pkg="${1//./\\.}" field="$2"
+
+    [ -f "$ATOMIC_DEMO_STAMP" ] || return 0
+
+    sed -n "s/^$pkg $field=\\(.*\\)\$/\\1/p" "$ATOMIC_DEMO_STAMP" | tail -n 1
+}
+
+# demo_stamp_put PKG REF COMMIT SOURCE -- record what was just installed
+demo_stamp_put() {
+    local pkg="$1" ref="$2" commit="$3" src="$4"
+    local re="${pkg//./\\.}" tmp="$ATOMIC_DEMO_STAMP.$$"
+
+    if [ -f "$ATOMIC_DEMO_STAMP" ]; then
+        grep -v "^$re " "$ATOMIC_DEMO_STAMP" > "$tmp" 2> /dev/null || true
+    else
+        : > "$tmp"
+    fi
+
+    printf '%s ref=%s\n%s commit=%s\n%s source=%s\n%s stamped=%s\n' \
+           "$pkg" "$ref"    "$pkg" "$commit" \
+           "$pkg" "$src"    "$pkg" "$(date '+%Y-%m-%dT%H:%M:%S')" >> "$tmp"
+
+    mv "$tmp" "$ATOMIC_DEMO_STAMP"
+}
+
+# demo_pkg_installed PKG -- 0 if $VE holds the package's console entry point
+demo_pkg_installed() {
+    case "$1" in
+        radical.orbit) [ -f "$VE/bin/radical-orbit-broker.py" ] ;;
+        atomic-wm)     [ -x "$VE/bin/atomic-join" ]             ;;
+        *)             return 1                                 ;;
+    esac
+}
+
+# demo_ensure_venv -- create $VE if it is missing (python >= 3.10)
+demo_ensure_venv() {
+    local python="$ATOMIC_DEMO_PYTHON" have=''
+
+    [ -x "$VE/bin/python" ] && return 0
+
+    command -v "$python" > /dev/null 2>&1 \
+        || demo_die "no python found ('$python') -- set \$ATOMIC_DEMO_PYTHON"
+
+    if ! "$python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
+    then
+        have="$("$python" -V 2>&1 | cut -d' ' -f2)"
+        demo_die "$python is ${have:-too old}, but the demo stack needs" \
+                 'python >= 3.10 -- load a newer python module or set' \
+                 '$ATOMIC_DEMO_PYTHON'
+    fi
+
+    demo_log "venv    : creating $VE ($("$python" -V 2>&1))"
+
+    "$python" -m venv "$VE" \
+        || demo_die "could not create $VE -- is python3-venv installed?"
+
+    "$VE/bin/python" -m pip install --quiet --upgrade pip setuptools wheel \
+        >> "$ATOMIC_DEMO_INSTALL_LOG" 2>&1 \
+        || demo_warn 'could not upgrade pip/setuptools/wheel -- continuing'
+}
+
+# demo_checkout_usable PATH REF -- 0 if PATH is a git checkout sitting on
+# REF with no modified tracked files.  Reads only; sets DEMO_CHECKOUT_WHY
+# to the reason when the answer is no.
+demo_checkout_usable() {
+    local path="$1" ref="$2" branch=''
+
+    DEMO_CHECKOUT_WHY=''
+
+    if [ "${ATOMIC_DEMO_FORCE_CLONE:-0}" = '1' ]; then
+        DEMO_CHECKOUT_WHY='ATOMIC_DEMO_FORCE_CLONE=1'
+        return 1
+    fi
+
+    if [ -z "$path" ] || ! git -C "$path" rev-parse --git-dir > /dev/null 2>&1
+    then
+        DEMO_CHECKOUT_WHY="no git checkout at ${path:-<unset>}"
+        return 1
+    fi
+
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2> /dev/null || true)"
+
+    if [ "$branch" != "$ref" ]; then
+        DEMO_CHECKOUT_WHY="$path is on '${branch:-?}', the demo pins '$ref'"
+        return 1
+    fi
+
+    if [ -n "$(git -C "$path" status --porcelain --untracked-files=no \
+               2> /dev/null)" ]; then
+        DEMO_CHECKOUT_WHY="$path has uncommitted changes to tracked files"
+        return 1
+    fi
+
+    return 0
+}
+
+# demo_clone DIR REPO REF -- make DIR a clone of REPO on REF, up to date.
+# Clones once, pulls afterwards; a failing pull is survivable, a failing
+# first clone is not.
+demo_clone() {
+    local dir="$1" repo="$2" ref="$3" url='' branch=''
+
+    url="$(demo_git_url "$repo")"
+
+    # a clone left over from a different pin is not this pin's clone
+    if git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
+
+        branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2> /dev/null || true)"
+
+        if [ "$branch" != "$ref" ]; then
+            demo_log "clone   : $dir is on '${branch:-?}' -- re-cloning '$ref'"
+            rm -rf "$dir"
+        fi
+    fi
+
+    if ! git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
+
+        rm -rf "$dir"
+        mkdir -p "$(dirname "$dir")"
+
+        demo_log "clone   : $url @ $ref -> $dir"
+
+        git clone --quiet --branch "$ref" "$url" "$dir" \
+            >> "$ATOMIC_DEMO_INSTALL_LOG" 2>&1 \
+            || demo_die "could not clone $url @ $ref into $dir" \
+                        "(see $ATOMIC_DEMO_INSTALL_LOG) -- no ssh key on this" \
+                        'host?  Set the *_REPO variable to an https URL,' \
+                        'see demo/2026_09_08/env.sh'
+        return 0
+    fi
+
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no \
+               2> /dev/null)" ]; then
+        demo_warn "$dir has local modifications -- not pulling"
+        return 0
+    fi
+
+    if git -C "$dir" pull --ff-only --quiet \
+           >> "$ATOMIC_DEMO_INSTALL_LOG" 2>&1; then
+        demo_log "pull    : $dir up to date with $ref"
+        return 0
+    fi
+
+    demo_warn "git pull in $dir failed (network? diverged?) -- continuing" \
+              "with the commit already checked out there"
+}
+
+# demo_ensure_component PKG REPO REF CHECKOUT EXTRA CLONE_DIR
+demo_ensure_component() {
+    local pkg="$1" repo="$2" ref="$3" checkout="$4" extra="$5" clone="$6"
+    local src='' kind='' commit='' short=''
+
+    if demo_checkout_usable "$checkout" "$ref"; then
+        src="$checkout"
+        kind='checkout'
+    else
+        demo_log "source  : $pkg -- $DEMO_CHECKOUT_WHY"
+        demo_clone "$clone" "$repo" "$ref"
+        src="$clone"
+        kind='clone'
+    fi
+
+    commit="$(git -C "$src" rev-parse HEAD 2> /dev/null || true)"
+
+    [ -n "$commit" ] || demo_die "cannot read HEAD of $src"
+
+    short="${commit:0:12}"
+
+    DEMO_STACK_COMMITS="$DEMO_STACK_COMMITS$pkg $ref $short $kind $src"$'\n'
+
+    if [ "${ATOMIC_DEMO_REINSTALL:-0}" != '1' ]                 \
+       && [ "$(demo_stamp_get "$pkg" ref)"    = "$ref" ]         \
+       && [ "$(demo_stamp_get "$pkg" commit)" = "$commit" ]      \
+       && [ "$(demo_stamp_get "$pkg" source)" = "$src" ]         \
+       && demo_pkg_installed "$pkg"; then
+
+        demo_log "install : $pkg up to date ($ref $short, $kind)"
+        return 0
+    fi
+
+    demo_log "install : $pkg from $kind $src ($ref $short)"
+
+    "$VE/bin/python" -m pip install --quiet --no-input "$src$extra" \
+        >> "$ATOMIC_DEMO_INSTALL_LOG" 2>&1 \
+        || demo_fail "pip install $pkg from $src$extra failed" \
+                     "$ATOMIC_DEMO_INSTALL_LOG"
+
+    demo_stamp_put "$pkg" "$ref" "$commit" "$src"
+}
+
+# demo_check_console_scripts -- the entry points the demo launches by name
+demo_check_console_scripts() {
+    local tool missing=''
+
+    for tool in atomic-join atomic-leave atomic-resources atomic-campaign \
+                atomic-fake-md atomic-fake-train; do
+        [ -x "$VE/bin/$tool" ] || missing="$missing $tool"
+    done
+
+    for tool in radical-orbit-broker.py radical-orbit-endpoint.py \
+                radical-orbit-endpoint-wrapper.sh; do
+        [ -f "$VE/bin/$tool" ] || missing="$missing $tool"
+    done
+
+    [ -z "$missing" ] \
+        || demo_fail "entry points missing after install:$missing" \
+                     "$ATOMIC_DEMO_INSTALL_LOG"
+}
+
+# ensure_stack -- the whole of the above, for both packages
+ensure_stack() {
+
+    if [ "${ATOMIC_DEMO_SKIP_INSTALL:-0}" = '1' ]; then
+        demo_log 'install : skipped (--skip-install)'
+        return 0
+    fi
+
+    DEMO_STACK_COMMITS=''
+
+    mkdir -p "$RUN_DIR"
+    printf '\n===== %s =====\n' "$(date '+%F %T')" \
+        >> "$ATOMIC_DEMO_INSTALL_LOG"
+
+    demo_ensure_venv
+
+    demo_ensure_component 'radical.orbit'                   \
+                          "$ATOMIC_DEMO_ORBIT_REPO"         \
+                          "$ATOMIC_DEMO_ORBIT_REF"          \
+                          "$ORBIT_SRC" ''                   \
+                          "$ATOMIC_DEMO_SRC/radical.orbit"
+
+    demo_ensure_component 'atomic-wm'                       \
+                          "$ATOMIC_DEMO_ATOMIC_REPO"        \
+                          "$ATOMIC_DEMO_ATOMIC_REF"         \
+                          "$ATOMIC_SRC" '[cli]'             \
+                          "$ATOMIC_DEMO_SRC/ATOMIC"
+
+    demo_ensure_pip_pins
+    demo_check_console_scripts
+}
+
+# demo_ensure_pip_pins -- the PyPI versions the demo was validated with.
+# Stamped like a package, so this is a no-op on the second run.
+demo_ensure_pip_pins() {
+    local pins="${ATOMIC_DEMO_PIP_PINS:-}"
+
+    [ -n "$pins" ] || return 0
+
+    if [ "${ATOMIC_DEMO_REINSTALL:-0}" != '1' ] \
+       && [ "$(demo_stamp_get 'pip-pins' ref)" = "$pins" ]; then
+        demo_log "install : pip pins up to date ($pins)"
+        return 0
+    fi
+
+    demo_log "install : pip pins $pins"
+
+    # shellcheck disable=SC2086
+    "$VE/bin/python" -m pip install --quiet --no-input $pins \
+        >> "$ATOMIC_DEMO_INSTALL_LOG" 2>&1 \
+        || demo_fail "pip install of the demo pins ($pins) failed" \
+                     "$ATOMIC_DEMO_INSTALL_LOG"
+
+    demo_stamp_put 'pip-pins' "$pins" '-' '-'
+}
+
+# demo_report_stack -- what ensure_stack resolved, one line per package
+demo_report_stack() {
+    local pkg ref short kind src
+
+    [ -n "${DEMO_STACK_COMMITS:-}" ] || return 0
+
+    while read -r pkg ref short kind src; do
+        [ -n "$pkg" ] || continue
+        demo_log "stack   : $pkg $ref @ $short ($kind $src)"
+    done <<< "$DEMO_STACK_COMMITS"
+}
 
 # --------------------------------------------------------------------------
 # the three local resources and their five members
@@ -312,7 +884,9 @@ ATOMIC_DEMO_STATE_BAK="$RUN_DIR/state.bak.latest"
 # The "GPU" is fake (psij `local`, rhapsody backend `concurrent`): only
 # the *declaration* matters for routing, and nothing reserves a GPU.
 
-ATOMIC_DEMO_RESOURCES=(local_a local_b local_c)
+# ATOMIC_DEMO_RESOURCES is set per resource name in "which resource is
+# this shell about?" above -- the laptop's three, or the one real
+# resource this host is.  join.sh accepts exactly those names.
 
 # demo_join_args NAME -- fills the array DEMO_JOIN_ARGS with the
 # `atomic-join` arguments for one resource (--detach is added by
@@ -329,7 +903,7 @@ demo_join_args() {
                      --kind       workstation
                      --declare    cores=4,gpus=0,mem_gb=8
                      --software   lammps
-                     --scratch    "$ATOMIC_DEMO_TMP/local_a") ;;
+                     --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/local_a") ;;
 
         local_b) DEMO_JOIN_ARGS=(
                      --name       local_b
@@ -338,7 +912,7 @@ demo_join_args() {
                      --kind       hpc
                      --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=lammps,pytorch,site=NERSC,mem_gb_per_node=16'
                      --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=NERSC,mem_gb_per_node=16'
-                     --scratch    "$ATOMIC_DEMO_TMP/local_b") ;;
+                     --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/local_b") ;;
 
         local_c) DEMO_JOIN_ARGS=(
                      --name       local_c
@@ -347,12 +921,117 @@ demo_join_args() {
                      --kind       hpc
                      --member     'cpu:queue=local,account=demo,nodes=1,cpus=2,walltime=1800,node_hours=2,software=pytorch,site=PSC,mem_gb_per_node=16'
                      --member     'gpu:queue=local,account=demo,nodes=1,cpus=1,gpus=1,walltime=1800,node_hours=1,max_pilots=1,software=pytorch,site=PSC,mem_gb_per_node=16'
-                     --scratch    "$ATOMIC_DEMO_TMP/local_c") ;;
+                     --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/local_c") ;;
+
+        # ------------------------------------------------------------------
+        # The REAL demo resources.  Selected by `source env.sh <name>`,
+        # i.e. by `join.sh r3|perlmutter|odo` -- so a laptop shell never
+        # sees them and `join.sh perlmutter` on the laptop is rejected by
+        # demo_known_resource before it can confuse anybody.
+        #
+        # `$ATOMIC_DEMO_MODE` is DETECTED, not configured: inside a Slurm
+        # allocation ($SLURM_JOB_ID set) the endpoint IS the resource ->
+        # allocation mode; on a login node -> login mode with declared
+        # members.  r3 is a workstation and is always allocation mode.
+        #
+        # Anything still spelled TODO(...) makes join.sh refuse, loudly,
+        # before it talks to the broker.
+        # ------------------------------------------------------------------
+
+        # r3 -- the Rutgers workstation, and the broker host itself.  No
+        # placeholders: it joins in seconds, which makes it the resource to
+        # join live, on camera.
+        r3)      DEMO_JOIN_ARGS=(
+                     --name       r3
+                     --mode       allocation
+                     --site       Rutgers
+                     --kind       workstation
+                     --software   lammps,pytorch
+                     --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/r3") ;;
+
+        # perlmutter (NERSC) and odo (OLCF).  Two shapes, one per detected
+        # mode.  The allocation shape is the recommended one and has no
+        # placeholders at all once $PSCRATCH / $MEMBERWORK are set: run
+        # `salloc` (or `srun --pty`), then `join.sh perlmutter` inside it.
+        # Capabilities are detected there (`sysinfo`, `queue_info` /
+        # `job_allocation` for size and remaining walltime).
+        perlmutter|odo)
+
+            if [ "$ATOMIC_DEMO_MODE" = 'allocation' ]; then
+
+                DEMO_JOIN_ARGS=(
+                     --name       "$name"
+                     --mode       allocation
+                     --site       "$ATOMIC_DEMO_SITE"
+                     --kind       hpc
+                     --software   lammps,pytorch
+                     --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/$name")
+
+            else
+
+                # Login mode: pilots are submitted on demand, so queue,
+                # account, pilot size and budget have to be declared -- one
+                # --member per pilot shape, and every remote member carries
+                # `shared_fs=false` plus an explicit `scratch_base=`.
+                #
+                # NOTE this only works from a broker host that can reach
+                # this site's batch system: psij detects the executor on the
+                # BROKER host, and r3 has no Slurm.  Hence the TODOs and
+                # hence the recommendation above -- start an allocation.
+                local q_cpu='TODO(CPU queue/partition)'
+                local q_gpu='TODO(GPU queue/partition)'
+                local acct='TODO(allocation/project id)'
+                local base="$ATOMIC_DEMO_SCRATCH_BASE/$name"
+
+                DEMO_JOIN_ARGS=(
+                     --name       "$name"
+                     --mode       login
+                     --site       "$ATOMIC_DEMO_SITE"
+                     --kind       hpc
+                     --member     "cpu:queue=$q_cpu,account=$acct,nodes=1,cpus=TODO(cpus per node),walltime=TODO(pilot walltime, seconds),node_hours=TODO(cpu member budget),software=lammps,pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
+                     --member     "gpu:queue=$q_gpu,account=$acct,nodes=1,cpus=TODO(cpus per node),gpus=TODO(gpus per node),walltime=TODO(pilot walltime, seconds),node_hours=TODO(gpu member budget),max_pilots=TODO(max concurrent gpu pilots),software=pytorch,site=$ATOMIC_DEMO_SITE,shared_fs=false,scratch_base=$base"
+                     --scratch    "$base")
+            fi ;;
+
+        # ------------------------------------------------------------------
+        # KNOWN GAP -- why allocation mode carries no `shared_fs=false`.
+        # An allocation-mode join has exactly one *implicit* member, and
+        # radical.orbit builds it with `shared_fs=True` hard-coded
+        # (plugin_federation.py `_implicit_member`), so it cannot declare
+        # otherwise.  That is harmless exactly when the endpoint runs
+        # inside the allocation and the tasks it launches see the
+        # `--scratch` it declared -- which is the case on Perlmutter and
+        # Odo, and is why the allocation path is the recommended one.
+        #
+        # `shared_fs=false` + `scratch_base=` are declarable only per
+        # --member, i.e. only in login mode (see above).  Without them the
+        # broker would stage inputs and mkdir a cwd on its *own* host and
+        # the task would run remotely with a bogus cwd and no inputs,
+        # silently.
+        # ------------------------------------------------------------------
 
         *)       demo_warn "no join arguments known for '$name'"
                  DEMO_JOIN_ARGS=()
                  return 1 ;;
     esac
+}
+
+# demo_join_args_todo -- 0 if DEMO_JOIN_ARGS still carries a placeholder,
+# and then $DEMO_JOIN_TODO names the first one.  A resource template that
+# was uncommented but not filled in must fail *here*, not four minutes
+# later inside a batch job.
+demo_join_args_todo() {
+    local arg
+
+    DEMO_JOIN_TODO=''
+
+    for arg in "${DEMO_JOIN_ARGS[@]}"; do
+        case "$arg" in
+            *'TODO('*) DEMO_JOIN_TODO="$arg"; return 0 ;;
+        esac
+    done
+
+    return 1
 }
 
 # demo_known_resource NAME -- 0 if NAME is one of the demo's resources
@@ -366,11 +1045,12 @@ demo_known_resource() {
     return 1
 }
 
-# resources that must show a live pilot before the smoke test starts
-# (allocation mode starts its pilot at join time; a login-mode member has
-# min_pilots=0 and only starts one when the first task arrives, so
-# local_b and local_c are not waited for)
-ATOMIC_DEMO_PILOT_RESOURCES=(local_a)
+# (ATOMIC_DEMO_PILOT_RESOURCES -- the resources that must show a live
+# pilot before the smoke test starts -- is set per resource name in
+# "which resource is this shell about?" above, NOT here: it is `local_a`
+# on the laptop, the resource itself in allocation mode, and empty in
+# login mode, where a member has min_pilots=0 and only starts a pilot
+# when the first task arrives.)
 
 # --------------------------------------------------------------------------
 # the campaign the client step submits

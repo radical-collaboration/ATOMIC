@@ -19,8 +19,25 @@
 
 set -euo pipefail
 
+# --resource is env.sh's one parameter, and env.sh must be sourced before
+# parse_args can use demo_die -- so pick it out of argv here.  parse_args
+# below sees (and skips) it again.
+_demo_res="${ATOMIC_DEMO_RESOURCE:-local}"
+_demo_argv=("$@")
+_demo_i=0
+while [ "$_demo_i" -lt "${#_demo_argv[@]}" ]; do
+    case "${_demo_argv[$_demo_i]}" in
+        --resource)   _demo_res="${_demo_argv[$((_demo_i + 1))]:-}" ;;
+        --resource=*) _demo_res="${_demo_argv[$_demo_i]#--resource=}" ;;
+    esac
+    _demo_i=$((_demo_i + 1))
+done
+
 # shellcheck source=demo/2026_09_08/env.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" \
+       "${_demo_res:-local}"
+
+unset _demo_res _demo_argv _demo_i
 
 KILL_ALL_ENDPOINTS=0
 WIPE=0
@@ -29,7 +46,10 @@ RC=0
 # --------------------------------------------------------------------------
 usage() {
     cat <<EOF
-usage: down.sh [options]
+usage: down.sh [--resource NAME] [options]
+
+  --resource NAME    which host to tear down (default: \$ATOMIC_DEMO_RESOURCE
+                     or 'local'); one of $ATOMIC_DEMO_KNOWN
 
   --all-endpoints    kill *every* radical-orbit-endpoint process, not just
                      this demo's.  Off by default: the machine may host
@@ -47,6 +67,10 @@ parse_args() {
         case "$1" in
             --all-endpoints) KILL_ALL_ENDPOINTS=1; shift ;;
             --wipe)          WIPE=1              ; shift ;;
+            --resource|--resource=*)
+                             # already consumed, before env.sh was sourced
+                             case "$1" in --resource) shift 2 ;; *) shift ;; esac
+                             ;;
             -h|--help)       usage; exit 0               ;;
             *)               usage >&2
                              demo_die "unknown argument: $1" ;;
@@ -235,17 +259,36 @@ step_restore_state() {
 
 # --------------------------------------------------------------------------
 step_wipe() {
+    local entry
+
     if [ "$WIPE" -eq 0 ]; then
         demo_log "kept    : $ATOMIC_DEMO_TMP (use --wipe to remove)"
         return 0
     fi
 
     case "$ATOMIC_DEMO_TMP" in
-        /tmp/*) rm -rf "$ATOMIC_DEMO_TMP"
-                demo_log "wiped   : $ATOMIC_DEMO_TMP" ;;
+        /tmp/*) ;;
         *)      demo_warn "refusing to wipe '$ATOMIC_DEMO_TMP'" \
-                          '-- not under /tmp' ;;
+                          '-- not under /tmp'
+                return 0 ;;
     esac
+
+    # $ATOMIC_DEMO_SRC (the clones of the pinned refs) defaults to a
+    # subdirectory of $ATOMIC_DEMO_TMP, and it is a *cache*, not state:
+    # wiping it would cost a full re-clone on the next run for nothing.
+    for entry in "$ATOMIC_DEMO_TMP"/* "$ATOMIC_DEMO_TMP"/.[!.]*; do
+        [ -e "$entry" ]                    || continue
+        [ "$entry" = "$ATOMIC_DEMO_SRC" ]  && continue
+        rm -rf "$entry"
+    done
+
+    rmdir "$ATOMIC_DEMO_TMP" 2> /dev/null || true
+
+    if [ -d "$ATOMIC_DEMO_SRC" ]; then
+        demo_log "wiped   : $ATOMIC_DEMO_TMP (kept $ATOMIC_DEMO_SRC)"
+    else
+        demo_log "wiped   : $ATOMIC_DEMO_TMP"
+    fi
 }
 
 # --------------------------------------------------------------------------

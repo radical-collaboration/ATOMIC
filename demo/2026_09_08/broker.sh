@@ -6,17 +6,23 @@
 #
 #   demo/2026_09_08/broker.sh                # install, isolate state, start
 #   demo/2026_09_08/broker.sh --skip-install # fast iteration
+#   demo/2026_09_08/broker.sh --reinstall    # force pip even on a match
 #
 # It does three things, in this order:
 #
-#   1. install radical.orbit and atomic-wm into ve3 (non-editable) so the
-#      pilots, the endpoint wrapper, the entry points and the console
-#      scripts are all current,
+#   1. `ensure_stack` (env.sh): put the *pinned* radical.orbit and
+#      atomic-wm into $ATOMIC_DEMO_VE, non-editable, so the broker, the
+#      endpoints, the pilots, the endpoint wrapper and the console scripts
+#      all run the same code -- on this host and on every other one,
 #   2. isolate state: federation / campaign / store go under
 #      $ATOMIC_DEMO_TMP; the dispatcher has no env override, so its state
 #      dir is backed up and cleared (down.sh restores it),
 #   3. start the broker (background, log + pidfile) and wait until
 #      GET /endpoints answers 200.
+#
+# The broker it starts is the *installed* one ($VE/bin), never a script
+# out of a checkout: on 2026-09-08 the broker host had radical.orbit on
+# `devel` and the broker came up without the `federation` plugin.
 #
 # The broker keeps running after this script returns -- it is a detached
 # background process with a pidfile, and `demo/2026_09_08/down.sh` stops it.
@@ -28,28 +34,55 @@
 
 set -euo pipefail
 
+# --resource is env.sh's one parameter, and env.sh must be sourced before
+# parse_args can use demo_die -- so pick it out of argv here.  parse_args
+# below sees (and skips) it again.
+_demo_res="${ATOMIC_DEMO_RESOURCE:-local}"
+_demo_argv=("$@")
+_demo_i=0
+while [ "$_demo_i" -lt "${#_demo_argv[@]}" ]; do
+    case "${_demo_argv[$_demo_i]}" in
+        --resource)   _demo_res="${_demo_argv[$((_demo_i + 1))]:-}" ;;
+        --resource=*) _demo_res="${_demo_argv[$_demo_i]#--resource=}" ;;
+    esac
+    _demo_i=$((_demo_i + 1))
+done
+
 # shellcheck source=demo/2026_09_08/env.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" \
+       "${_demo_res:-local}"
+
+unset _demo_res _demo_argv _demo_i
 
 DEMO_TOOL='broker.sh'
-
-DO_INSTALL=1
 
 # --------------------------------------------------------------------------
 usage() {
     cat <<EOF
-usage: broker.sh [options]
+usage: broker.sh [--resource local|r3] [options]
 
-  --skip-install     do not re-install radical.orbit / atomic-wm into ve3
-                     (fast iteration; the first run of the day must install)
+  --resource NAME    which host this broker is for (default: \$ATOMIC_DEMO_RESOURCE
+                     or 'local').  'local' = the laptop (127.0.0.1:8010),
+                     'r3' = the distributed run's broker host.
+
+  --skip-install     do not touch the venv at all (fast iteration; the
+                     first run on a host must install)
+  --reinstall        pip install both packages even when the venv's stamp
+                     already matches the pinned refs
   --plugins LIST     broker-hosted plugins (default: \$ATOMIC_DEMO_PLUGINS,
                      currently '$ATOMIC_DEMO_PLUGINS').  A subset such as
                      'task_dispatcher' starts a broker without the demo
                      plugins.
   -h, --help         this text
 
+The stack is pinned: \$ATOMIC_DEMO_ORBIT_REPO@\$ATOMIC_DEMO_ORBIT_REF
+($ATOMIC_DEMO_ORBIT_REF) and \$ATOMIC_DEMO_ATOMIC_REPO@\$ATOMIC_DEMO_ATOMIC_REF
+($ATOMIC_DEMO_ATOMIC_REF), installed into \$ATOMIC_DEMO_VE ($ATOMIC_DEMO_VE).
+See "How the stack is pinned and installed" in the README.
+
 environment (see env.sh): ATOMIC_DEMO_BROKER_PORT, ATOMIC_DEMO_TMP,
-ATOMIC_DEMO_BROKER_WAIT, ORBIT_SRC, VE
+ATOMIC_DEMO_BROKER_WAIT, ATOMIC_DEMO_VE, ATOMIC_DEMO_SRC,
+ATOMIC_DEMO_FORCE_CLONE, ORBIT_SRC
 EOF
 }
 
@@ -57,7 +90,12 @@ EOF
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --skip-install) DO_INSTALL=0            ; shift   ;;
+            --resource|--resource=*)
+                            # already consumed, before env.sh was sourced
+                            case "$1" in --resource) shift 2 ;; *) shift ;; esac
+                            ;;
+            --skip-install) ATOMIC_DEMO_SKIP_INSTALL=1; shift ;;
+            --reinstall)    ATOMIC_DEMO_REINSTALL=1   ; shift ;;
             --plugins)      [ $# -ge 2 ] || demo_die '--plugins needs a value'
                             ATOMIC_DEMO_PLUGINS="$2"; shift 2 ;;
             -h|--help)      usage; exit 0                     ;;
@@ -75,11 +113,11 @@ step_prepare() {
     demo_log "scratch  : $ATOMIC_DEMO_TMP"
     demo_log "broker   : $RADICAL_ORBIT_BROKER_URL"
     demo_log "plugins  : $ATOMIC_DEMO_PLUGINS"
+    demo_log "venv     : $VE"
+    demo_log "pins     : radical.orbit@$ATOMIC_DEMO_ORBIT_REF," \
+             "atomic-wm@$ATOMIC_DEMO_ATOMIC_REF"
 
     demo_mkdirs
-
-    [ -x "$VE/bin/python" ] \
-        || demo_die "no python in $VE/bin -- is ORBIT_SRC=$ORBIT_SRC right?"
 
     [ -r "$RADICAL_ORBIT_BROKER_CERT" ] \
         || demo_die "broker cert missing: $RADICAL_ORBIT_BROKER_CERT"
@@ -97,38 +135,20 @@ step_prepare() {
 }
 
 # --------------------------------------------------------------------------
-# ve3 may hold a stale radical.orbit (and a pre-#121 endpoint wrapper).
-# Pilots run the *installed* code, not $PYTHONPATH, so both repos have to
-# be installed -- non-editable, per the ground rules.
+# The venv may hold a stale radical.orbit (or one built from a checkout on
+# the wrong branch, which is what killed the 2026-09-08 broker host).
+# ensure_stack resolves both packages against the pins, installs only what
+# moved, and logs to $RUN_DIR/install.log.  Nothing runs from a source
+# tree: broker, endpoints, pilots and CLIs all use $VE.
 step_install() {
-    if [ "$DO_INSTALL" -eq 0 ]; then
-        demo_log 'install : skipped (--skip-install)'
-        return 0
-    fi
 
-    demo_log "install : radical.orbit from $ORBIT_SRC  (log: $ATOMIC_DEMO_PIP_LOG)"
-    : > "$ATOMIC_DEMO_PIP_LOG"
+    ensure_stack
 
-    "$VE/bin/pip" install --quiet --no-input "$ORBIT_SRC" \
-        >> "$ATOMIC_DEMO_PIP_LOG" 2>&1 \
-        || demo_fail 'pip install radical.orbit failed' "$ATOMIC_DEMO_PIP_LOG"
+    [ -x "$VE/bin/python" ] \
+        || demo_die "no python in $VE/bin -- run without --skip-install," \
+                    'or point $ATOMIC_DEMO_VE at a prepared venv'
 
-    demo_log "install : atomic-wm[cli] from $ATOMIC_SRC"
-
-    "$VE/bin/pip" install --quiet --no-input "$ATOMIC_SRC[cli]" \
-        >> "$ATOMIC_DEMO_PIP_LOG" 2>&1 \
-        || demo_fail 'pip install atomic-wm[cli] failed' "$ATOMIC_DEMO_PIP_LOG"
-
-    local missing=''
-    local tool
-    for tool in atomic-join atomic-leave atomic-resources atomic-campaign \
-                atomic-fake-md atomic-fake-train; do
-        [ -x "$VE/bin/$tool" ] || missing="$missing $tool"
-    done
-
-    [ -z "$missing" ] \
-        || demo_fail "console scripts missing after install:$missing" \
-                     "$ATOMIC_DEMO_PIP_LOG"
+    demo_report_stack
 }
 
 # --------------------------------------------------------------------------
@@ -168,7 +188,7 @@ step_start_broker() {
 
     : > "$ATOMIC_DEMO_BROKER_LOG"
 
-    "$VE/bin/python" "$ORBIT_SRC/bin/radical-orbit-broker.py" \
+    "$VE/bin/python" "$VE/bin/radical-orbit-broker.py"        \
         --host    "$ATOMIC_DEMO_BROKER_HOST"                  \
         --port    "$ATOMIC_DEMO_BROKER_PORT"                  \
         --no-auth                                             \

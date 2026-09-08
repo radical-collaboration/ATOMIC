@@ -20,12 +20,12 @@
 
 set -euo pipefail
 
+# up.sh is the laptop orchestrator: `local`, always
 # shellcheck source=demo/2026_09_08/env.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" local
 
 DEMO_TOOL='up.sh'
 
-DO_INSTALL=1
 DO_JOIN=1
 
 # --------------------------------------------------------------------------
@@ -33,8 +33,9 @@ usage() {
     cat <<EOF
 usage: up.sh [options]
 
-  --skip-install     do not re-install radical.orbit / atomic-wm into ve3
-                     (fast iteration; the first run of the day must install)
+  --skip-install     do not check the venv against the pinned stack
+                     (fast iteration; the first run on a host must install)
+  --reinstall        pip install both packages even on a stamp match
   --no-join          start the broker only, join no resources
                      (useful while the federation plugin is being written)
   --plugins LIST     broker-hosted plugins (default: \$ATOMIC_DEMO_PLUGINS,
@@ -44,7 +45,8 @@ usage: up.sh [options]
   -h, --help         this text
 
 environment (see env.sh): ATOMIC_DEMO_BROKER_PORT, ATOMIC_DEMO_TMP,
-ATOMIC_DEMO_RESOURCE_WAIT, ORBIT_SRC, VE
+ATOMIC_DEMO_RESOURCE_WAIT, ATOMIC_DEMO_VE, ATOMIC_DEMO_SRC,
+ATOMIC_DEMO_FORCE_CLONE, ORBIT_SRC
 EOF
 }
 
@@ -52,7 +54,8 @@ EOF
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --skip-install) DO_INSTALL=0            ; shift   ;;
+            --skip-install) ATOMIC_DEMO_SKIP_INSTALL=1; shift ;;
+            --reinstall)    ATOMIC_DEMO_REINSTALL=1   ; shift ;;
             --no-join)      DO_JOIN=0               ; shift   ;;
             --plugins)      [ $# -ge 2 ] || demo_die '--plugins needs a value'
                             ATOMIC_DEMO_PLUGINS="$2"; shift 2 ;;
@@ -72,7 +75,13 @@ parse_args() {
 step_broker() {
     local args=(--plugins "$ATOMIC_DEMO_PLUGINS")
 
-    [ "$DO_INSTALL" -eq 1 ] || args+=(--skip-install)
+    if [ "${ATOMIC_DEMO_SKIP_INSTALL:-0}" = '1' ]; then
+        args+=(--skip-install)
+    fi
+
+    if [ "${ATOMIC_DEMO_REINSTALL:-0}" = '1' ]; then
+        args+=(--reinstall)
+    fi
 
     "$ATOMIC_DEMO_DIR/broker.sh" "${args[@]}" \
         || demo_die 'demo/2026_09_08/broker.sh failed -- see the output above'
@@ -87,9 +96,11 @@ step_join() {
         return 0
     fi
 
+    # broker.sh has just ensured the pinned stack in this very venv, so
+    # the joins skip that step rather than `git pull` three more times
     local name
     for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
-        "$ATOMIC_DEMO_DIR/join.sh" "$name" \
+        "$ATOMIC_DEMO_DIR/join.sh" "$name" --skip-install \
             || demo_die "demo/2026_09_08/join.sh $name failed --" \
                         'run demo/2026_09_08/down.sh before retrying'
     done
@@ -214,7 +225,7 @@ step_report() {
         printf '\n'
     fi
 
-    demo_log 'next     : ve3/bin/python demo/2026_09_08/smoke.py'
+    demo_log "next     : $VE/bin/python demo/2026_09_08/smoke.py"
     demo_log '           (or demo/2026_09_08/submit.sh --wait)'
     demo_log 'teardown : demo/2026_09_08/down.sh'
 }

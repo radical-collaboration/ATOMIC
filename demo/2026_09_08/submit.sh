@@ -24,8 +24,25 @@
 
 set -euo pipefail
 
+# --resource is env.sh's one parameter, and env.sh must be sourced before
+# parse_args can use demo_die -- so pick it out of argv here.  parse_args
+# below sees (and skips) it again.
+_demo_res="${ATOMIC_DEMO_RESOURCE:-local}"
+_demo_argv=("$@")
+_demo_i=0
+while [ "$_demo_i" -lt "${#_demo_argv[@]}" ]; do
+    case "${_demo_argv[$_demo_i]}" in
+        --resource)   _demo_res="${_demo_argv[$((_demo_i + 1))]:-}" ;;
+        --resource=*) _demo_res="${_demo_argv[$_demo_i]#--resource=}" ;;
+    esac
+    _demo_i=$((_demo_i + 1))
+done
+
 # shellcheck source=demo/2026_09_08/env.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)/env.sh" \
+       "${_demo_res:-local}"
+
+unset _demo_res _demo_argv _demo_i
 
 DEMO_TOOL='submit.sh'
 
@@ -41,7 +58,10 @@ TERMINAL=' DONE FAILED CANCELED CANCELLED INTERRUPTED ABORTED '
 # --------------------------------------------------------------------------
 usage() {
     cat <<EOF
-usage: submit.sh [options]
+usage: submit.sh [--resource NAME] [options]
+
+  --resource NAME    which broker to talk to (default: \$ATOMIC_DEMO_RESOURCE
+                     or 'local'); one of $ATOMIC_DEMO_KNOWN
 
   --sweep K=V,V,…    parameter sweep (default: '$ATOMIC_DEMO_SWEEP').
                      One workflow per value.
@@ -51,7 +71,13 @@ usage: submit.sh [options]
                      collected results.  Exit 0 only on DONE.
   --timeout SEC      how long --wait may take (default:
                      \$ATOMIC_DEMO_CAMPAIGN_WAIT, currently $TIMEOUT)
+  --skip-install     do not check the venv against the pinned stack
+  --reinstall        pip install both packages even on a stamp match
   -h, --help         this text
+
+The client runs the same pinned stack as the broker --
+radical.orbit@$ATOMIC_DEMO_ORBIT_REF, atomic-wm@$ATOMIC_DEMO_ATOMIC_REF --
+installed into \$ATOMIC_DEMO_VE ($ATOMIC_DEMO_VE) by ensure_stack.
 EOF
 }
 
@@ -66,6 +92,12 @@ parse_args() {
             --timeout) [ $# -ge 2 ] || demo_die '--timeout needs a value'
                        TIMEOUT="$2"; shift 2 ;;
             --wait)    WAIT=1      ; shift   ;;
+            --resource|--resource=*)
+                       # already consumed, before env.sh was sourced
+                       case "$1" in --resource) shift 2 ;; *) shift ;; esac
+                       ;;
+            --skip-install) ATOMIC_DEMO_SKIP_INSTALL=1; shift ;;
+            --reinstall)    ATOMIC_DEMO_REINSTALL=1   ; shift ;;
             -h|--help) usage; exit 0         ;;
             *)         usage >&2
                        demo_die "unknown argument: $1" ;;
@@ -176,6 +208,9 @@ main() {
     parse_args "$@"
 
     demo_mkdirs
+
+    ensure_stack
+
     demo_require_broker
 
     step_submit
