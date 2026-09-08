@@ -163,13 +163,17 @@ step_stop_broker() {
         pid="$(cat "$ATOMIC_DEMO_BROKER_PID" 2> /dev/null || true)"
     fi
 
+    # no pidfile: this host runs no broker of the demo (a joining resource
+    # dials radical.3), so a broker that still answers is simply the real
+    # one, not a leftover -- nothing to stop, nothing to warn about
     if [ -z "$pid" ]; then
-        demo_log 'broker  : no pidfile, nothing to stop'
-    else
-        demo_log "broker  : stopping (pid $pid)"
-        stop_pid "$pid" 'broker' || RC=1
-        rm -f "$ATOMIC_DEMO_BROKER_PID"
+        demo_log 'broker  : none started on this host'
+        return 0
     fi
+
+    demo_log "broker  : stopping (pid $pid)"
+    stop_pid "$pid" 'broker' || RC=1
+    rm -f "$ATOMIC_DEMO_BROKER_PID"
 
     if demo_broker_alive; then
         demo_warn "something still answers on $RADICAL_ORBIT_BROKER_URL" \
