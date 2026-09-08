@@ -50,6 +50,11 @@ CLASS_RE = re.compile(r'^[a-z0-9][a-z0-9_-]*$')
 # capability keys which can be declared (and their type)
 DECLARE_KEYS = {'cores': int, 'gpus': int, 'mem_gb': float}
 
+# `--declare` keys which are NOT capabilities: `shared_fs` says whether
+# this resource sees the broker's filesystem and travels as a *top-level*
+# field of the join record (see `validate` and `assemble_record`)
+DECLARE_BOOL_KEYS = {'shared_fs'}
+
 # `--member` keys which map onto a member's pool description.  Everything
 # NOT listed here becomes an entry in the member's `attributes` -- which is
 # how free-form labels (site=…, mem_gb_per_node=…) reach the dispatcher.
@@ -165,7 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
                              '(default: workstation)')
     parser.add_argument('--declare', default=None, metavar='K=V,…',
                         help='override detected capabilities: '
-                             'cores=,gpus=,mem_gb=')
+                             'cores=,gpus=,mem_gb=.  Also takes '
+                             'shared_fs=<bool> -- not a capability but a '
+                             'statement about this resource: false says it '
+                             'does NOT share the broker\'s filesystem, so '
+                             'its scratch is a path on this host and inputs '
+                             'are staged to it')
     parser.add_argument('--software', action='append', default=[],
                         metavar='NAME,…',
                         help='software available here (comma separated, '
@@ -238,7 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_declare(text: Optional[str]) -> Dict[str, Any]:
-    """Parse ``--declare cores=4,gpus=0,mem_gb=8``."""
+    """Parse ``--declare cores=4,gpus=0,mem_gb=8,shared_fs=false``.
+
+    Everything but ``shared_fs`` is a capability; ``shared_fs`` is split
+    off the result by :func:`validate` and becomes a top-level field of
+    the record.
+    """
 
     out: Dict[str, Any] = {}
 
@@ -252,9 +267,17 @@ def parse_declare(text: Optional[str]) -> Dict[str, Any]:
         key, _, val = item.partition('=')
         key, val    = key.strip(), val.strip()
 
+        if key in DECLARE_BOOL_KEYS:
+            if val.lower() not in BOOL_WORDS:
+                raise UsageError('--declare %s: must be true or false, '
+                                 'got %r' % (key, val))
+            out[key] = BOOL_WORDS[val.lower()]
+            continue
+
         if key not in DECLARE_KEYS:
             raise UsageError('--declare: unknown capability %r (known: %s)'
-                             % (key, ', '.join(sorted(DECLARE_KEYS))))
+                             % (key, ', '.join(sorted(set(DECLARE_KEYS)
+                                                      | DECLARE_BOOL_KEYS))))
         try:
             out[key] = DECLARE_KEYS[key](val)
         except ValueError:
@@ -457,7 +480,9 @@ def _member_str(name: str, key: str, values: List[str]) -> str:
                          'pool fed-<class> and is never lower-cased for '
                          'you), got: %r' % (name, CLASS_RE.pattern, value))
     if key == 'scratch':
-        return check_scratch(value)
+        # the location rule needs the member's shared_fs, which may come
+        # later in the same spec: parse_members applies it once complete
+        return os.path.abspath(os.path.expanduser(value))
 
     return value
 
@@ -474,6 +499,10 @@ def parse_members(specs: Sequence[str]) -> List[Dict[str, Any]]:
             raise UsageError('--member %s: declared more than once'
                              % member['member'])
         seen[member['member']] = True
+        if member.get('scratch_base'):
+            member['scratch_base'] = check_scratch(
+                member['scratch_base'],
+                shared=bool(member.get('shared_fs', True)))
         members.append(member)
 
     return members
@@ -493,10 +522,22 @@ def parse_software(values: Sequence[str]) -> List[str]:
     return out
 
 
-def check_scratch(path: str) -> str:
-    """Validate ``--scratch`` against the staging plugin's location rule."""
+def check_scratch(path: str, shared: bool = True) -> str:
+    """Validate ``--scratch`` against the staging plugin's location rule.
 
-    full  = os.path.abspath(os.path.expanduser(path))
+    The ``$HOME`` / ``/tmp`` rule is the *broker's*: it applies when the
+    broker writes into the scratch itself, i.e. on a shared filesystem.
+    A non-shared scratch (``shared_fs=false``: Perlmutter's ``/pscratch``,
+    a Lustre project space) lives on the resource's own host, where the
+    endpoint's staging plugin enforces its allow-list -- which the join
+    widens to this very path via ``RADICAL_ORBIT_SCRATCH_BASE``.
+    """
+
+    full = os.path.abspath(os.path.expanduser(path))
+
+    if not shared:
+        return full
+
     roots = [os.path.realpath(os.path.expanduser('~')),
              os.path.realpath('/tmp')]
     real  = os.path.realpath(full)
@@ -506,15 +547,16 @@ def check_scratch(path: str) -> str:
             return full
 
     raise UsageError('--scratch must lie under $HOME or /tmp (orbit staging '
-                     'rule), got: %s' % full)
+                     'rule) unless shared_fs=false, got: %s' % full)
 
 
 def validate(args: argparse.Namespace) -> argparse.Namespace:
     """Validate and normalise the parsed arguments.
 
     Adds the derived attributes ``declared`` (dict), ``software`` (list),
-    ``members`` (list of member records) and ``scratch`` (absolute or
-    None); raises :class:`UsageError`.
+    ``members`` (list of member records), ``scratch`` (absolute or None)
+    and ``shared_fs`` (bool, or None when not declared); raises
+    :class:`UsageError`.
     """
 
     if not NAME_RE.match(args.name):
@@ -522,11 +564,15 @@ def validate(args: argparse.Namespace) -> argparse.Namespace:
                          % (NAME_RE.pattern, args.name))
 
     args.declared = parse_declare(args.declare)
+    # not a capability: it is a top-level record field, and stays None
+    # when it was not declared (old brokers never see the key at all)
+    args.shared_fs = args.declared.pop('shared_fs', None)
     args.software = parse_software(args.software)
     args.members  = parse_members(args.member)
 
     if args.scratch:
-        args.scratch = check_scratch(args.scratch)
+        args.scratch = check_scratch(args.scratch,
+                                     shared=args.shared_fs is not False)
 
     if args.node_hours is not None and args.node_hours <= 0:
         raise UsageError('--node-hours must be > 0')
@@ -814,6 +860,11 @@ def assemble_record(args: argparse.Namespace,
     if args.scratch:
         record['scratch_base'] = args.scratch
 
+    # only sent when declared: a broker that predates the field must keep
+    # seeing exactly the record it always saw
+    if getattr(args, 'shared_fs', None) is not None:
+        record['shared_fs'] = bool(args.shared_fs)
+
     if args.members:
         record['members'] = [dict(m) for m in args.members]
 
@@ -1094,13 +1145,20 @@ def run(args: argparse.Namespace) -> int:
     install_signal_handlers(stop)
 
     # ---------------------------------------------------------- 1. endpoint
+    # the endpoint's staging plugin must accept the scratch tree, wherever
+    # it lies -- the allocation's --scratch, else the first member's
+    scratch = args.scratch or next(
+        (m.get('scratch_base') for m in (args.members or [])
+         if m.get('scratch_base')), None)
+
     proc = EndpointProcess(name, client.broker,
                            endpoint =endpoint,
                            token    =client.token or None,
                            cert     =client.cert,
                            plugins  =args.plugins,
                            log_level=args.log_level,
-                           binary   =args.endpoint_bin)
+                           binary   =args.endpoint_bin,
+                           scratch  =scratch)
     try:
         pid = proc.start()
     except EndpointError as e:
@@ -1251,9 +1309,17 @@ def _report_joined(name: str, record: Dict[str, Any],
     else:
         info('  pool         : %s' % full.get('pool_name', 'fed-%s' % name))
 
-    if full.get('scratch_base') or record.get('scratch_base'):
-        info('  scratch      : %s' % (full.get('scratch_base')
-                                      or record.get('scratch_base')))
+    # scratch and shared_fs belong together: a non-shared resource's
+    # scratch is a path on THIS host, not on the broker's
+    scratch = full.get('scratch_base') or record.get('scratch_base')
+    shared  = full.get('shared_fs', record.get('shared_fs'))
+    tag     = '' if shared is None else \
+              ' (shared_fs=%s)' % ('true' if shared else 'false')
+
+    if scratch:
+        info('  scratch      : %s%s' % (scratch, tag))
+    elif tag:
+        info('  shared_fs    : %s' % ('true' if shared else 'false'))
 
 
 # ---------------------------------------------------------------------------

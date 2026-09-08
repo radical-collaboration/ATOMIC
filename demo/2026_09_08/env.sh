@@ -1099,11 +1099,23 @@ demo_join_args() {
 
             if [ "$ATOMIC_DEMO_MODE" = 'allocation' ]; then
 
+                # shared_fs=false: neither site shares the broker's (r3's)
+                # filesystem, so --scratch is a path HERE and inputs are
+                # staged through the pilot.  Odo also needs gpus=8 declared:
+                # a node has 4 MI250X = 8 GCDs, and the AMD GPUs are
+                # invisible to the nvidia-smi based detection (which reports
+                # cores=128, gpus=0).
+                local decl='shared_fs=false'
+                if [ "$name" = 'odo' ]; then
+                    decl='gpus=8,shared_fs=false'
+                fi
+
                 DEMO_JOIN_ARGS=(
                      --name       "$name"
                      --mode       allocation
                      --site       "$ATOMIC_DEMO_SITE"
                      --kind       hpc
+                     --declare    "$decl"
                      --software   lammps,pytorch
                      --scratch    "$ATOMIC_DEMO_SCRATCH_BASE/$name")
 
@@ -1148,17 +1160,14 @@ demo_join_args() {
             fi ;;
 
         # ------------------------------------------------------------------
-        # KNOWN GAP -- why allocation mode carries no `shared_fs=false`.
-        # An allocation-mode join has exactly one *implicit* member, and
-        # radical.orbit builds it with `shared_fs=True` hard-coded
-        # (plugin_federation.py `_implicit_member`), so it cannot declare
-        # otherwise.  That is harmless exactly when the endpoint runs
-        # inside the allocation and the tasks it launches see the
-        # `--scratch` it declared -- which is the case on Perlmutter and
-        # Odo, and is why the allocation path is the recommended one.
+        # Allocation mode DOES declare `shared_fs=false`: it travels as a
+        # top-level field of the join record (`--declare shared_fs=false`,
+        # set above for perlmutter and odo), and the implicit member the
+        # broker builds inherits it -- so the resource's `--scratch` is
+        # read as a path on ITS host and inputs are staged there.
         #
-        # `shared_fs=false` + `scratch_base=` are declarable only per
-        # --member, i.e. only in login mode (see above).  Without them the
+        # In login mode the same statement is made per --member
+        # (`shared_fs=false,scratch_base=…`, see above).  Without it the
         # broker would stage inputs and mkdir a cwd on its *own* host and
         # the task would run remotely with a bogus cwd and no inputs,
         # silently.

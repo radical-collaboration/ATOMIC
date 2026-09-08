@@ -36,9 +36,11 @@ class FakeProc:
     hook: Any = None            # called on start(), e.g. to connect the ep
 
     def __init__(self, name, url, endpoint=None, token=None, cert=None,
-                 plugins='default', log_level='INFO', binary=None):
+                 plugins='default', log_level='INFO', binary=None,
+                 scratch=None):
 
         self.name       = name
+        self.scratch    = scratch
         self.url        = url
         self.endpoint   = endpoint or endpoint_proc.endpoint_name(name)
         self.token      = token
@@ -151,11 +153,40 @@ def test_declare_parsing():
 
 
 @pytest.mark.parametrize('text', ['cores', 'nodes=2', 'cores=many',
-                                  'cores=-1'])
+                                  'cores=-1', 'shared_fs=maybe'])
 def test_declare_rejects_junk(text):
 
     with pytest.raises(join.UsageError):
         join.parse_declare(text)
+
+
+def test_declare_shared_fs_is_not_a_capability():
+    """`shared_fs` is a top-level record field, not a capability."""
+
+    assert join.parse_declare('gpus=8,shared_fs=false') \
+        == {'gpus': 8, 'shared_fs': False}
+
+    args = parsed(['--broker', 'https://x', '--name', 'a', '--mode',
+                   'allocation', '--declare', 'gpus=8,shared_fs=false'])
+
+    assert args.declared  == {'gpus': 8}        # capabilities only
+    assert args.shared_fs is False
+
+    rec = join.assemble_record(args, {'cores': 128})
+
+    assert rec['shared_fs']   is False
+    assert rec['capabilities'] == {'cores': 128, 'gpus': 8, 'software': []}
+
+
+def test_declare_without_shared_fs_omits_the_field():
+    """A broker that predates the field must see the record it always saw."""
+
+    args = parsed(['--broker', 'https://x', '--name', 'a', '--mode',
+                   'allocation', '--declare', 'gpus=8'])
+
+    assert args.declared  == {'gpus': 8}
+    assert args.shared_fs is None
+    assert 'shared_fs' not in join.assemble_record(args, {'cores': 128})
 
 
 def test_software_flattens_and_dedupes():
@@ -1431,6 +1462,20 @@ def test_the_record_is_written_at_join_and_removed_at_teardown(tmp_path):
     endpoint_proc.remove_record('local_b')
 
 
+def test_join_sends_and_stores_shared_fs(broker, proc):
+
+    rc = join.main(['--broker', 'https://127.0.0.1:8013', '--token', '',
+                    '--name', 'local_a', '--mode', 'allocation', '--detach',
+                    '--declare', 'cores=4,shared_fs=false'])
+
+    assert rc == 0
+    assert broker.joined[-1]['shared_fs'] is False
+
+    stored = endpoint_proc.read_record('local_a')
+    assert stored is not None
+    assert stored['shared_fs'] is False
+
+
 def test_an_unreadable_record_is_simply_absent(tmp_path):
 
     endpoint_proc.state_dir('local_c', create=True)
@@ -1550,3 +1595,31 @@ def test_resources_without_a_federation_plugin(broker, capsys):
 
     assert rc == 1
     assert "does not host the 'federation' plugin" in capsys.readouterr().err
+
+
+def test_scratch_rule_is_lifted_for_a_non_shared_filesystem():
+    # /pscratch is outside $HOME and /tmp: refused when the broker would
+    # write there itself, accepted when the resource declares the
+    # filesystem non-shared (the endpoint's staging plugin owns the path)
+    with pytest.raises(join.UsageError):
+        join.check_scratch('/pscratch/sd/m/x/atomic-demo')
+    assert join.check_scratch('/pscratch/sd/m/x/atomic-demo',
+                                  shared=False) \
+        == '/pscratch/sd/m/x/atomic-demo'
+
+    members = join.parse_members(
+        ['gpu:queue=q,nodes=1,cpus=4,walltime=600,node_hours=1,'
+         'shared_fs=false,scratch=/pscratch/sd/m/x/atomic-demo'])
+    assert members[0]['scratch_base'] == '/pscratch/sd/m/x/atomic-demo'
+    with pytest.raises(join.UsageError):
+        join.parse_members(
+            ['gpu:queue=q,nodes=1,cpus=4,walltime=600,node_hours=1,'
+             'scratch=/pscratch/sd/m/x/atomic-demo'])
+
+
+def test_child_env_names_the_scratch_tree():
+    env = endpoint_proc.child_env(base={'PATH': '/bin'},
+                                  scratch='/pscratch/sd/m/x/atomic-demo')
+    assert env['RADICAL_ORBIT_SCRATCH_BASE'] == '/pscratch/sd/m/x/atomic-demo'
+    assert 'RADICAL_ORBIT_SCRATCH_BASE' not in endpoint_proc.child_env(
+        base={'PATH': '/bin'})

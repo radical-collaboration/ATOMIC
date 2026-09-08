@@ -447,7 +447,9 @@ def members_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
         'max_pilots'      : pool.get('max_pilots', 1),
         'rhapsody_backend': pool.get('rhapsody_backend'),
         'scratch_base'    : record.get('scratch_base'),
-        'shared_fs'       : True,
+        # a resource that declared `shared_fs=false` at join time says so
+        # at the top level of its record -- the implicit member inherits it
+        'shared_fs'       : bool(record.get('shared_fs', True)),
         'software'        : list(caps.get('software') or []),
         'attributes'      : {'site'           : record.get('site') or '',
                              'kind'           : record.get('kind') or '',

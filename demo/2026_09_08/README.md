@@ -704,14 +704,9 @@ alongside every other site's GPU member — that is the whole point of the
 class pools. The flat `--queue/--nodes/--cpus/…` flags still describe a
 single-member resource and cannot be combined with `--member`.
 
-Note the tension `env.sh` spells out at the join templates:
-`shared_fs=false` and an explicit `scratch_base=` are declarable **only
-per `--member`**, i.e. only in login mode — and `--member` is an error in
-allocation mode, where the one implicit member is built with
-`shared_fs=True` hard-coded (`plugin_federation.py::_implicit_member`).
-That is harmless exactly when the endpoint runs inside the allocation and
-the tasks it launches see the `--scratch` it declared, which is why the
-allocation path is the recommended one.
+Allocation mode declares it too — `--declare shared_fs=false` puts it at
+the top level of the join record and the implicit member inherits it,
+which is what `env.sh` does for `perlmutter` and `odo`.
 
 Suggested choreography for the live demo: **join Perlmutter and Odo
 beforehand** (an allocation can take minutes to start, and a queued pilot

@@ -13,6 +13,7 @@ this file up: it belongs to the demo harness, not to the package.
 
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -836,3 +837,44 @@ def test_wait_times_out_with_a_useful_message():
 
     assert 'RUNNING' in str(excinfo.value)
     assert 'c1' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# env.sh: the join arguments of the remote resources
+# ---------------------------------------------------------------------------
+
+def _join_args(resource, **env):
+    """``demo_join_args <resource>`` as env.sh fills it, one entry per line."""
+
+    here   = os.path.dirname(os.path.abspath(__file__))
+    env_sh = os.path.join(here, 'env.sh')
+
+    child = dict(os.environ)
+    child['ATOMIC_DEMO_NO_PROXY'] = '1'
+    child.update(env)
+
+    proc = subprocess.run(
+        ['bash', '-c',
+         'source "$1" "$2" >/dev/null 2>&1; demo_join_args "$2" || exit 1; '
+         'printf "%s\\n" "${DEMO_JOIN_ARGS[@]}"',
+         '_', env_sh, resource],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child)
+
+    assert proc.returncode == 0, proc.stderr.decode('utf-8', 'replace')
+
+    return proc.stdout.decode('utf-8', 'replace').splitlines()
+
+
+@pytest.mark.parametrize('resource,declare,env', [
+    ('odo',        'gpus=8,shared_fs=false', {}),
+    ('perlmutter', 'shared_fs=false',        {'PSCRATCH': '/tmp/pscratch'}),
+])
+def test_allocation_mode_declares_shared_fs(resource, declare, env):
+    """Neither site shares the broker's filesystem -- and Odo's 8 GCDs are
+    invisible to the nvidia-smi based detection, so they are declared."""
+
+    args = _join_args(resource, SLURM_JOB_ID='1234', **env)
+
+    assert args[args.index('--mode')    + 1] == 'allocation'
+    assert args[args.index('--declare') + 1] == declare
+    assert [a for a in args if 'TODO(' in a] == []

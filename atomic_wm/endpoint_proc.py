@@ -268,10 +268,16 @@ def find_endpoint_bin(explicit: Optional[str] = None) -> str:
 
 
 def child_env(base: Optional[Dict[str, str]] = None,
-              log_level: str = 'INFO') -> Dict[str, str]:
+              log_level: str = 'INFO',
+              scratch: Optional[str] = None) -> Dict[str, str]:
     """Environment for the endpoint child — see the module docstring."""
 
     env = dict(os.environ if base is None else base)
+
+    # the staging plugin allows ~ and /tmp plus this one tree; a site
+    # scratch (/pscratch, Lustre) is outside both, so name it
+    if scratch:
+        env['RADICAL_ORBIT_SCRATCH_BASE'] = scratch
 
     # the venv bin directory must come first: psij launched pilots resolve
     # `radical-orbit-endpoint-wrapper.sh` by name
@@ -336,9 +342,11 @@ class EndpointProcess:
                  cert: Optional[str] = None,
                  plugins: str = 'default',
                  log_level: str = 'INFO',
-                 binary: Optional[str] = None):
+                 binary: Optional[str] = None,
+                 scratch: Optional[str] = None):
 
         self.name      = name
+        self.scratch   = scratch
         self.endpoint  = endpoint or endpoint_name(name)
         self.url       = url
         self.token     = token
@@ -384,7 +392,8 @@ class EndpointProcess:
                 stdin =subprocess.DEVNULL,
                 stdout=self._logfd,
                 stderr=subprocess.STDOUT,
-                env   =child_env(log_level=self.log_level),
+                env   =child_env(log_level=self.log_level,
+                                 scratch=self.scratch),
                 # own session: a Ctrl-C on the CLI's terminal must not
                 # race our orderly `leave` + shutdown, and `--detach`
                 # leaves the endpoint behind on purpose
