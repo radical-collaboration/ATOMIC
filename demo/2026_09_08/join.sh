@@ -123,6 +123,10 @@ parse_args() {
 join_detached() {
     local log="$RUN_DIR/join-$NAME.log"
 
+    demo_leave_stale "$NAME" \
+        || demo_die "a resource named '$NAME' is already in the federation" \
+                    "and alive -- atomic-leave $NAME first if it is yours"
+
     demo_log "join    : $NAME (log: $log)"
 
     if ! timeout "$ATOMIC_DEMO_JOIN_WAIT" \
@@ -143,6 +147,10 @@ join_detached() {
 join_live() {
     demo_log "join    : $NAME (live -- Ctrl-C leaves the federation again)"
     demo_log 'hint    : in another terminal: atomic-resources'
+
+    demo_leave_stale "$NAME" \
+        || demo_die "a resource named '$NAME' is already in the federation" \
+                    "and alive -- atomic-leave $NAME first if it is yours"
 
     exec "$VE/bin/atomic-join" "${DEMO_JOIN_ARGS[@]}"
 }

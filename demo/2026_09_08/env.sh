@@ -333,6 +333,48 @@ demo_require_broker() {
              'run demo/2026_09_08/broker.sh first'
 }
 
+# demo_fed_resources -- print "name liveness" for every resource the
+# federation lists (empty when the broker is unreachable).  Used to spot
+# records that outlived their endpoint: the federation state persists
+# across broker restarts, and a resource that was never `atomic-leave`d
+# comes back with liveness 'lost' and blocks a re-join (409).
+demo_fed_resources() {
+    "$VE/bin/atomic-resources" --json 2> /dev/null | "$VE/bin/python" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in data if isinstance(data, list) else []:
+    print(r.get("name") or "", r.get("liveness") or "")
+' 2> /dev/null || true
+}
+
+# demo_leave_stale NAME -- if the federation lists NAME with a liveness
+# other than ok, leave it (with --cancel-tasks) so a fresh join can take
+# the name.  Returns 1 when NAME is listed and alive (someone else's, or
+# an earlier join of ours that is still running).
+demo_leave_stale() {
+    local name="$1" line liveness=''
+
+    while read -r line; do
+        case "$line" in
+            "$name "*) liveness="${line#* }" ;;
+        esac
+    done <<< "$(demo_fed_resources)"
+
+    [ -n "$liveness" ] || return 0            # not listed: nothing to do
+    [ "$liveness" != ok ] || return 1         # listed and alive
+
+    demo_log "stale   : $name is still in the federation (liveness" \
+             "$liveness) from an earlier run -- leaving it first"
+    timeout "${ATOMIC_DEMO_STOP_WAIT:-30}" \
+        "$VE/bin/atomic-leave" "$name" --cancel-tasks \
+        >> "$RUN_DIR/leave.log" 2>&1 \
+        || demo_warn "atomic-leave $name reported a problem (see $RUN_DIR/leave.log)"
+    return 0
+}
+
 # demo_mkdirs -- every directory the demo writes into (idempotent).
 # Called by whichever role script runs first; the manual sequence has no
 # single entry point that could do it once.

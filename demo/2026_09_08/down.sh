@@ -109,9 +109,28 @@ stop_pid() {
 
 # --------------------------------------------------------------------------
 step_leave() {
-    local name
+    local name line listed=() names=()
 
-    for name in "${ATOMIC_DEMO_RESOURCES[@]}"; do
+    # Every demo resource the federation lists -- not only the ones this
+    # shell was sourced for.  `down.sh` without --resource on r3 must take
+    # r3 out too, or the record outlives its endpoint and blocks the next
+    # join with a 409.  Anything not known to the demo is left alone.
+    while read -r line; do
+        [ -n "$line" ] || continue
+        name="${line%% *}"
+        case " $ATOMIC_DEMO_KNOWN " in
+            *" $name "*) listed+=("$name") ;;
+        esac
+    done <<< "$(demo_fed_resources)"
+
+    for name in "${ATOMIC_DEMO_RESOURCES[@]}" "${listed[@]}"; do
+        case " ${names[*]:-} " in
+            *" $name "*) ;;
+            *) names+=("$name") ;;
+        esac
+    done
+
+    for name in "${names[@]}"; do
 
         demo_log "leave   : $name"
 
