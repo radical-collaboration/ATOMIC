@@ -358,14 +358,27 @@ check(/id local_b\.gpu/.test(res),
       'the wire id is not in the sub-row tooltip');
 check(/declared GPU\(s\) per node, not reserved/.test(res),
       'the GPU tooltip must say declared, not reserved');
+// the ranking: lost > failing > suspect > stale > ok > idle, and an
+// unknown word is news, so it wins.  `idle` is the quietest word there
+// is: one busy shape makes the resource ok
 check(m._internals.worstState(['ok', 'idle', 'suspect']) === 'suspect'
       && m._internals.worstState(['idle', 'ok']) === 'ok'
+      && m._internals.worstState(['idle', 'idle']) === 'idle'
+      && m._internals.worstState(['ok', 'stale']) === 'stale'
+      && m._internals.worstState(['failing', 'lost']) === 'lost'
+      && m._internals.worstState(['lost', 'melted']) === 'melted'
       && m._internals.worstState(['idle']) === 'idle'
       && m._internals.worstState([]) === '',
-      'a resource row does not show the worst state of its sub-rows');
+      'a resource row does not rank states the way the federation does');
+// a shape on an endpoint that is not answering is that, not idle
+check(m._internals.pilotsOf({members: [{member: 'x', liveness: 'lost',
+                                        usage: {pilots_active: 0}}]})[0]
+                   .state === 'lost',
+      'a shape on a lost endpoint is called idle');
 check(m._internals.hoursCell(5400) === '1.50 h'
+      && m._internals.hoursCell(-90) === '0.00 h'
       && m._internals.hoursCell(null) === '–',
-      'hours are not two decimals, or a missing one is not a dash');
+      'hours are not two decimals, clamped at zero, dash when missing');
 check((res.match(/allocation/g) || []).length === 1,
       'the join mode belongs in the tooltip, once');
 
@@ -457,7 +470,8 @@ const visible = (res + camp + tmpl)
   .replace(/<div class="ac-detail">[^<]*<\/div>/g, ' ')
   .replace(/<span\s+class="ac-detail">[^<]*<\/span>/g, ' ')
   .replace(/<[^>]*>/g, ' ');
-for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher', 'namespace']) {
+for (const w of ['pilot', 'broker', 'endpoint', 'dispatcher', 'namespace',
+                 'member']) {
   check(!new RegExp(w, 'i').test(visible),
         `forbidden word "${w}" in visible text`);
 }

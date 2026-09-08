@@ -71,8 +71,11 @@ INDENT = '  '
 # a free-form name (`atomic-join --endpoint` takes any) is cut to this
 NAME_WIDTH = 24
 
-# how bad a state word is: the resource row shows the worst of its pilots'
-STATE_RANK = {'lost': 5, 'failing': 4, 'suspect': 3, 'ok': 2, 'idle': 1}
+# how bad a state word is, for the worst-of a resource row shows.  `idle`
+# ranks below `ok`: a resource with one busy shape and one quiet one is
+# working, and `idle` on a resource row means it runs nothing at all
+STATE_RANK = {'lost': 5, 'failing': 4, 'suspect': 3, 'stale': 2,
+              'ok': 1, 'idle': 0}
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +118,17 @@ def _num(value: Any, digits: int = 1) -> str:
 
 
 def hours(seconds: Any) -> str:
-    """Seconds as hours with two decimals; ``-`` when there are none."""
+    """Seconds as hours with two decimals; ``-`` when there are none.
+
+    A walltime that has run out is reported as a small negative number by
+    more than one batch system; ``0.00`` is what that means.
+    """
 
     if seconds is None or isinstance(seconds, bool) \
             or not isinstance(seconds, (int, float)):
         return DASH
 
-    return '%.2f' % (float(seconds) / 3600.0)
+    return '%.2f' % max(0.0, float(seconds) / 3600.0)
 
 
 def clip(name: str) -> str:
@@ -136,7 +143,7 @@ def clip(name: str) -> str:
 
 
 def worst_state(words: Sequence[str]) -> str:
-    """The state a resource row shows: the worst of the words handed in.
+    """The worst of the words handed in, by the federation's own ranking.
 
     Anything the federation invented after this was written outranks the
     words we know -- an unknown state is news, and news belongs on the
@@ -243,6 +250,31 @@ def pilot_note(record: Dict[str, Any]) -> str:
     return note
 
 
+def resource_state(record: Dict[str, Any],
+                   pilots: Sequence[Dict[str, Any]]) -> str:
+    """The state word of one resource row.
+
+    A federation that derives one for the resource is believed, exactly as
+    a row's own word is.  Without one the row shows the worst of its
+    pilots', plus the resource's liveness where that is not ``ok`` (an
+    ``ok`` endpoint says nothing about the work running on it).  One busy
+    shape is enough to call the resource ``ok``; ``idle`` reaches this row
+    only when every shape is idle -- the resource runs nothing at all.
+    """
+
+    word = str(record.get('state') or '')
+
+    if word:
+        return word
+
+    live   = str(record.get('liveness') or '')
+    states = [live] if live and live != 'ok' else []
+    states += [str(p.get('state') or '') for p in pilots]
+    word   = worst_state(states)
+
+    return live if word == DASH and live else word
+
+
 def resource_row(record: Dict[str, Any],
                  pilots: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     """The row of one resource: what it is, and how its work is going.
@@ -256,15 +288,13 @@ def resource_row(record: Dict[str, Any],
     usage  = record.get('usage') or {}
     counts = usage if any(k in usage for k in TASK_KEYS) \
                    else _summed(pilots)
-    states = [str(record.get('state') or record.get('liveness') or '')]
-    states += [str(p.get('state') or '') for p in pilots]
 
     row = {
         'resource': clip(record.get('name') or DASH),
         'site'    : str(record.get('site') or DASH),
         'software': software_of(record, pilots),
         'classes' : classes_of(pilots),
-        'state'   : state_cell(worst_state(states), usage),
+        'state'   : state_cell(resource_state(record, pilots), usage),
         'note'    : '',
     }
     row.update(_tasks(counts))
@@ -358,6 +388,8 @@ def render(records: Sequence[Dict[str, Any]]) -> str:
                  '(declared -- not reserved)')
     lines.append('RUNTIME/LEFT: how long a pilot runs, and what is left '
                  'of that, in hours')
+    lines.append("STATE: ok | idle -- declared, running nothing | suspect "
+                 "| lost | failing")
 
     if any('*' in r['state'] for r in every):
         lines.append('*: usage could not be refreshed -- values are stale')

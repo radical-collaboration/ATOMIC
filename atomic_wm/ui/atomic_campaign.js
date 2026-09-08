@@ -401,6 +401,8 @@ export function css() {
     /* declared, reachable, running nothing right now: an outline, not a
        colour -- idle is not a fault */
     .ac-dot.idle    { background: transparent; box-shadow: inset 0 0 0 2px var(--muted); }
+    /* the numbers behind it could not be refreshed */
+    .ac-dot.stale   { background: var(--muted); box-shadow: 0 0 5px rgba(148,163,184,.5); }
     .ac-dot.suspect { background: var(--warn); }
     .ac-dot.lost    { background: var(--danger); }
     /* reachable, but every pilot it is asked to start dies at submit */
@@ -1001,30 +1003,48 @@ function pilotRow(r, m) {
 }
 
 // A federation that derives a state word per row is believed, `idle` and
-// all.  An older one reports only liveness, so a shape that holds nothing
-// is read here: failing when what it started died, idle otherwise.
+// all.  An older one reports only liveness, so the word is read here: an
+// endpoint that is not answering is that, whatever it holds; a shape on a
+// healthy endpoint that holds nothing is failing when what it started
+// died, and idle otherwise.
 function pilotState(r, m) {
   if (m.state) return String(m.state);
 
-  const u = m.usage || {};
-  if (u.pilots_active === 0) {
-    return (u.pilot_error || u.pilot_failures) ? 'failing' : 'idle';
-  }
+  // liveness first: `idle` would be a comfortable lie about a lost site
+  const live = String(m.liveness || r.liveness || '');
+  if (live && live !== 'ok') return live;
 
-  return String(m.liveness || r.state || r.liveness || '');
+  const u = m.usage || {};
+  if (u.pilots_active === 0) return pilotFailing(u) ? 'failing' : 'idle';
+
+  return live || String(r.state || '');
 }
 
-const STATE_RANK = {lost: 5, failing: 4, suspect: 3, ok: 2, idle: 1};
+// The federation calls a row failing after three failures in a row, or
+// while it is still backing off.  A reported reason counts on its own --
+// a broker that surfaces one without a counter is the case this was
+// written for.
+function pilotFailing(u) {
+  if (u.pilot_error) return true;
+  if (num(u.pilot_failures, 0) >= 3) return true;
 
-// What a resource row says: the worst of its own state and its rows'.  A
-// word this build does not know outranks the ones it does -- news belongs
-// on the resource row.
+  return num(u.paused_until, 0) * 1000 > Date.now();
+}
+
+const STATE_RANK = {lost: 5, failing: 4, suspect: 3, stale: 2, ok: 1,
+                    idle: 0};
+
+// What a resource row says: the worst of the words handed in.  `idle`
+// ranks below `ok` -- one busy shape means the resource is working, and
+// `idle` on a resource row means it runs nothing at all.  A word this
+// build does not know outranks the ones it does: news belongs on the
+// resource row.
 function worstState(words) {
+  const rank  = w => (STATE_RANK[w] === undefined ? 6 : STATE_RANK[w]);
   const known = words.filter(Boolean).map(w => String(w).toLowerCase());
   if (!known.length) return '';
 
-  return known.sort((a, b) => (STATE_RANK[a] || 6) - (STATE_RANK[b] || 6))
-              .pop();
+  return known.sort((a, b) => rank(a) - rank(b)).pop();
 }
 
 // Node-hours are tooltip material now: `used / allowance`, or just what
@@ -1046,13 +1066,15 @@ function nodeHourTip(usage, bud) {
 }
 
 // Seconds as hours, the unit the runtime columns are read in.  Two
-// decimals always: these two columns are read down, not across.
+// decimals always: these two columns are read down, not across.  A
+// walltime that has run out comes back slightly negative from more than
+// one batch system, and 0.00 is what that means.
 function hoursCell(sec) {
   // Number(null) is 0, and an unreported time left is not zero hours
   if (sec === null || sec === undefined || sec === '') return '–';
   const v = num(sec, NaN);
 
-  return Number.isFinite(v) ? `${(v / 3600).toFixed(2)} h` : '–';
+  return Number.isFinite(v) ? `${Math.max(0, v / 3600).toFixed(2)} h` : '–';
 }
 
 // A row's usage may not carry task counts at all (a federation that does
@@ -1071,10 +1093,11 @@ function statusCell(record, fallback) {
   const alt  = fallback || {};
   const live = String(rec.state || rec.liveness
                       || alt.state || alt.liveness || '').toLowerCase();
-  const dot  = ['ok', 'idle', 'suspect', 'lost', 'failing'].includes(live)
-             ? live : '';
+  const dot  = ['ok', 'idle', 'stale', 'suspect', 'lost', 'failing']
+               .includes(live) ? live : '';
   const label = live === 'ok'       ? 'online'
               : live === 'idle'     ? 'idle'
+              : live === 'stale'    ? 'not refreshed'
               : live === 'suspect'  ? 'unsteady'
               : live === 'lost'     ? 'offline'
               : live === 'failing'  ? 'failing' : 'unknown';
@@ -1194,8 +1217,15 @@ function renderResourceRow(r, pilots) {
   // the record counts the tasks nothing has placed yet as well, which no
   // sub-row does -- so its own numbers win wherever it reports any
   const counts = TASK_KEYS.some(k => k in usage) ? usage : sumUsage(pilots);
-  const state  = worstState([r.state || r.liveness]
-                            .concat(pilots.map(p => p.state)));
+  // the record's own word is believed where it sends one, exactly as a
+  // sub-row's is; without one the row shows the worst of its sub-rows,
+  // plus its own liveness where that is not `ok` -- an `ok` endpoint says
+  // nothing about the work running on it
+  const live   = String(r.liveness || '');
+  const state  = String(r.state || '')
+              || worstState((live && live !== 'ok' ? [live] : [])
+                            .concat(pilots.map(p => p.state)))
+              || live;
 
   // the only place an Orbit-internal name is allowed: a tooltip
   const tip = [r.endpoint ? `serving endpoint: ${r.endpoint}` : '',

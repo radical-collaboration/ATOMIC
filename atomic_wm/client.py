@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import ssl
+import time
 
 from typing import Any, Dict, List, Optional
 
@@ -452,14 +453,37 @@ def _pilot_name(record: Dict[str, Any], member: Dict[str, Any],
     return ep or name or str(record.get('name') or '')
 
 
+def _pilot_failing(usage: Dict[str, Any]) -> bool:
+    """Whether a row that holds no pilot is failing rather than idle.
+
+    The federation itself calls a row ``failing`` after three failures in
+    a row, or while it is still backing off.  This mirrors that, and
+    diverges in one spot on purpose: a reported ``pilot_error`` counts on
+    its own, because a broker that surfaces the reason without a counter
+    is exactly the case this line was written for.
+    """
+
+    if usage.get('pilot_error'):
+        return True
+
+    if _int(usage.get('pilot_failures'), 0) >= 3:
+        return True
+
+    until = usage.get('paused_until')
+
+    return isinstance(until, (int, float)) and not isinstance(until, bool) \
+        and until > time.time()
+
+
 def _pilot_state(record: Dict[str, Any], member: Dict[str, Any]) -> str:
     """The state word of one pilot row.
 
     A federation that derives one per row (Orbit 122) is believed --
-    including its ``idle``.  An older one reports only liveness, so a
-    shape that holds no pilot is read here: ``failing`` when its pilots
-    died at submit, ``idle`` otherwise -- it is declared, it is simply
-    not running anything.
+    including its ``idle``.  An older one reports only liveness, so the
+    word is read here: an endpoint that is not answering is that, whatever
+    it holds; a shape on a healthy endpoint that holds no pilot is
+    ``failing`` when what it started died, and ``idle`` otherwise -- it is
+    declared, it is simply not running anything.
     """
 
     word = member.get('state')
@@ -467,15 +491,19 @@ def _pilot_state(record: Dict[str, Any], member: Dict[str, Any]) -> str:
     if word:
         return str(word)
 
+    # liveness first: `idle` would be a comfortable lie about a lost site
+    live = str(member.get('liveness') or record.get('liveness') or '')
+
+    if live and live != 'ok':
+        return live
+
     usage  = member.get('usage') or {}
     active = usage.get('pilots_active')
-    failed = usage.get('pilot_error') or usage.get('pilot_failures')
 
     if active == 0 and not isinstance(active, bool):
-        return 'failing' if failed else 'idle'
+        return 'failing' if _pilot_failing(usage) else 'idle'
 
-    return str(member.get('liveness') or record.get('state')
-               or record.get('liveness') or '')
+    return live or str(record.get('state') or '')
 
 
 def pilots_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -511,6 +539,12 @@ def pilots_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
     for member in rows:
         kind  = _pilot_kind(record, member)
         attrs = member.get('attributes') or {}
+        # the memory lives under `attributes` on every shape so far; a
+        # row that carries it at the top level is not overruled by a
+        # `None` sitting in the attributes
+        mem   = attrs.get('mem_gb_per_node')
+        if mem is None:
+            mem = member.get('mem_gb_per_node')
 
         member.update({
             'endpoint'       : member.get('endpoint')
@@ -519,8 +553,7 @@ def pilots_of(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             'pilot_name'     : _pilot_name(record, member, kind),
             'mode'           : 'alloc' if kind == 'endpoint' else 'login',
             'remaining_sec'  : _float(member.get('remaining_sec')),
-            'mem_gb_per_node': attrs.get('mem_gb_per_node',
-                                         member.get('mem_gb_per_node')),
+            'mem_gb_per_node': mem,
             'state'          : _pilot_state(record, member),
         })
         out.append(member)

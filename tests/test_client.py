@@ -466,6 +466,52 @@ def test_a_failing_shape_is_not_called_idle():
     assert client.pilots_of(record)[1]['state'] == 'failing'
 
 
+def test_a_shape_on_a_dead_endpoint_is_not_called_idle():
+
+    # liveness comes first: a lost site holds no pilot either, and `idle`
+    # would say the resource is fine and merely quiet
+    record = {'name': 'x', 'endpoint': 'ep_x', 'mode': 'login',
+              'members': [{'member': 'cpu', 'liveness': 'lost',
+                           'usage': {'pilots_active': 0}}]}
+
+    assert client.pilots_of(record)[0]['state'] == 'lost'
+
+    # ... and the same word off the record, where the row carries none
+    record['members'][0].pop('liveness')
+    record['liveness'] = 'suspect'
+
+    assert client.pilots_of(record)[0]['state'] == 'suspect'
+
+
+def test_only_a_real_failure_run_is_called_failing():
+
+    def state(usage):
+        record = {'name': 'x', 'endpoint': 'ep_x', 'mode': 'login',
+                  'liveness': 'ok',
+                  'members': [{'member': 'cpu', 'liveness': 'ok',
+                               'usage': dict(usage, pilots_active=0)}]}
+        return client.pilots_of(record)[0]['state']
+
+    # one bad submit is not a failing shape -- the federation waits for
+    # three, or for a backoff it has actually started
+    assert state({})                        == 'idle'
+    assert state({'pilot_failures': 1})     == 'idle'
+    assert state({'pilot_failures': 3})     == 'failing'
+    assert state({'paused_until': 1.0})     == 'idle'      # long past
+    assert state({'paused_until': 4e9})     == 'failing'   # still backing off
+    # a reason without a counter is the case the line was written for
+    assert state({'pilot_error': 'quota'})  == 'failing'
+
+
+def test_the_memory_per_node_may_come_off_the_row_itself():
+
+    record = {'name': 'x', 'mode': 'login',
+              'members': [{'member': 'cpu', 'mem_gb_per_node': 128,
+                           'attributes': {'mem_gb_per_node': None}}]}
+
+    assert client.pilots_of(record)[0]['mem_gb_per_node'] == 128
+
+
 def test_pilots_of_derives_one_row_for_an_old_record():
 
     # a broker that predates class pools reports no rows at all; the

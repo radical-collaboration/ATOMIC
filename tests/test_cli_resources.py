@@ -217,6 +217,17 @@ def test_a_shape_without_a_pilot_is_idle():
     assert _row([GROUPED], '  └ ep_local_b/cpu').rstrip().endswith('ok')
 
 
+def test_the_hours_columns_never_go_negative():
+
+    # a walltime that has run out comes back slightly negative from more
+    # than one batch system; 0.00 is what that means
+    assert resources.hours(-90)   == '0.00'
+    assert resources.hours(0)     == '0.00'
+    assert resources.hours(5400)  == '1.50'
+    assert resources.hours(None)  == '-'
+    assert resources.hours('now') == '-'
+
+
 def test_a_row_without_a_reported_time_left_says_so():
 
     row = _row([GROUPED], '  └ ep_local_b/cpu').split()
@@ -232,13 +243,37 @@ def test_the_resource_row_shows_the_worst_state_of_its_pilots():
 
     # ok + suspect + idle -> suspect
     assert _row([record], 'local_b').rstrip().endswith('suspect')
-    # ... and a resource whose shapes are all idle is idle
+
+    # one busy shape is enough to call the resource ok, even next to an
+    # idle one (GROUPED's gpu shape holds no pilot)
+    record['members'][0].pop('state', None)
+    assert _row([record], 'local_b').rstrip().endswith('ok')
+
+    # a resource whose shapes are ALL idle runs nothing at all, and says
+    # so -- its own `ok` liveness says nothing about the work
     for m in record['members']:
-        m['state']           = ''
-        m['liveness']        = ''
+        m.pop('state', None)
         m['usage']['pilots_active'] = 0
-    record['liveness'] = ''
+    assert record['liveness'] == 'ok'
     assert _row([record], 'local_b').rstrip().endswith('idle')
+
+    # ... and the word the federation derives for the resource is believed
+    record['state'] = 'ok'
+    assert _row([record], 'local_b').rstrip().endswith('ok')
+
+
+def test_the_states_are_ranked_the_way_the_federation_ranks_them():
+
+    # `idle` is the quietest word there is: one busy shape wins over it
+    assert resources.worst_state(['ok', 'idle'])           == 'ok'
+    assert resources.worst_state(['idle', 'idle'])         == 'idle'
+    assert resources.worst_state(['ok', 'stale'])          == 'stale'
+    assert resources.worst_state(['stale', 'suspect'])     == 'suspect'
+    assert resources.worst_state(['suspect', 'failing'])   == 'failing'
+    assert resources.worst_state(['failing', 'lost'])      == 'lost'
+    # a word this build does not know is news, and news wins
+    assert resources.worst_state(['lost', 'melted'])       == 'melted'
+    assert resources.worst_state(['', None])               == '-'
 
 
 def test_the_resource_row_badges_every_class_pool():
@@ -251,6 +286,8 @@ def test_the_resource_row_counts_come_from_the_record():
     row = _row([GROUPED], 'local_b').split()
 
     # 2/5/1 is what the record reports -- NOT the 2/5/0 its rows sum to
+    # (and the state is `ok`: one busy shape is a working resource, even
+    # though its other shape is idle)
     assert row[-4:] == ['2', '5', '1', 'ok']
 
 

@@ -247,8 +247,8 @@ cancel explicitly.  The federation answers with `members_removed`,
 
 `atomic-resources` prints two independent column sets: a resource row —
 name, site, the software union, the class pools it serves, and its tasks
-run/done/failed with the worst state of its pilots — and, indented under
-it, one row per **pilot**:
+run/done/failed with a state derived from its pilots' — and, indented
+under it, one row per **pilot**:
 
 ```
 RESOURCE    SITE   SOFTWARE        CLASSES          RUN  DONE  FAILED  STATE
@@ -272,8 +272,16 @@ refresh that row's usage and is showing its last known values
 (`"stale": true`).
 
 The last column is the federation's derived `state` — the endpoint's
-liveness (`ok` / `suspect` / `lost`), `idle`, or `failing`: reachable,
-but holding no pilot because the ones it submitted keep dying.  A
+liveness (`ok` / `suspect` / `lost`), `idle` (declared, running nothing),
+`stale`, or `failing`: reachable, but holding no pilot because the ones it
+submitted keep dying.  A resource row shows the word the federation
+derives for the resource where it sends one; otherwise the worst of its
+pilot rows' (`lost` > `failing` > `suspect` > `stale` > `ok` > `idle`,
+with anything newer than this CLI above all of them) together with its own
+liveness where that is not `ok`.  `idle` is the quietest of those words:
+the `perlmutter` row above reads `ok` because one of its shapes is busy,
+and a resource row says `idle` only when every shape of it runs nothing.
+A
 `failing` row is followed by an indented `! pilot: <reason>` line
 carrying what the batch system actually said (plus
 `(paused until HH:MM:SS)` while the dispatcher has stopped trying), so a

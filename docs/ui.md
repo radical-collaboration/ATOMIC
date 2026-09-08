@@ -47,7 +47,7 @@ The resource row says what the resource is and how its work is going:
 | Software | the union over its sub-rows, else `capabilities.software` |
 | Classes | the `pool_name` badges of its sub-rows (`fed-cpu`, `fed-gpu`) — the placement classes stay visible without a column per sub-row |
 | Run · Done · Failed | `usage.tasks_running` / `.tasks_done` / `.tasks_failed` — the record's own, which count what nothing has placed yet as well; summed over the sub-rows only where the record reports none |
-| Status | the worst state of the record and its sub-rows → green (online) / hollow (idle) / amber (unsteady) / red (offline, failing) |
+| Status | the record's own `state` where it sends one, else the worst of its sub-rows' (`lost` > `failing` > `suspect` > `stale` > `ok` > `idle`, an unknown word above all of them) plus its own `liveness` where that is not `ok` → green (online) / hollow (idle) / amber (unsteady) / red (offline, failing).  One busy sub-row makes the resource *online*; *idle* reaches this row only when every sub-row is idle |
 
 Underneath each resource sits one indented `└ name` sub-row per shape of
 work it runs — an entry of `members[]` on the wire. An allocation is one
@@ -69,7 +69,8 @@ tooltip material, and a shape declaring GPUs says so as *declared, not
 reserved* — nothing pins a GPU to a task this round. A shape whose
 `usage` carries no task counts shows `–`, not a zero it cannot vouch
 for, and one that holds nothing right now reads *idle* behind a hollow
-dot. A shape the federation reports as `failing` — reachable, but
+dot — unless the endpoint under it is not answering, which is what the
+row says then. A shape the federation reports as `failing` — reachable, but
 everything it starts dies — says *failing* in red and is followed by one
 monospace `! cannot start work here:` line carrying its
 `usage.pilot_error` (server text, truncated, full text in the tooltip)
