@@ -2,12 +2,6 @@
 
 2026-10-02.
 
-Figures (sources: `fig-ml-architecture.svg`, `fig-ml-bigsim.svg`):
-
-![Architecture: client, central service host with the portal, endpoints per resource](fig-ml-architecture.png)
-
-![Use case: the bigsim per-frame chain over endpoints, with data sizes](fig-ml-bigsim.png)
-
 Goal of the call: agree a development line that runs the bigsim chain on the
 stack we demoed on 2026-09-08, and the order of the work after it.
 
@@ -16,8 +10,8 @@ stack we demoed on 2026-09-08, and the order of the work after it.
 - **Science:** defect detection in MD snapshots. Frames come from Qianqian's
   LAMMPS runs on SOE NFS. No ML → MD feedback today.
 - **Per-frame chain:**
-  1. denoise: GNN, Amarel, 1 GPU, Slurm.
-  2. PTM: OVITO, soenfs6, 1 CPU, no scheduler.
+  1. denoise: GNN, Amarel, 1 GPU.
+  2. PTM: OVITO, soenfs6, 1 CPU.
   3. ACE features: LAMMPS+PACE, SOE sills, 2 nodes × 4 MPI ranks.
   4. extract flagged rows: soenfs6.
   5. table, MLP predict, post-process, score: laptop.
@@ -28,134 +22,125 @@ stack we demoed on 2026-09-08, and the order of the work after it.
 
   | Workload | Atoms per frame | Shape | Status |
   |---|---|---|---|
-  | Scenario matrix | ~4k | 1,820 two-minute feature jobs, 270 MLP trainings | done |
+  | Scenario matrix | ~4k | 1,820 two-minute feature tasks, 270 MLP trainings | done |
   | Grain boundaries | 4–7k | 88 frames at ~4 min, serial today | 2 boundaries done |
   | Bigsim | ~1M | 35–45 min compute per frame, 246 frames left | demo done |
 
-- **Side tasks:** denoiser retraining, 3–4.5 h on 1 GPU. Training-crystal builds,
-  140 crystals per dataset, one SOE job each.
-- **Machines:** Amarel (Slurm, GPU), SOE sills (Slurm, MPI, stripped login
-  shell), soenfs6 (no scheduler, NFS head node), laptop. Environments are
-  hand-built, with no containers. All hosts are behind the campus VPN.
-- **Today's glue:** zsh scripts with ssh, rsync and polling of Slurm and
-  `pgrep`. Resume relies on stamp files. Provenance lives in two hand-kept
-  documents per project.
+- **Side tasks:** denoiser retraining, 3–4.5 h on 1 GPU. Training-crystal
+  builds, 140 crystals per dataset, one SOE task each.
+- **Machines:** Amarel (GPU), SOE sills (MPI), soenfs6 (no scheduler, NFS head
+  node), laptop. Environments are hand-built. All hosts are behind the campus
+  VPN.
+- **Today's glue:** shell scripts over ssh and rsync, driven from the laptop.
+  Provenance lives in two hand-kept documents per project.
 - **First target, proposed by the ML team:** the bigsim chain on the remaining
   frames. Baseline: ~1.5 h of compute and ~4 h wall clock for two frames.
 
 ## 2. Architecture
 
-See the architecture figure above.
+![Architecture: client, central service host with the portal, endpoints per resource](fig-ml-architecture.png)
 
-- **Central service host:**
-  - The ORBIT broker runs there, plus the `atomic_campaign` plugin, which hosts
-    one Campaign Manager instance per campaign: bigsim, GB, matrix.
-  - The Campaign Manager is the Rutgers one (Masha's design). The plugin is its
-    host. Today's plugin is a mock-up of that seam.
-  - The `federation`, `task_dispatcher` and staging plugins sit beside it.
-  - The ATOMIC portal is a plugin on the central host, served by the gateway:
-    campaign UI, live state and logs, results browser, provenance queries.
-  - The host's location (r3 or a Rutgers-hosted VM) is left open; see §6.
-- **Endpoints:** one per resource class, started under the user's account. Each
-  endpoint opens its connection to the central host.
-  - `gpu` on Amarel: denoise, retraining, optional MLP training.
-  - `mpi` on SOE sills: ACE, training-crystal builds.
-  - `host` on soenfs6: PTM, extract, predict, score.
+- **Central service host:** always on. It holds the campaigns, one Campaign
+  Manager instance per campaign (bigsim, GB, matrix), and the ATOMIC portal.
+  It decides where each task runs and keeps the record of what ran.
+- **Endpoints:** one per resource and hardware type, started under the user's
+  account:
+  - `gpu`: denoise, denoiser retraining, optionally MLP training;
+  - `mpi`: ACE features, training-crystal builds;
+  - `host`: PTM, extract, predict, score.
+- **Resources:** the figure shows today's machines. The SOE machines will
+  likely be replaced by NSF and DOE systems: Bridges-2, Delta, Perlmutter,
+  Frontier. These systems already run our stack in AmSC. What needs checking is
+  software availability on each: LAMMPS with PACE, OVITO, PyTorch.
+- **Data:** tasks run where their data is. The 12.7 GB ACE output never leaves
+  the file system it was written to. Only the 36 MB frames and the 20–60 MB
+  results move between sites.
+- **Client:** a browser on the portal, or the atomic CLI. It submits, watches,
+  fetches results and queries provenance. It runs no task, and it may
+  disconnect without stopping a campaign.
 
-  How an endpoint gets its resources is an implementation detail: a pilot inside
-  a Slurm allocation, or a plain host process.
-- **Data:**
-  - Placement follows the data: ACE, PTM, extract and predict run on SOE, next
-    to the shared NFS.
-  - Only the denoise round trip crosses sites: 36 MB in and 36 MB out.
-  - Results of 20–60 MB per frame go to the results store; the client fetches
-    them.
-- **Client:** a browser on the portal, or the atomic CLI against the gateway.
-  It submits, watches, fetches and queries provenance. It hosts no service and
-  runs no task.
+## 3. Use case: bigsim
 
-## 3. How the architecture answers "What breaks" (§6 of the document)
+![Use case: the bigsim per-frame chain over endpoints, with data sizes](fig-ml-bigsim.png)
+
+- **Pipelines:** one per frame. Many frames run at once; the endpoint sizes
+  bound how many, not the chain.
+- **Stage 2:** PTM and ACE run in parallel.
+- **Data:** the raw frame goes to the GPU endpoint and the denoised frame comes
+  back. The steps after that read their inputs in place.
+- **Scripts:** each task is one of the ML team's existing scripts.
+- **Fixed inputs:** the models and the descriptor file are fixed per campaign
+  and recorded with every result.
+
+## 4. How the architecture answers "What breaks" (§6 of the document)
 
 | # | Break | Answer in the architecture |
 |---|---|---|
-| 1 | laptop is the controller; VPN drops kill it | the controller is the always-on central host; the laptop is a client that may disconnect; endpoints reconnect on their own |
-| 2 | fixed staging names force one frame at a time | each task runs in its own sandbox under a unique id; N pipelines in flight |
-| 3 | tag collisions mix runs silently | the Campaign Manager derives the tag from the pipeline id; task arguments come from the spec, not from hand-picked numbers |
-| 4 | results visible 2–3 min after Slurm reports COMPLETED | the endpoint reports completion from inside the allocation once declared outputs exist; staging reads from the endpoint, not from the login node |
-| 5 | `pgrep` matched its own ssh command | the endpoint starts the process and tracks it by pid; no remote process probing |
-| 6 | 12.7 GB intermediates | placement by data locality; ACE output stays on SOE NFS; only declared small outputs move |
-| 7 | hand-built environments, stripped login shell | environment declared once per endpoint at join (OpenMPI paths, conda env), plus an optional per-task setup step |
-| 8 | silent failures, provenance drift | a task is done only on exit 0 plus declared outputs present; provenance recorded per task by the Campaign Manager |
+| 1 | laptop is the controller; VPN drops kill it | the controller is the always-on central host; the laptop is a client and may disconnect |
+| 2 | fixed staging names force one frame at a time | every task gets its own working directory and a unique id; many frames run at once |
+| 3 | tag collisions mix runs silently | tags are derived from the pipeline id, never chosen by hand |
+| 4 | results visible 2–3 min after Slurm reports COMPLETED | completion is reported from where the task ran, once its outputs exist |
+| 5 | `pgrep` matched its own ssh command | the endpoint starts each process itself and knows its state; no remote process probing |
+| 6 | 12.7 GB intermediates | tasks run next to their data; only declared small outputs move |
+| 7 | hand-built environments, stripped login shell | the environment is set up once per endpoint, plus an optional setup step per task |
+| 8 | silent failures, provenance drift | a task counts as done only on success with all outputs present; provenance is recorded for every task |
 
-## 4. Draft answers to the ML team's questions (§8 of the document)
+## 5. Draft answers to the ML team's questions (§8 of the document)
 
-1. **Scripts as executables:** yes. A task is a script plus arguments. The
-   only requirement is to make implicit inputs explicit: tag, staging paths,
-   model paths. The Campaign Manager passes them in, so the validated logic
-   does not change.
+1. **Scripts as executables:** yes, as they are. Inputs that are implicit today
+   (tag, staging paths, model paths) become explicit arguments. The validated
+   logic does not change.
 2. **Where the manager runs:** on the central host. The laptop is not needed
-   after submission. Endpoints drive Slurm on Amarel and sills, and run plain
-   processes on soenfs6.
-3. **Data movement:** declared inputs and outputs per task. The 12.7 GB stays
-   on SOE NFS. Only the 36 MB denoise round trip and the 20–60 MB results move.
-4. **Network drop:** the endpoint keeps running its tasks and reconnects.
-   Reattach and campaign resume after a central host restart are on the
-   development line (§5). Do not promise these as available today.
-5. **1,820 small jobs:** yes. That is what an endpoint inside one allocation
-   does: many tasks, one Slurm submission.
-6. **GPU and MPI tasks:** per-task requirements (gpu, ranks, nodes) are in the
-   spec and passed through. Per-task setup steps cover the environment exports.
-   Multi-node MPI tasks are a gap today (§5).
-7. **State and provenance:** per task: script, arguments, model version, scale
-   factor, noise level, inputs, outputs, endpoint, exit code, times. Queryable
-   from the CLI and portal. The schema needs agreement with the ML team.
-8. **Credentials:** endpoints start under the user's own account, with their
-   ssh keys, then connect to the central host over token-gated TLS. The VPN is
-   needed only to start an endpoint. Compute nodes must be able to reach the
-   central host (§6).
+   after submission. Slurm clusters and hosts without a scheduler both work.
+3. **Data movement:** each task declares its inputs and outputs. The 12.7 GB
+   stays on the cluster; only the frames and the results move.
+4. **Network drop:** campaigns live on the central host and continue through
+   client disconnects. Resuming tasks across endpoint reconnects is part of the
+   development line (§6).
+5. **1,820 small tasks:** yes. They run as many tasks inside one allocation.
+6. **GPU and MPI tasks:** each task states what it needs: GPUs, nodes, ranks.
+   Multi-node MPI tasks are supported. A per-task setup step covers the
+   environment exports.
+7. **State and provenance:** recorded per task: script, arguments, model
+   version, scale factor, noise level, inputs, outputs, resource, exit status,
+   times. Queryable from the portal and the CLI. The field list needs
+   agreement with the ML team.
+8. **Credentials:** endpoints start under the user's own account and keys.
+   After that they connect to the central host over an authenticated channel.
 
-## 5. Development line (proposal)
+## 6. Development line (proposal)
 
 Each step ends with a run the ML team can check against their numbers.
 
-1. **Bigsim on the demo stack:**
-   - Three endpoints: Amarel gpu, sills mpi, soenfs6 host.
-   - The chain as a campaign spec, with their scripts unchanged except for the
-     explicit inputs.
-   - 2 frames first, compared with the ~4 h baseline. Then N frames.
-2. **Multi-node MPI tasks:** ACE needs 2 nodes × 4 ranks inside an endpoint's
-   allocation. Today Rhapsody `concurrent` runs only on the head node, and
-   multi-node use of an adopted allocation is an open gap in ORBIT. Until it is
-   fixed, one fallback is an ACE task that submits its own Slurm job from the
-   `mpi` endpoint.
-3. **Robustness:**
-   - task reattach after an endpoint reconnect;
-   - campaign resume after a central host restart (today the plugin marks
-     unfinished work INTERRUPTED);
-   - checked outputs;
-   - a dispatcher reaper for tasks stuck in RUNNING.
-4. **Provenance schema:** agree the fields with the ML team, record them per
-   task, and query them from the CLI and portal.
-5. **Campaign Manager integration:** replace the mock-up in `atomic_campaign`
-   with the Rutgers Campaign Manager. This is the point where Masha's design
-   docs feed in.
+1. **Bigsim on the demo stack:** the chain as one campaign, with their scripts
+   unchanged. 2 frames first, compared with the ~4 h baseline, then the
+   remaining frames.
+2. **Robustness:** resume after network loss and service restarts; outputs
+   checked before a task counts as done.
+3. **Provenance:** agree the recorded fields with the ML team; query them from
+   the portal.
+4. **Campaign Manager integration:** the Rutgers Campaign Manager drives the
+   campaigns on the central host.
+5. **More resources:** NSF and DOE systems in place of or next to SOE, after
+   the software check.
 6. **Wider fan-out:**
    - GB frames in parallel;
-   - the 1,820 training-crystal jobs under one allocation;
+   - the 1,820 training-crystal tasks under one allocation;
    - MLP training as cluster tasks (270 runs).
 
-## 6. Open points for the call
+## 7. Open points for the call
 
 - **Central host location:** r3 sits outside the campus network. A
-  Rutgers-hosted VM sits inside it. The deciding question is whether Amarel and
-  SOE compute nodes can open outbound connections to r3.
+  Rutgers-hosted VM sits inside it. The deciding question is whether the
+  compute nodes can open outbound connections to r3.
 - **Compute approvals:** the status of what Ryan is chasing with Ileny.
-- **Access:** accounts on Amarel and SOE for running endpoints. Use the ML
-  team's allocation, or ours?
+- **Access:** accounts on Amarel, SOE and the NSF and DOE systems for running
+  endpoints. Use the ML team's allocation, or ours?
+- **Software on NSF and DOE systems:** LAMMPS with PACE, OVITO and PyTorch;
+  installed by the sites, or built by us.
 - **Code and data:** the GitHub repository Yating announced for the week of
   09-21. Which revision of the scripts counts as validated?
 - **Test data:** Qianqian's MD frames, and the separate thread Ryan opened on
   test files.
 - **Who owns the campaign spec:** the ML team writes it with our templates, or
   we write it with them.
-
