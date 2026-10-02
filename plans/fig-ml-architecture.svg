@@ -1,0 +1,202 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" font-family="Inter, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <!-- ATOMIC ML workloads on ATOMIC_WM: architecture.
+       Idiom: AmSC deck flow-diagram family (see amsc/presentations/dtaas-architecture.svg).
+       Level colors:
+         L5 ATOMIC frontend #40c8e8 (cyan)   L4 Campaign Manager #a78bfa (violet)
+         L2.5 ORBIT         #e8a040 (amber)  L2 Rhapsody         #e878a8 (pink)
+         L1 resources       #c89a6b (bronze)
+       Arrows: cyan = control, green = data (sizes per 1M-atom frame). -->
+  <defs>
+    <marker id="ah-cyan"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#40c8e8"/></marker>
+    <marker id="ah-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5acd83"/></marker>
+    <marker id="ah-dim"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7080a0"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="720" fill="#080818"/>
+
+  <!-- title -->
+  <text x="640" y="36" text-anchor="middle" fill="#e6ecf6" font-size="20" font-weight="600">ATOMIC ML workloads — architecture</text>
+  <text x="640" y="56" text-anchor="middle" fill="#7080a0" font-size="12">campaigns live on a central service host; endpoints on each resource run the tasks where the data and hardware are</text>
+
+  <!-- ============================== CLIENT ============================== -->
+  <rect x="36" y="76" width="236" height="554" rx="8" fill="#0d1525" stroke="#1e3a5f"/>
+  <text x="52" y="98" fill="#94a3b8" font-size="11" letter-spacing="1.5">CLIENT — USER LAPTOP</text>
+
+  <rect x="56" y="112" width="196" height="128" rx="6" fill="#080818" stroke="#40c8e8"/>
+  <text x="68" y="134" fill="#40c8e8" font-size="14" font-weight="600">browser · atomic CLI</text>
+  <text x="68" y="156" fill="#e6ecf6" font-size="11">• submit campaign spec</text>
+  <text x="68" y="174" fill="#e6ecf6" font-size="11">• watch state, cancel, retry</text>
+  <text x="68" y="192" fill="#e6ecf6" font-size="11">• fetch results + provenance</text>
+  <text x="68" y="210" fill="#7080a0" font-size="11">• attach, detach, reattach</text>
+  <text x="68" y="228" fill="#7080a0" font-size="11">• no tasks run here</text>
+
+  <rect x="56" y="256" width="196" height="118" rx="6" fill="#080818" stroke="#1e3a5f"/>
+  <text x="68" y="278" fill="#e6ecf6" font-size="13" font-weight="600">campaign spec</text>
+  <text x="68" y="298" fill="#7080a0" font-size="11">• task graph per frame, once</text>
+  <text x="68" y="316" fill="#7080a0" font-size="11">• frame set, sweep axes</text>
+  <text x="68" y="334" fill="#7080a0" font-size="11">• task = existing script + args</text>
+  <text x="68" y="352" fill="#7080a0" font-size="11">• needs: gpu · mpi n×r · cpu</text>
+
+  <!-- ============================ CENTRAL HOST ========================== -->
+  <rect x="304" y="76" width="560" height="554" rx="8" fill="#0d1525" stroke="#1e3a5f"/>
+  <text x="320" y="98" fill="#94a3b8" font-size="11" letter-spacing="1.5">CENTRAL SERVICE HOST — ATOMIC_WM</text>
+  <text x="320" y="116" fill="#7080a0" font-size="11">always on; campaign state persists across client and endpoint disconnects</text>
+
+  <rect x="324" y="128" width="520" height="44" rx="6" fill="#080818" stroke="#e8a040"/>
+  <text x="334" y="148" fill="#e8a040" font-size="13" font-weight="600">ORBIT broker</text>
+  <text x="334" y="164" fill="#7080a0" font-size="11">• token-gated ingress, pinned-cert TLS&#160;&#160;&#160;• gateway (HTTP, SSE)&#160;&#160;&#160;• durable state</text>
+
+  <!-- plugin frame: campaign -->
+  <rect x="324" y="184" width="520" height="232" rx="6" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+  <text x="338" y="204" fill="#e8a040" font-size="11" letter-spacing="1.5">PLUGIN: ATOMIC_CAMPAIGN</text>
+
+  <!-- stacked CM instances -->
+  <rect x="352" y="224" width="472" height="152" rx="6" fill="#080818" stroke="#a78bfa" stroke-opacity="0.35"/>
+  <rect x="348" y="220" width="472" height="152" rx="6" fill="#080818" stroke="#a78bfa" stroke-opacity="0.55"/>
+  <rect x="344" y="216" width="472" height="152" rx="6" fill="#080818" stroke="#a78bfa"/>
+  <text x="356" y="238" fill="#a78bfa" font-size="13" font-weight="600">Campaign Manager <tspan fill="#7080a0" font-weight="400" font-size="11">(one instance per campaign: bigsim · GB · matrix)</tspan></text>
+  <g font-size="11" fill="#e6ecf6">
+    <rect x="360" y="252" width="96" height="28" rx="4" fill="#0d1525" stroke="#a78bfa"/>
+    <text x="408" y="270" text-anchor="middle">campaign</text>
+    <rect x="480" y="252" width="110" height="28" rx="4" fill="#0d1525" stroke="#1e3a5f"/>
+    <text x="535" y="270" text-anchor="middle">pipeline × frame</text>
+    <rect x="614" y="252" width="80" height="28" rx="4" fill="#0d1525" stroke="#1e3a5f"/>
+    <text x="654" y="270" text-anchor="middle">stage</text>
+    <rect x="718" y="252" width="80" height="28" rx="4" fill="#0d1525" stroke="#1e3a5f"/>
+    <text x="758" y="270" text-anchor="middle">task</text>
+    <line x1="456" y1="266" x2="478" y2="266" stroke="#7080a0" marker-end="url(#ah-dim)"/>
+    <line x1="590" y1="266" x2="612" y2="266" stroke="#7080a0" marker-end="url(#ah-dim)"/>
+    <line x1="694" y1="266" x2="716" y2="266" stroke="#7080a0" marker-end="url(#ah-dim)"/>
+  </g>
+  <text x="356" y="302" fill="#e6ecf6" font-size="11">• N frame pipelines in flight; independent tasks share a stage</text>
+  <text x="356" y="320" fill="#e6ecf6" font-size="11">• unique ids per pipeline, stage, task; own sandbox per task</text>
+  <text x="356" y="338" fill="#7080a0" font-size="11">• stage state checkpointed; a task is done on exit 0 + declared outputs</text>
+  <text x="356" y="356" fill="#4a5670" font-size="10">new → staging → running → collecting → done | failed | interrupted → resumed</text>
+
+  <rect x="344" y="384" width="472" height="22" rx="4" fill="#080818" stroke="#1e3a5f"/>
+  <text x="356" y="399" fill="#7080a0" font-size="11">provenance store: per task — script, args, model, inputs, outputs, host, exit</text>
+
+  <!-- plugin row: portal + federation + dispatcher + staging -->
+  <rect x="324" y="428" width="124" height="182" rx="6" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+  <text x="334" y="446" fill="#94a3b8" font-size="9" letter-spacing="1.2">PLUGIN</text>
+  <text x="334" y="463" fill="#e8a040" font-size="12" font-weight="600" letter-spacing="1">PORTAL</text>
+  <text x="334" y="484" fill="#e6ecf6" font-size="11">• campaign UI</text>
+  <text x="334" y="502" fill="#e6ecf6" font-size="11">• live state, logs</text>
+  <text x="334" y="520" fill="#e6ecf6" font-size="11">• results browser</text>
+  <text x="334" y="538" fill="#e6ecf6" font-size="11">• provenance query</text>
+  <text x="344" y="556" fill="#7080a0" font-size="11">served by the</text>
+  <text x="344" y="574" fill="#7080a0" font-size="11">gateway</text>
+  <rect x="456" y="428" width="124" height="182" rx="6" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+  <text x="466" y="446" fill="#94a3b8" font-size="9" letter-spacing="1.2">PLUGIN</text>
+  <text x="466" y="463" fill="#e8a040" font-size="12" font-weight="600" letter-spacing="1">FEDERATION</text>
+  <text x="466" y="484" fill="#e6ecf6" font-size="11">• endpoint registry</text>
+  <text x="466" y="502" fill="#e6ecf6" font-size="11">• capabilities</text>
+  <text x="476" y="520" fill="#7080a0" font-size="11">gpu · mpi · cpu · fs</text>
+  <text x="466" y="538" fill="#e6ecf6" font-size="11">• place by needs</text>
+  <text x="476" y="556" fill="#7080a0" font-size="11">and data locality</text>
+  <text x="466" y="574" fill="#e6ecf6" font-size="11">• liveness</text>
+  <rect x="588" y="428" width="124" height="182" rx="6" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+  <text x="598" y="446" fill="#94a3b8" font-size="9" letter-spacing="1.2">PLUGIN</text>
+  <text x="598" y="463" fill="#e8a040" font-size="12" font-weight="600" letter-spacing="1">DISPATCHER</text>
+  <text x="598" y="484" fill="#e6ecf6" font-size="11">• queue per endpoint</text>
+  <text x="598" y="502" fill="#e6ecf6" font-size="11">• state pushed by</text>
+  <text x="608" y="520" fill="#7080a0" font-size="11">the endpoint</text>
+  <text x="598" y="538" fill="#e6ecf6" font-size="11">• reattach after</text>
+  <text x="608" y="556" fill="#7080a0" font-size="11">a reconnect</text>
+  <text x="598" y="574" fill="#e6ecf6" font-size="11">• exit + stderr kept</text>
+  <rect x="720" y="428" width="124" height="182" rx="6" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+  <text x="730" y="446" fill="#94a3b8" font-size="9" letter-spacing="1.2">PLUGIN</text>
+  <text x="730" y="463" fill="#e8a040" font-size="12" font-weight="600" letter-spacing="1">STAGING</text>
+  <text x="730" y="484" fill="#e6ecf6" font-size="11">• declared in / out</text>
+  <text x="740" y="502" fill="#7080a0" font-size="11">with sizes</text>
+  <text x="730" y="520" fill="#e6ecf6" font-size="11">• move small,</text>
+  <text x="740" y="538" fill="#7080a0" font-size="11">keep bulk in place</text>
+  <text x="730" y="556" fill="#e6ecf6" font-size="11">• checksum + retry</text>
+  <text x="730" y="574" fill="#e6ecf6" font-size="11">• results store</text>
+
+  <!-- ============================== RESOURCES =========================== -->
+  <rect x="896" y="76" width="348" height="554" rx="8" fill="#0d1525" stroke="#1e3a5f"/>
+  <text x="912" y="98" fill="#94a3b8" font-size="11" letter-spacing="1.5">RESOURCES — CAMPUS NETWORK</text>
+
+  <!-- GPU cluster -->
+  <rect x="912" y="110" width="316" height="138" rx="6" fill="#080818" stroke="#1e3a5f"/>
+  <text x="924" y="128" fill="#c89a6b" font-size="11" letter-spacing="1.2">GPU CLUSTER (Amarel) · Slurm</text>
+  <rect x="924" y="136" width="292" height="100" rx="5" fill="#0d1525" stroke="#40c8e8"/>
+  <text x="936" y="156" fill="#40c8e8" font-size="13" font-weight="600">endpoint: gpu</text>
+  <text x="936" y="174" fill="#e878a8" font-size="11">• rhapsody: GPU tasks in one allocation</text>
+  <text x="936" y="192" fill="#e6ecf6" font-size="11">• denoise · denoiser retrain · MLP train</text>
+  <text x="936" y="210" fill="#7080a0" font-size="11">• env: conda + torch, declared at join</text>
+  <g fill="#15384a" stroke="#40c8e8" stroke-opacity="0.6">
+    <rect x="1140" y="146" width="30" height="16" rx="3"/><rect x="1176" y="146" width="30" height="16" rx="3"/>
+  </g>
+
+  <!-- SOE site: two endpoints over one shared FS -->
+  <rect x="912" y="260" width="316" height="290" rx="6" fill="#080818" stroke="#1e3a5f"/>
+  <text x="924" y="278" fill="#c89a6b" font-size="11" letter-spacing="1.2">ENGINEERING CLUSTER (SOE)</text>
+
+  <rect x="924" y="286" width="292" height="100" rx="5" fill="#0d1525" stroke="#5acd83"/>
+  <text x="936" y="306" fill="#5acd83" font-size="13" font-weight="600">endpoint: mpi <tspan fill="#7080a0" font-weight="400" font-size="11">(sills · Slurm)</tspan></text>
+  <text x="936" y="324" fill="#e878a8" font-size="11">• rhapsody: multi-node MPI + small-task fan-out</text>
+  <text x="936" y="342" fill="#e6ecf6" font-size="11">• ACE features · training-crystal builds</text>
+  <text x="936" y="360" fill="#7080a0" font-size="11">• env: OpenMPI 5.0.8 paths, declared at join</text>
+  <g fill="#1a4028" stroke="#5acd83" stroke-opacity="0.6">
+    <rect x="1104" y="296" width="30" height="16" rx="3"/><rect x="1140" y="296" width="30" height="16" rx="3"/><rect x="1176" y="296" width="30" height="16" rx="3"/>
+  </g>
+
+  <rect x="924" y="396" width="292" height="84" rx="5" fill="#0d1525" stroke="#e6ecf6" stroke-opacity="0.6"/>
+  <text x="936" y="416" fill="#e6ecf6" font-size="13" font-weight="600">endpoint: host <tspan fill="#7080a0" font-weight="400" font-size="11">(soenfs6 · no scheduler)</tspan></text>
+  <text x="936" y="434" fill="#e878a8" font-size="11">• rhapsody: local processes, tracked by pid</text>
+  <text x="936" y="452" fill="#e6ecf6" font-size="11">• PTM (OVITO) · extract flagged rows</text>
+  <text x="936" y="470" fill="#7080a0" font-size="11">• post-process, score</text>
+
+  <rect x="924" y="490" width="292" height="48" rx="5" fill="#0d1525" stroke="#c89a6b"/>
+  <text x="936" y="510" fill="#c89a6b" font-size="12" font-weight="600">shared NFS</text>
+  <text x="936" y="527" fill="#7080a0" font-size="11">MD frames · 12.7 GB ACE output stays here</text>
+
+  <!-- more resources -->
+  <rect x="912" y="562" width="316" height="52" rx="6" fill="#080818" stroke="#1e3a5f" stroke-dasharray="4 3"/>
+  <text x="924" y="584" fill="#e6ecf6" font-size="12" font-weight="600">further resources</text>
+  <text x="924" y="602" fill="#7080a0" font-size="11">ACCESS, DOE: same endpoint model, join when needed</text>
+
+  <!-- ============================== ARROWS ============================== -->
+  <!-- client <-> broker -->
+  <line x1="274" y1="150" x2="320" y2="150" stroke="#40c8e8" stroke-width="1.5" marker-end="url(#ah-cyan)"/>
+  <text x="297" y="140" text-anchor="middle" fill="#40c8e8" font-size="10">spec</text>
+  <line x1="320" y1="184" x2="274" y2="184" stroke="#7080a0" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah-dim)"/>
+  <text x="297" y="200" text-anchor="middle" fill="#7080a0" font-size="10">state</text>
+  <line x1="320" y1="214" x2="274" y2="214" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+  <text x="297" y="230" text-anchor="middle" fill="#5acd83" font-size="10">results</text>
+  <text x="297" y="242" text-anchor="middle" fill="#5acd83" font-size="9">20–60 MB</text>
+  <text x="297" y="253" text-anchor="middle" fill="#5acd83" font-size="9">per frame</text>
+
+  <!-- endpoints <-> broker: endpoint-initiated, tasks down, state up -->
+  <line x1="866" y1="186" x2="922" y2="186" stroke="#40c8e8" stroke-width="1.5" marker-end="url(#ah-cyan)"/>
+  <line x1="866" y1="336" x2="922" y2="336" stroke="#40c8e8" stroke-width="1.5" marker-end="url(#ah-cyan)"/>
+  <line x1="866" y1="438" x2="922" y2="438" stroke="#40c8e8" stroke-width="1.5" marker-end="url(#ah-cyan)"/>
+  <text x="880" y="176" text-anchor="middle" fill="#40c8e8" font-size="10">tasks</text>
+  <text x="880" y="326" text-anchor="middle" fill="#40c8e8" font-size="10">tasks</text>
+  <text x="880" y="428" text-anchor="middle" fill="#40c8e8" font-size="10">tasks</text>
+
+  <!-- data: SOE NFS -> GPU (raw frame), GPU -> SOE NFS (denoised frame) -->
+  <path d="M 1228 506 C 1262 470, 1262 230, 1218 200" fill="none" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+  <path d="M 1216 222 C 1250 260, 1250 470, 1218 520" fill="none" stroke="#5acd83" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ah-green)"/>
+  <text x="1262" y="352" fill="#5acd83" font-size="10" text-anchor="end" transform="rotate(-90 1262 352)">frame in / denoised out, 36 MB each</text>
+
+  <!-- ============================ LAYER RIBBON ========================== -->
+  <g font-size="11">
+    <rect x="36"  y="652" width="236" height="36" rx="4" fill="#0d1525" stroke="#40c8e8" stroke-opacity="0.55"/>
+    <text x="154" y="674" text-anchor="middle" fill="#e6ecf6">L5 <tspan fill="#40c8e8">ATOMIC portal · CLI</tspan></text>
+    <rect x="280" y="652" width="236" height="36" rx="4" fill="#0d1525" stroke="#a78bfa" stroke-opacity="0.55"/>
+    <text x="398" y="674" text-anchor="middle" fill="#e6ecf6">L4 <tspan fill="#a78bfa">Campaign Manager</tspan></text>
+    <rect x="524" y="652" width="236" height="36" rx="4" fill="#0d1525" stroke="#e8a040" stroke-opacity="0.55"/>
+    <text x="642" y="674" text-anchor="middle" fill="#e6ecf6">L2.5 <tspan fill="#e8a040">ORBIT</tspan></text>
+    <rect x="768" y="652" width="236" height="36" rx="4" fill="#0d1525" stroke="#e878a8" stroke-opacity="0.55"/>
+    <text x="886" y="674" text-anchor="middle" fill="#e6ecf6">L2 <tspan fill="#e878a8">Rhapsody</tspan></text>
+    <rect x="1012" y="652" width="232" height="36" rx="4" fill="#0d1525" stroke="#c89a6b" stroke-opacity="0.55"/>
+    <text x="1128" y="674" text-anchor="middle" fill="#e6ecf6">L1 <tspan fill="#c89a6b">resources</tspan></text>
+  </g>
+  <text x="640" y="708" text-anchor="middle" fill="#4a5670" font-size="10">endpoints open the connection to the central host; the client and the endpoints may disconnect without stopping a campaign</text>
+</svg>

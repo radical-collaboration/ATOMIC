@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" font-family="Inter, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <!-- ATOMIC ML use case: bigsim per-frame chain over endpoints.
+       Idiom: AmSC deck flow-diagram family; colors as in fig-ml-architecture.svg.
+       Lanes = where things run or live; columns = stages of one frame pipeline.
+       Green solid = data moved between sites, bronze dotted = data read in place
+       on the shared FS. Sizes and times per 1M-atom frame (Yating, 2026-09-17). -->
+  <defs>
+    <marker id="ah-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5acd83"/></marker>
+    <marker id="ah-bronze" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c89a6b"/></marker>
+    <marker id="ah-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#40c8e8"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="720" fill="#080818"/>
+
+  <!-- title -->
+  <text x="640" y="36" text-anchor="middle" fill="#e6ecf6" font-size="20" font-weight="600">Use case: bigsim per-frame chain</text>
+  <text x="640" y="56" text-anchor="middle" fill="#7080a0" font-size="12">one pipeline per MD frame, 246 frames, N pipelines in flight; sizes and times per 1M-atom frame</text>
+
+  <!-- stage headers -->
+  <g font-size="11" fill="#94a3b8" letter-spacing="1.2" text-anchor="middle">
+    <text x="300" y="86">STAGE 1</text>
+    <text x="480" y="86">STAGE 2 · 2 TASKS</text>
+    <text x="650" y="86">STAGE 3</text>
+    <text x="820" y="86">STAGE 4</text>
+    <text x="990" y="86">RESULTS</text>
+  </g>
+
+  <!-- ============================== LANES =============================== -->
+  <g fill="#0d1525" stroke="#1e3a5f">
+    <rect x="36" y="96"  width="1208" height="88" rx="8"/>
+    <rect x="36" y="192" width="1208" height="88" rx="8"/>
+    <rect x="36" y="288" width="1208" height="88" rx="8"/>
+    <rect x="36" y="384" width="1208" height="88" rx="8"/>
+    <rect x="36" y="480" width="1208" height="80" rx="8"/>
+    <rect x="36" y="568" width="1208" height="64" rx="8"/>
+  </g>
+
+  <!-- lane labels -->
+  <text x="52" y="132" fill="#e8a040" font-size="13" font-weight="600">central host</text>
+  <text x="52" y="150" fill="#7080a0" font-size="11">ATOMIC_WM · ORBIT</text>
+  <text x="52" y="228" fill="#40c8e8" font-size="13" font-weight="600">endpoint: gpu</text>
+  <text x="52" y="246" fill="#7080a0" font-size="11">GPU cluster · Slurm</text>
+  <text x="52" y="324" fill="#5acd83" font-size="13" font-weight="600">endpoint: mpi</text>
+  <text x="52" y="342" fill="#7080a0" font-size="11">SOE sills · Slurm</text>
+  <text x="52" y="420" fill="#e6ecf6" font-size="13" font-weight="600">endpoint: host</text>
+  <text x="52" y="438" fill="#7080a0" font-size="11">SOE soenfs6 · no sched.</text>
+  <text x="52" y="514" fill="#c89a6b" font-size="13" font-weight="600">shared NFS</text>
+  <text x="52" y="532" fill="#7080a0" font-size="11">SOE</text>
+  <text x="52" y="598" fill="#40c8e8" font-size="13" font-weight="600">client</text>
+  <text x="52" y="616" fill="#7080a0" font-size="11">user laptop</text>
+
+  <!-- ============================ CENTRAL ROW =========================== -->
+  <rect x="222" y="106" width="678" height="68" rx="6" fill="#080818" stroke="#a78bfa"/>
+  <text x="234" y="126" fill="#a78bfa" font-size="13" font-weight="600">Campaign Manager: bigsim</text>
+  <text x="234" y="146" fill="#e6ecf6" font-size="11">• pipeline k of 246 · stage 1 → 2 (PTM ∥ ACE) → 3 → 4 · each task placed on the endpoint matching its needs</text>
+  <text x="234" y="164" fill="#7080a0" font-size="11">• per task recorded: script, args, model version, scale factor, inputs, outputs, endpoint, exit code</text>
+
+  <rect x="920" y="106" width="140" height="68" rx="6" fill="#080818" stroke="#e8a040"/>
+  <text x="932" y="126" fill="#e8a040" font-size="13" font-weight="600">results store</text>
+  <text x="932" y="146" fill="#7080a0" font-size="11">per frame, keyed by</text>
+  <text x="932" y="162" fill="#7080a0" font-size="11">pipeline id</text>
+
+  <rect x="1076" y="106" width="156" height="68" rx="6" fill="#080818" stroke="#1e3a5f" stroke-dasharray="4 3"/>
+  <text x="1088" y="126" fill="#e6ecf6" font-size="12" font-weight="600">fixed per campaign</text>
+  <text x="1088" y="146" fill="#7080a0" font-size="11">denoiser model · MLP</text>
+  <text x="1088" y="162" fill="#7080a0" font-size="11">model · .yace file</text>
+
+  <!-- ============================== TASKS =============================== -->
+  <!-- ghost copies: N pipelines in flight -->
+  <g fill="#080818" stroke-opacity="0.35">
+    <rect x="230" y="216" width="148" height="52" rx="5" stroke="#40c8e8"/>
+    <rect x="408" y="312" width="152" height="52" rx="5" stroke="#5acd83"/>
+    <rect x="408" y="408" width="100" height="52" rx="5" stroke="#e6ecf6"/>
+    <rect x="588" y="408" width="132" height="52" rx="5" stroke="#e6ecf6"/>
+    <rect x="758" y="408" width="142" height="52" rx="5" stroke="#e6ecf6"/>
+  </g>
+
+  <rect x="222" y="208" width="148" height="52" rx="5" fill="#080818" stroke="#40c8e8"/>
+  <text x="234" y="230" fill="#40c8e8" font-size="12" font-weight="600">1 denoise (GNN)</text>
+  <text x="234" y="248" fill="#7080a0" font-size="11">1 GPU · 7–10 min</text>
+
+  <rect x="400" y="304" width="152" height="52" rx="5" fill="#080818" stroke="#5acd83"/>
+  <text x="412" y="326" fill="#5acd83" font-size="12" font-weight="600">3 ACE features</text>
+  <text x="412" y="344" fill="#7080a0" font-size="11">2 nodes × 4 ranks · 21 min</text>
+
+  <rect x="400" y="400" width="100" height="52" rx="5" fill="#080818" stroke="#e6ecf6" stroke-opacity="0.7"/>
+  <text x="412" y="422" fill="#e6ecf6" font-size="12" font-weight="600">2 PTM</text>
+  <text x="412" y="440" fill="#7080a0" font-size="11">1 CPU · 90 s</text>
+
+  <rect x="580" y="400" width="132" height="52" rx="5" fill="#080818" stroke="#e6ecf6" stroke-opacity="0.7"/>
+  <text x="592" y="422" fill="#e6ecf6" font-size="12" font-weight="600">4 extract flagged</text>
+  <text x="592" y="440" fill="#7080a0" font-size="11">1 CPU · 3–5 min</text>
+
+  <rect x="750" y="400" width="142" height="52" rx="5" fill="#080818" stroke="#e6ecf6" stroke-opacity="0.7"/>
+  <text x="762" y="422" fill="#e6ecf6" font-size="12" font-weight="600">5 predict · score</text>
+  <text x="762" y="440" fill="#7080a0" font-size="11">1 CPU · ~5 min</text>
+
+  <!-- N badge -->
+  <rect x="1076" y="208" width="156" height="244" rx="6" fill="#080818" stroke="#1e3a5f"/>
+  <text x="1154" y="244" text-anchor="middle" fill="#e6ecf6" font-size="26" font-weight="600">× N</text>
+  <text x="1154" y="266" text-anchor="middle" fill="#7080a0" font-size="11">pipelines in flight</text>
+  <text x="1088" y="300" fill="#e6ecf6" font-size="11">• 246 frames left</text>
+  <text x="1088" y="320" fill="#e6ecf6" font-size="11">• 35–45 min compute</text>
+  <text x="1100" y="336" fill="#7080a0" font-size="11">per frame</text>
+  <text x="1088" y="356" fill="#e6ecf6" font-size="11">• frames independent</text>
+  <text x="1088" y="376" fill="#e6ecf6" font-size="11">• N bound by endpoint</text>
+  <text x="1100" y="392" fill="#7080a0" font-size="11">size, not by the chain</text>
+  <text x="1088" y="412" fill="#e6ecf6" font-size="11">• task scripts as they</text>
+  <text x="1100" y="428" fill="#7080a0" font-size="11">are today</text>
+
+  <!-- ============================== NFS ROW ============================= -->
+  <rect x="222" y="496" width="148" height="48" rx="5" fill="#080818" stroke="#c89a6b"/>
+  <text x="234" y="516" fill="#c89a6b" font-size="12" font-weight="600">raw frame</text>
+  <text x="234" y="534" fill="#7080a0" font-size="11">36 MB · from MD runs</text>
+
+  <rect x="400" y="496" width="152" height="48" rx="5" fill="#080818" stroke="#c89a6b"/>
+  <text x="412" y="516" fill="#c89a6b" font-size="12" font-weight="600">denoised frame</text>
+  <text x="412" y="534" fill="#7080a0" font-size="11">36 MB · PTM labels</text>
+
+  <rect x="580" y="496" width="132" height="48" rx="5" fill="#080818" stroke="#c89a6b"/>
+  <text x="592" y="516" fill="#c89a6b" font-size="12" font-weight="600">ACE output</text>
+  <text x="592" y="534" fill="#7080a0" font-size="11">12.7 GB · stays</text>
+
+  <rect x="750" y="496" width="142" height="48" rx="5" fill="#080818" stroke="#c89a6b"/>
+  <text x="762" y="516" fill="#c89a6b" font-size="12" font-weight="600">flagged rows</text>
+  <text x="762" y="534" fill="#7080a0" font-size="11">21–59 MB</text>
+
+  <!-- ============================= CLIENT ROW =========================== -->
+  <rect x="920" y="576" width="140" height="48" rx="5" fill="#080818" stroke="#40c8e8"/>
+  <text x="932" y="596" fill="#40c8e8" font-size="12" font-weight="600">pred + metrics</text>
+  <text x="932" y="614" fill="#7080a0" font-size="11">per frame, on demand</text>
+
+  <!-- ============================== ARROWS ============================== -->
+  <!-- raw frame -> denoise (moved to the GPU cluster) -->
+  <line x1="260" y1="494" x2="260" y2="264" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+  <text x="266" y="404" fill="#5acd83" font-size="10">36 MB in</text>
+  <!-- denoise -> denoised frame (moved back) -->
+  <path d="M 370 234 H 386 V 492" fill="none" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+  <text x="332" y="300" fill="#5acd83" font-size="10">36 MB out</text>
+
+  <!-- denoised frame -> PTM, ACE (read in place) -->
+  <line x1="450" y1="494" x2="450" y2="456" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <line x1="530" y1="494" x2="530" y2="360" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <!-- PTM -> NFS labels (write back, same box) -->
+  <line x1="480" y1="454" x2="480" y2="492" stroke="#c89a6b" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <!-- ACE -> ACE output -->
+  <path d="M 552 330 H 566 V 492 H 578" fill="none" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <line x1="566" y1="520" x2="578" y2="520" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <path d="M 566 492 V 520" fill="none" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <!-- ACE output + labels -> extract -->
+  <line x1="646" y1="494" x2="646" y2="456" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <!-- extract -> flagged rows -->
+  <path d="M 712 426 H 730 V 520 H 748" fill="none" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+  <!-- flagged rows -> predict -->
+  <line x1="821" y1="494" x2="821" y2="456" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+
+  <!-- predict -> results store (moved) -->
+  <path d="M 892 426 H 960 V 178" fill="none" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+  <text x="966" y="320" fill="#5acd83" font-size="10">pred,</text>
+  <text x="966" y="332" fill="#5acd83" font-size="10">metrics</text>
+  <!-- results store -> client -->
+  <line x1="1040" y1="176" x2="1040" y2="572" stroke="#5acd83" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ah-green)"/>
+  <text x="1034" y="500" fill="#5acd83" font-size="10" text-anchor="end">fetch</text>
+
+
+  <!-- ============================== LEGEND ============================== -->
+  <g font-size="11">
+    <line x1="52" y1="662" x2="92" y2="662" stroke="#5acd83" stroke-width="1.5" marker-end="url(#ah-green)"/>
+    <text x="100" y="666" fill="#e6ecf6">data moved between sites</text>
+    <line x1="300" y1="662" x2="340" y2="662" stroke="#c89a6b" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah-bronze)"/>
+    <text x="348" y="666" fill="#e6ecf6">data read in place on the shared FS</text>
+    <rect x="600" y="653" width="40" height="18" rx="3" fill="#080818" stroke="#e6ecf6" stroke-opacity="0.35"/>
+    <rect x="596" y="649" width="40" height="18" rx="3" fill="#080818" stroke="#e6ecf6" stroke-opacity="0.7"/>
+    <text x="648" y="666" fill="#e6ecf6">task, one copy per pipeline in flight</text>
+    <text x="900" y="666" fill="#e6ecf6">1–5 <tspan fill="#7080a0">= steps in the ML team's chain</tspan></text>
+  </g>
+  <text x="640" y="702" text-anchor="middle" fill="#4a5670" font-size="10">first target named in the workload document; GB and scenario-matrix campaigns reuse the same chain with small frames and wider fan-out</text>
+</svg>
