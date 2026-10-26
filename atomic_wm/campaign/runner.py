@@ -494,6 +494,11 @@ class StageRunner:
 
             if deadline is None and state == 'RUNNING':
                 deadline = self._clock() + self._timeout
+            elif deadline is not None and state != 'RUNNING':
+                # back in the queue (its member left, the task was
+                # re-queued): waiting again is not running time
+                deadline       = None
+                queue_deadline = self._clock() + self._queue_timeout
 
             if deadline is None:
                 if self._clock() > queue_deadline:

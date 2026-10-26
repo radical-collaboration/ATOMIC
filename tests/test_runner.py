@@ -545,6 +545,26 @@ class TestFailures:
         assert 'timed out' not in (stage.reason or '')
         assert fed.cancels == []
 
+    def test_requeue_after_running_does_not_eat_the_deadline(self, tmp_path):
+        # RUNNING on one member, re-queued when it leaves, then a long
+        # pilot wait on the next member: only running time counts
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'RUNNING'}] * 2
+                            + [{'state': 'QUEUED'}] * 20
+                            + [{'state': 'RUNNING'}, {'state': 'DONE'}]}})
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+
+        ticks = iter(range(0, 10000, 7))
+
+        _run(fed, camp, store, stage_timeout=20,
+             clock=lambda: float(next(ticks)))
+
+        stage = camp.workflows[0].stages[0]
+        assert 'timed out' not in (stage.reason or '')
+        assert fed.cancels == []
+
     def test_task_that_never_starts_hits_the_queue_bound(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},

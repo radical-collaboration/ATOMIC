@@ -17,6 +17,7 @@ never through the broker caller, which cannot address the broker itself).
 from __future__ import annotations
 
 import asyncio
+import math
 import base64
 import json
 import logging
@@ -640,7 +641,7 @@ class PluginAtomicCampaign(Plugin):
             number = float(value)
         except (TypeError, ValueError):
             number = float('nan')
-        if not number > 0 or number != number:      # NaN-safe
+        if not number > 0 or not math.isfinite(number):  # NaN, inf
             raise HTTPException(status_code=400,
                                 detail='%s must be a positive number' % key)
         return number

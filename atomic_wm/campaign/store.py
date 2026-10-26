@@ -37,7 +37,9 @@ Source = Tuple[str, Callable[[str], Awaitable[Optional[bytes]]]]
 
 # --------------------------------------------------------------------------
 # stage and file names end up in store paths and in URL path segments
-# (task ids, stage_out routes): one rule for the planner and the store
+# (task ids, stage_out routes).  New specs must use this set (the planner
+# checks it); the store itself only refuses what escapes its directory,
+# so campaigns recovered from state written before the rule still read.
 SAFE_NAME = re.compile(r'[A-Za-z0-9._-]+')
 
 
@@ -51,7 +53,8 @@ def is_safe_name(name: str) -> bool:
 def _safe_name(name: str) -> str:
     """Reject anything that would escape the store directory."""
 
-    if not is_safe_name(name):
+    if not name or name in ('.', '..') \
+            or any(c in name for c in '/\\\0\n'):
         raise ValueError('unsafe store path component: %r' % name)
     return name
 

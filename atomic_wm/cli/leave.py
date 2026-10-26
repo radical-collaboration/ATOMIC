@@ -178,8 +178,10 @@ def stop_endpoint(args: argparse.Namespace) -> int:
         return 0
 
     if endpoint_proc.stop_pid(pid, timeout=args.timeout):
+        record = endpoint_proc.read_pidfile(args.name) or {}
         info('stopped endpoint %s (pid %d)'
-             % (endpoint_proc.endpoint_name(args.name), pid))
+             % (record.get('endpoint')
+                or endpoint_proc.endpoint_name(args.name), pid))
         endpoint_proc.remove_pidfile(args.name)
         return 0
 
