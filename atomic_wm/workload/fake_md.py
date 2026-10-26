@@ -102,7 +102,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    common.require(TOOL, args.temperature > 0, '--temperature must be > 0')
+    common.require(TOOL, math.isfinite(args.temperature)
+                   and args.temperature > 0,
+                   '--temperature must be a finite number > 0')
     common.require(TOOL, args.steps > 0,       '--steps must be > 0')
     common.check_std_args(TOOL, args)
 

@@ -95,6 +95,12 @@ class TestValidation:
         with pytest.raises(PlannerError):
             validate_workflow(spec)
 
+    def test_rejects_non_finite_sweep_values(self):
+        with pytest.raises(PlannerError):
+            validate_sweep({'temperature': [300, float('nan')]})
+        with pytest.raises(PlannerError):
+            validate_sweep({'temperature': [float('inf')]})
+
     def test_rejects_an_oversized_sweep(self):
         with pytest.raises(PlannerError) as exc:
             validate_sweep({'a': list(range(100)), 'b': list(range(100))})

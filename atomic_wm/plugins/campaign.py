@@ -662,14 +662,12 @@ class PluginAtomicCampaign(Plugin):
                 log.info('[%s] campaign %s interrupted by shutdown',
                          self.instance_name, cid)
 
-        for task in list(self._drivers.values()):
-            if task.done():
-                continue
+        # cancel every driver before awaiting any: awaiting one at a time
+        # let the others keep polling and submit new stages meanwhile
+        pending = [task for task in self._drivers.values() if not task.done()]
+        for task in pending:
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):       # noqa: BLE001
-                pass
+        await asyncio.gather(*pending, return_exceptions=True)
         self._drivers.clear()
         self._runners.clear()
         self._persist()

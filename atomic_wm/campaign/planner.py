@@ -13,6 +13,7 @@ a bad spec is a 400 at submit time and never a half-run campaign.
 from __future__ import annotations
 
 import itertools
+import math
 import re
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -101,6 +102,10 @@ def validate_workflow(workflow: Any) -> None:
     params = workflow.get('params')
     if params is not None and not isinstance(params, dict):
         raise PlannerError('workflow "params" must be an object')
+    for key, value in (params or {}).items():
+        if not _finite(value):
+            raise PlannerError('param %r must be a finite number (no NaN / '
+                               'Infinity)' % key)
 
     seen = set()
     for idx, stage in enumerate(stages):
@@ -151,6 +156,12 @@ def _validate_stage(idx: int, stage: Any) -> str:
 
 
 # --------------------------------------------------------------------------
+def _finite(value: Any) -> bool:
+    """False for NaN / +-Infinity: JSON responses cannot encode them."""
+
+    return not isinstance(value, float) or math.isfinite(value)
+
+
 # the cartesian product is expanded inside the submit request and every
 # instance is persisted -- bound it
 MAX_SWEEP_POINTS = 1000
@@ -171,6 +182,9 @@ def validate_sweep(sweep: Any) -> Dict[str, List[Any]]:
         if not isinstance(values, (list, tuple)) or not values:
             raise PlannerError('sweep parameter %r needs a non-empty list '
                                'of values' % key)
+        if any(not _finite(v) for v in values):
+            raise PlannerError('sweep parameter %r: values must be finite '
+                               'numbers (no NaN / Infinity)' % key)
         out[key] = list(values)
 
     n_points = 1

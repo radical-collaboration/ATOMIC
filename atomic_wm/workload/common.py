@@ -17,6 +17,7 @@ so that a revision of the contract touches a single function.
 import argparse
 import hashlib
 import json
+import math
 import os
 import socket
 import statistics
@@ -114,7 +115,8 @@ def add_std_args(parser: argparse.ArgumentParser,
 def check_std_args(tool: str, args: argparse.Namespace) -> None:
     """Validate the arguments added by :func:`add_std_args`."""
 
-    require(tool, args.duration_sec >= 0.0, '--duration-sec must be >= 0')
+    require(tool, math.isfinite(args.duration_sec) and args.duration_sec >= 0.0,
+            '--duration-sec must be a finite number >= 0')
 
 
 def pace(started: float, duration: float) -> float:

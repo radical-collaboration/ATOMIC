@@ -556,14 +556,15 @@ class TestFailures:
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},
                    'polls': [{'state': 'RUNNING'}] * 2
-                            + [{'state': 'QUEUED'}] * 20
+                            + [{'state': 'QUEUED'}] * 40
                             + [{'state': 'RUNNING'}, {'state': 'DONE'}]}})
         camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
         store = _store(tmp_path)
 
         ticks = iter(range(0, 10000, 7))
 
-        _run(fed, camp, store, stage_timeout=20,
+        # the queue wait (40 polls) is far longer than the stage timeout
+        _run(fed, camp, store, stage_timeout=60,
              clock=lambda: float(next(ticks)))
 
         stage = camp.workflows[0].stages[0]
@@ -588,6 +589,23 @@ class TestFailures:
         stage = camp.workflows[0].stages[0]
         assert stage.state == 'FAILED'
         assert 'timed out' in (stage.reason or '')
+
+    def test_a_flapping_task_hits_the_hard_bound(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'RUNNING'},
+                             {'state': 'QUEUED'}] * 500}})
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+
+        ticks = iter(range(0, 100000, 7))
+
+        _run(fed, camp, store, stage_timeout=20, queue_timeout=100,
+             clock=lambda: float(next(ticks)))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert 'did not complete' in (stage.reason or '')
 
     def test_task_that_never_starts_hits_the_queue_bound(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={

@@ -672,6 +672,9 @@ def _validate_login(args: argparse.Namespace) -> None:
         if val is not None and val <= 0:
             raise UsageError('%s must be > 0' % flag)
 
+    if args.gpus_per_node is not None and args.gpus_per_node < 0:
+        raise UsageError('--gpus-per-node must be >= 0')
+
     if args.queue == 'default':
         raise UsageError("--queue must not be 'default' (reserved by the "
                          "orbit task dispatcher)")

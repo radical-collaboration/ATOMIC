@@ -472,7 +472,11 @@ class StageRunner:
         applies, so a task that never starts cannot hang its campaign.
         """
 
-        queue_deadline = self._clock() + self._queue_timeout
+        started        = self._clock()
+        queue_deadline = started + self._queue_timeout
+        # a task flapping between RUNNING and re-queued resets both bounds
+        # below; this one it cannot reset
+        hard_deadline  = started + self._queue_timeout + self._timeout
         deadline: Optional[float] = None
         interval = self._poll
         task_dict: Dict[str, Any] = {}
@@ -495,6 +499,15 @@ class StageRunner:
             state = str(task_dict.get('state') or '')
             if state in TASK_TERMINAL:
                 return task_dict
+
+            if self._clock() > hard_deadline:
+                await self._cancel_task(stage)
+                stage.state  = FAILED
+                stage.reason = ('stage did not complete within %.0f s '
+                                '(last state: %s)'
+                                % (hard_deadline - started,
+                                   state or 'unknown'))
+                raise StageFailed(stage.reason)
 
             if deadline is None and state == 'RUNNING':
                 deadline = self._clock() + self._timeout
