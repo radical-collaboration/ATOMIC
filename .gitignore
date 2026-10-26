@@ -38,3 +38,7 @@ nosetests.xml
 .project
 .pydevproject
 .idea
+
+# demo / runtime artefacts
+telemetry-output/
+demo/2026_09_08/run/

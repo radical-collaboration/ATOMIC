@@ -1,0 +1,34 @@
+; flake8 config for the atomic repo -- mirrors radical.orbit's, so that
+; code moving between the two repos keeps linting clean (RADICAL style
+; aligns assignments and colons, which upsets several pycodestyle rules).
+[flake8]
+exclude         = .git,__pycache__,docs,build,dist,ve,ve3,one_drive,plans
+max-complexity  = 10
+max-line-length = 80
+ignore          =
+     # module level import location
+     E402,
+     # space before/after operator
+     E221, E222, E251,
+     # multiple spaces before/after keyword
+     E271, E272,
+     # line too long (orbit ignores it too; 80 cols stay the target)
+     E501,
+     # whitespace before/after ...
+     E201, E203, E202, E231, E241, E211, E116, E127,
+     # same indent
+     E129,
+     # comment indent not mod(4)
+     E114,
+     # cont line indentation
+     E128, E126, E124, E125, E131,
+     # blank lines
+     W391, E301, E303,
+     # multiple statements on one line
+     E701, E704,
+     # allow line breaks before/after binary operators
+     W503, W504,
+     # explicit delegation
+     W235,
+     # space before nested definition (we use a marker line)
+     E306
