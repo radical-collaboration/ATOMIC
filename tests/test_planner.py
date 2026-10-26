@@ -87,6 +87,21 @@ class TestValidation:
         with pytest.raises(PlannerError):
             validate_workflow(spec)
 
+    @pytest.mark.parametrize('name', ['md v2', 'md?x', 'md#1', 'a\\b'])
+    def test_rejects_unsafe_stage_names(self, name):
+        # stage names become URL path segments and store directories
+        spec = _spec()
+        spec['stages'][0]['name'] = name
+        with pytest.raises(PlannerError):
+            validate_workflow(spec)
+
+    def test_rejects_manifest_as_output(self):
+        spec = _spec()
+        spec['stages'][0]['outputs'] = ['manifest.json']
+        with pytest.raises(PlannerError) as exc:
+            validate_workflow(spec)
+        assert 'reserved' in str(exc.value)
+
     def test_rejects_non_string_cmd_element(self):
         spec = _spec()
         spec['stages'][0]['cmd'] = ['atomic-fake-md', 300]

@@ -1084,14 +1084,14 @@ def test_command_line(monkeypatch, tmp_path):
     binary.write_text('#!/usr/bin/env python3\n')
 
     argv = endpoint_proc.command('ep_a', 'https://host:8013',
-                                 token='tok', cert='/tmp/cert.pem',
+                                 cert='/tmp/cert.pem',
                                  plugins='default', log_level='info',
                                  binary=str(binary))
 
     assert argv[1] == str(binary)
     assert argv[2:] == ['--name', 'ep_a', '--url', 'https://host:8013',
                         '--plugins', 'default', '--log-level', 'INFO',
-                        '--token', 'tok', '--cert', '/tmp/cert.pem']
+                        '--cert', '/tmp/cert.pem']
 
     # no token / cert -> the endpoint resolves them itself
     argv = endpoint_proc.command('ep_a', 'https://host:8013',
@@ -1605,6 +1605,14 @@ def test_scratch_rule_is_lifted_for_a_non_shared_filesystem():
         join.parse_members(
             ['gpu:queue=q,nodes=1,cpus=4,walltime=600,node_hours=1,'
              'scratch=/pscratch/sd/m/x/atomic-demo'])
+
+
+def test_child_env_carries_the_token_not_argv():
+    # argv is world-readable and logged; the token rides in the environment
+    env = endpoint_proc.child_env(base={'PATH': '/bin'}, token='tok')
+    assert env['RADICAL_ORBIT_BROKER_TOKEN'] == 'tok'
+    assert 'RADICAL_ORBIT_BROKER_TOKEN' not in endpoint_proc.child_env(
+        base={'PATH': '/bin'})
 
 
 def test_child_env_names_the_scratch_tree():

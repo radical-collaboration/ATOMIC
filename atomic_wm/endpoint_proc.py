@@ -269,10 +269,16 @@ def find_endpoint_bin(explicit: Optional[str] = None) -> str:
 
 def child_env(base: Optional[Dict[str, str]] = None,
               log_level: str = 'INFO',
-              scratch: Optional[str] = None) -> Dict[str, str]:
+              scratch: Optional[str] = None,
+              token: Optional[str] = None) -> Dict[str, str]:
     """Environment for the endpoint child — see the module docstring."""
 
     env = dict(os.environ if base is None else base)
+
+    # the broker token goes through the environment, not argv: argv is
+    # world-readable (ps, /proc/<pid>/cmdline) and is written to the log
+    if token:
+        env['RADICAL_ORBIT_BROKER_TOKEN'] = token
 
     # the staging plugin allows ~ and /tmp plus this one tree; a site
     # scratch (/pscratch, Lustre) is outside both, so name it
@@ -303,7 +309,6 @@ def child_env(base: Optional[Dict[str, str]] = None,
 
 
 def command(endpoint: str, url: str,
-            token: Optional[str] = None,
             cert: Optional[str] = None,
             plugins: str = 'default',
             log_level: str = 'INFO',
@@ -321,8 +326,6 @@ def command(endpoint: str, url: str,
             '--plugins',   plugins,
             '--log-level', log_level.upper()]
 
-    if token:
-        argv += ['--token', token]
     if cert:
         argv += ['--cert', os.path.expanduser(cert)]
 
@@ -374,7 +377,6 @@ class EndpointProcess:
         state_dir(self.name, create=True)
 
         self.argv = command(self.endpoint, self.url,
-                            token    =self.token,
                             cert     =self.cert,
                             plugins  =self.plugins,
                             log_level=self.log_level,
@@ -393,7 +395,8 @@ class EndpointProcess:
                 stdout=self._logfd,
                 stderr=subprocess.STDOUT,
                 env   =child_env(log_level=self.log_level,
-                                 scratch=self.scratch),
+                                 scratch=self.scratch,
+                                 token  =self.token),
                 # own session: a Ctrl-C on the CLI's terminal must not
                 # race our orderly `leave` + shutdown, and `--detach`
                 # leaves the endpoint behind on purpose

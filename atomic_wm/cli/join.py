@@ -1151,6 +1151,14 @@ def run(args: argparse.Namespace) -> int:
         (m.get('scratch_base') for m in (args.members or [])
          if m.get('scratch_base')), None)
 
+    # a second join of a live name would overwrite its pidfile, and its
+    # failure path would then kill the first instance's pilots and state
+    running = endpoint_proc.endpoint_pids(endpoint)
+    if running:
+        error('%s is already running (pid %s) -- run `atomic-leave %s` first'
+              % (endpoint, ', '.join(str(p) for p in running), name))
+        return 1
+
     proc = EndpointProcess(name, client.broker,
                            endpoint =endpoint,
                            token    =client.token or None,
@@ -1177,6 +1185,11 @@ def run(args: argparse.Namespace) -> int:
 
     except (Interrupted, JoinError, ClientError, KeyboardInterrupt) as e:
         _report_join_failure(e, name, proc.log)
+        if isinstance(e, ClientError) and e.status == 0:
+            # transport failure: the broker may have accepted the join
+            # before the connection broke -- leave so no dead resource
+            # stays registered (a 404 here is reported, not raised)
+            do_leave(client, name)
         abort(name, proc)
         return 1
 

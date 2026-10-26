@@ -18,12 +18,17 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .state import StageRun, WorkflowInstance
+from .store import MANIFEST as MANIFEST_NAME
 
 # A placeholder is a bare ``{name}``; nothing fancier is supported (no
 # ``{a.b}``, no format specs), so a command that legitimately contains braces
 # -- a JSON snippet, a shell brace expansion -- is left alone unless it looks
 # exactly like an identifier in braces.
 _PLACEHOLDER = re.compile(r'\{([A-Za-z_][A-Za-z0-9_]*)\}')
+
+# stage and file names end up in store paths and in URL path segments
+# (task ids, stage_out routes): keep them to a URL- and path-safe set
+_SAFE_NAME = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
 # --------------------------------------------------------------------------
@@ -119,8 +124,9 @@ def _validate_stage(idx: int, stage: Any) -> str:
     name = stage.get('name')
     if not isinstance(name, str) or not name:
         raise PlannerError('stage %d needs a "name"' % idx)
-    if '/' in name or name in ('.', '..'):
-        raise PlannerError('invalid stage name: %r' % name)
+    if not _SAFE_NAME.match(name) or name in ('.', '..'):
+        raise PlannerError('invalid stage name: %r (letters, digits, '
+                           '".", "_" and "-" only)' % name)
 
     cmd = stage.get('cmd')
     if not isinstance(cmd, list) or not cmd:
@@ -132,11 +138,15 @@ def _validate_stage(idx: int, stage: Any) -> str:
     for key in ('inputs', 'outputs'):
         for fname in _as_str_list(stage.get(key),
                                   'stage %r "%s"' % (name, key)):
-            if '/' in fname or fname in ('.', '..'):
+            if not _SAFE_NAME.match(fname) or fname in ('.', '..'):
                 raise PlannerError(
-                    'stage %r: %s entry %r must be a plain file name '
-                    '(staging works on the task working directory only)'
-                    % (name, key, fname))
+                    'stage %r: %s entry %r must be a plain file name of '
+                    'letters, digits, ".", "_" and "-" (staging works on '
+                    'the task working directory only)' % (name, key, fname))
+            if key == 'outputs' and fname == MANIFEST_NAME:
+                raise PlannerError(
+                    'stage %r: output %r is reserved for the stage '
+                    'manifest' % (name, fname))
 
     reqs = stage.get('requirements')
     if reqs is not None and not isinstance(reqs, dict):

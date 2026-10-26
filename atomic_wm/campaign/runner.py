@@ -459,10 +459,12 @@ class StageRunner:
         """Poll until the task is terminal; 1 s, backing off to 3 s.
 
         The timeout is counted on the TASK state only -- a pilot that takes a
-        minute to boot is normal and must not fail a stage.
+        minute to boot, or waits in the batch queue, is normal and must not
+        fail a stage.  The deadline therefore starts at the first RUNNING
+        poll.
         """
 
-        deadline = self._clock() + self._timeout
+        deadline: Optional[float] = None
         interval = self._poll
         task_dict: Dict[str, Any] = {}
         failures = 0
@@ -484,6 +486,11 @@ class StageRunner:
             state = str(task_dict.get('state') or '')
             if state in TASK_TERMINAL:
                 return task_dict
+
+            if deadline is None:
+                if state == 'RUNNING':
+                    deadline = self._clock() + self._timeout
+                continue
 
             if self._clock() > deadline:
                 await self._cancel_task(stage)

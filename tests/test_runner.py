@@ -526,6 +526,25 @@ class TestFailures:
         assert camp.reason == 'the resource federation is not available'
         assert all(wf.state == 'FAILED' for wf in camp.workflows)
 
+    def test_queued_time_does_not_count_toward_the_deadline(self, tmp_path):
+        # a pilot waiting in the batch queue keeps the task QUEUED for long;
+        # the stage deadline starts only at the first RUNNING poll
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'QUEUED'}] * 20
+                            + [{'state': 'RUNNING'}, {'state': 'DONE'}]}})
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+
+        ticks = iter(range(0, 10000, 7))
+
+        _run(fed, camp, store, stage_timeout=20,
+             clock=lambda: float(next(ticks)))
+
+        stage = camp.workflows[0].stages[0]
+        assert 'timed out' not in (stage.reason or '')
+        assert fed.cancels == []
+
     def test_stage_times_out_on_task_state(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},
