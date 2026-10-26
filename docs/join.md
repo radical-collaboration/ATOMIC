@@ -305,10 +305,7 @@ It creates the venv if missing, installs `radical.orbit` and
 prepared venv skips straight to the join.  Knobs: `PYTHON`,
 `ORBIT_SPEC` (a pip spec, a local path, or `none` to skip; defaults to
 `git+https://github.com/radical-cybertools/radical.orbit@$ORBIT_BRANCH`),
-`ORBIT_BRANCH` (default `devel` — note that `devel` does not yet host the
-`federation` plugin the join talks to; until `feature/atomic-federation`
-merges, that branch is what the *broker* must run, while the joining side
-only needs an endpoint), `ATOMIC_SPEC`, `ATOMIC_FORCE=1` to reinstall,
+`ORBIT_BRANCH` (default `devel`), `ATOMIC_SPEC`, `ATOMIC_FORCE=1` to reinstall,
 `ATOMIC_NO_EXEC=1` to only prepare the venv.
 
 > The `cli` extra is what pulls in `requests`.  The base install is

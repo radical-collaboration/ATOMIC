@@ -116,7 +116,7 @@ The scripts remember the resource of the last join or broker run in
 
 ## What the scripts do for you
 
-- Install the pinned stack themselves: `radical.orbit@feature/atomic-federation`
+- Install the pinned stack themselves: `radical.orbit@devel`
   and `ATOMIC@feature/demo-wm`, cloned under the site's demo home (or
   `/tmp/atomic-demo/src`), `git pull` plus a reinstall only when the
   commit moved (`--skip-install` skips the check, `--reinstall` forces it).

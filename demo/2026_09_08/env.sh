@@ -94,7 +94,7 @@ export ATOMIC_DEMO_DIR ATOMIC_SRC ORBIT_SRC
 # A leading `git+` (pip's spelling) is accepted and stripped for git.
 
 : "${ATOMIC_DEMO_ORBIT_REPO:=git+ssh://git@github.com/radical-cybertools/radical.orbit.git}"
-: "${ATOMIC_DEMO_ORBIT_REF:=feature/atomic-federation}"
+: "${ATOMIC_DEMO_ORBIT_REF:=devel}"
 
 : "${ATOMIC_DEMO_ATOMIC_REPO:=git+ssh://git@github.com/radical-collaboration/ATOMIC.git}"
 : "${ATOMIC_DEMO_ATOMIC_REF:=feature/demo-wm}"
@@ -1143,7 +1143,7 @@ demo_join_args() {
                 fi
 
                 # No `--plugins default,psij` any more: since Orbit plan
-                # 122 (feature/atomic-federation 71e895c) the dispatcher
+                # 122 (Orbit devel since #125) the dispatcher
                 # adopts an allocation's endpoint as the pilot instead of
                 # launching a second endpoint through psij.  The demo of
                 # 2026-09-08 still needed psij on the compute node.
