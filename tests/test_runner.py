@@ -545,6 +545,23 @@ class TestFailures:
         assert 'timed out' not in (stage.reason or '')
         assert fed.cancels == []
 
+    def test_task_that_never_starts_hits_the_queue_bound(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'QUEUED'}]}})    # never starts
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+
+        ticks = iter(range(0, 100000, 7))
+
+        _run(fed, camp, store, stage_timeout=20, queue_timeout=100,
+             clock=lambda: float(next(ticks)))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert 'did not start' in (stage.reason or '')
+        assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+
     def test_stage_times_out_on_task_state(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},

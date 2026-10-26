@@ -1154,6 +1154,12 @@ def run(args: argparse.Namespace) -> int:
     # a second join of a live name would overwrite its pidfile, and its
     # failure path would then kill the first instance's pilots and state
     running = endpoint_proc.endpoint_pids(endpoint)
+    prior   = endpoint_proc.read_pidfile(name)
+    if prior and endpoint_proc.pid_alive(int(prior['pid'])) \
+            and endpoint_proc.is_endpoint_cmdline(
+                endpoint_proc.cmdline_of(int(prior['pid'])),
+                str(prior.get('endpoint') or endpoint)):
+        running = sorted(set(running) | {int(prior['pid'])})
     if running:
         error('%s is already running (pid %s) -- run `atomic-leave %s` first'
               % (endpoint, ', '.join(str(p) for p in running), name))
@@ -1185,11 +1191,13 @@ def run(args: argparse.Namespace) -> int:
 
     except (Interrupted, JoinError, ClientError, KeyboardInterrupt) as e:
         _report_join_failure(e, name, proc.log)
-        if isinstance(e, ClientError) and e.status == 0:
-            # transport failure: the broker may have accepted the join
-            # before the connection broke -- leave so no dead resource
-            # stays registered (a 404 here is reported, not raised)
-            do_leave(client, name)
+        if isinstance(e, ClientError) and e.status in (0, 502, 503, 504):
+            # the broker may have accepted the join before the reply was
+            # lost -- but a blind leave could remove someone else's live
+            # resource of the same name, so only say so
+            warn('the federation may still list %r -- check with '
+                 '`atomic-resources`, remove with `atomic-leave %s`'
+                 % (name, name))
         abort(name, proc)
         return 1
 

@@ -176,6 +176,7 @@ class StageRunner:
                  poll_interval:     float = 1.0,
                  poll_max_interval: float = 3.0,
                  stage_timeout:     float = 900.0,
+                 queue_timeout:     float = 4 * 3600.0,
                  tool_prefix:       Optional[str] = None,
                  on_change:         Optional[Callable[[], None]] = None,
                  sleep:             Callable[[float], Any] = asyncio.sleep,
@@ -186,6 +187,7 @@ class StageRunner:
         self._poll         = float(poll_interval)
         self._poll_max     = float(poll_max_interval)
         self._timeout      = float(stage_timeout)
+        self._queue_timeout = float(queue_timeout)
         self._tool_prefix  = tool_prefix if tool_prefix is not None \
                              else os.environ.get(_TOOL_PREFIX_ENV)
         self._on_change    = on_change
@@ -460,10 +462,12 @@ class StageRunner:
 
         The timeout is counted on the TASK state only -- a pilot that takes a
         minute to boot, or waits in the batch queue, is normal and must not
-        fail a stage.  The deadline therefore starts at the first RUNNING
-        poll.
+        fail a stage.  The stage deadline therefore starts at the first
+        RUNNING poll; until then a separate, much longer queue-wait bound
+        applies, so a task that never starts cannot hang its campaign.
         """
 
+        queue_deadline = self._clock() + self._queue_timeout
         deadline: Optional[float] = None
         interval = self._poll
         task_dict: Dict[str, Any] = {}
@@ -487,9 +491,18 @@ class StageRunner:
             if state in TASK_TERMINAL:
                 return task_dict
 
+            if deadline is None and state == 'RUNNING':
+                deadline = self._clock() + self._timeout
+
             if deadline is None:
-                if state == 'RUNNING':
-                    deadline = self._clock() + self._timeout
+                if self._clock() > queue_deadline:
+                    await self._cancel_task(stage)
+                    stage.state  = FAILED
+                    stage.reason = ('stage did not start within %.0f s '
+                                    '(last state: %s)'
+                                    % (self._queue_timeout,
+                                       state or 'unknown'))
+                    raise StageFailed(stage.reason)
                 continue
 
             if self._clock() > deadline:

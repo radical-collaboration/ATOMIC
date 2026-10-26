@@ -492,6 +492,7 @@ def iter_processes() -> List[Tuple[int, str]]:
     """
 
     out: List[Tuple[int, str]] = []
+    uid = os.getuid()
 
     try:
         entries = os.listdir('/proc')
@@ -502,6 +503,10 @@ def iter_processes() -> List[Tuple[int, str]]:
         if not entry.isdigit():
             continue
         try:
+            # other users' processes are neither ours to stop nor proof
+            # that our resource is joined (shared login nodes)
+            if os.stat('/proc/%s' % entry).st_uid != uid:
+                continue
             with open('/proc/%s/cmdline' % entry, 'rb') as fin:
                 raw = fin.read()
         except OSError:

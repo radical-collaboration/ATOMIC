@@ -15,6 +15,7 @@ collection paths worked (see :func:`collect`).
 from __future__ import annotations
 
 import json
+import re
 import logging
 import time
 
@@ -35,10 +36,22 @@ Source = Tuple[str, Callable[[str], Awaitable[Optional[bytes]]]]
 
 
 # --------------------------------------------------------------------------
+# stage and file names end up in store paths and in URL path segments
+# (task ids, stage_out routes): one rule for the planner and the store
+SAFE_NAME = re.compile(r'[A-Za-z0-9._-]+')
+
+
+def is_safe_name(name: str) -> bool:
+    """A plain, URL- and path-safe name (not '.' or '..')."""
+
+    return bool(name) and SAFE_NAME.fullmatch(name) is not None \
+        and name not in ('.', '..')
+
+
 def _safe_name(name: str) -> str:
     """Reject anything that would escape the store directory."""
 
-    if not name or '/' in name or '\\' in name or name in ('.', '..'):
+    if not is_safe_name(name):
         raise ValueError('unsafe store path component: %r' % name)
     return name
 

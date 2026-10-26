@@ -157,10 +157,6 @@ def endpoint_pid(args: argparse.Namespace) -> Optional[int]:
     if found:
         info('found endpoint %s in the process table (pid %s)'
              % (endpoint, ', '.join(str(p) for p in found)))
-        # a duplicate join or a twice-killed CLI can leave several -- the
-        # extras are stopped here, the first is handed back as usual
-        for extra in found[1:]:
-            endpoint_proc.stop_pid(extra)
         return found[0]
 
     if not record:

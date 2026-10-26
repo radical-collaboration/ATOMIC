@@ -87,7 +87,7 @@ class TestValidation:
         with pytest.raises(PlannerError):
             validate_workflow(spec)
 
-    @pytest.mark.parametrize('name', ['md v2', 'md?x', 'md#1', 'a\\b'])
+    @pytest.mark.parametrize('name', ['md v2', 'md?x', 'md#1', 'a\\b', 'md\n'])
     def test_rejects_unsafe_stage_names(self, name):
         # stage names become URL path segments and store directories
         spec = _spec()
