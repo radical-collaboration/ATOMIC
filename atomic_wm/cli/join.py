@@ -19,6 +19,7 @@ See ``docs/join.md``; the resource record is specified in
 """
 
 import argparse
+import math
 import os
 import re
 import signal
@@ -283,8 +284,9 @@ def parse_declare(text: Optional[str]) -> Dict[str, Any]:
         except ValueError:
             raise UsageError('--declare %s: not a number: %r' % (key, val))
 
-        if out[key] < 0:
-            raise UsageError('--declare %s: must not be negative' % key)
+        if not math.isfinite(out[key]) or out[key] < 0:
+            raise UsageError('--declare %s: must be a finite number >= 0'
+                             % key)
 
     return out
 
@@ -464,8 +466,9 @@ def _member_float(name: str, key: str, values: List[str]) -> float:
     except ValueError:
         raise UsageError('--member %s: %s is not a number: %r'
                          % (name, key, raw))
-    if number <= 0:
-        raise UsageError('--member %s: %s must be > 0' % (name, key))
+    if not (math.isfinite(number) and number > 0):
+        raise UsageError('--member %s: %s must be a finite number > 0'
+                         % (name, key))
 
     return number
 
@@ -574,8 +577,9 @@ def validate(args: argparse.Namespace) -> argparse.Namespace:
         args.scratch = check_scratch(args.scratch,
                                      shared=args.shared_fs is not False)
 
-    if args.node_hours is not None and args.node_hours <= 0:
-        raise UsageError('--node-hours must be > 0')
+    if args.node_hours is not None and not (
+            math.isfinite(args.node_hours) and args.node_hours > 0):
+        raise UsageError('--node-hours must be a finite number > 0')
 
     if args.mode == 'login':
         _validate_login(args)

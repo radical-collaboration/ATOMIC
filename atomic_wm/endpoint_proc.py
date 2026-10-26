@@ -681,7 +681,8 @@ def kill_pilots(name: str,
                 record: Optional[Dict[str, Any]] = None) -> List[int]:
     """Terminate the surviving pilot children of the resource `name`.
 
-    Returns the pids which were signalled (empty when there were none).
+    Returns the pids which are gone (empty when there were none); a pilot
+    that survived SIGKILL is logged, not reported as terminated.
     *record* is the joined record (see :func:`pilot_patterns`); without
     one the stored ``record.json`` is read.  `killer`/`alive` are
     injectable, as in :func:`kill_pids`.
@@ -689,10 +690,15 @@ def kill_pilots(name: str,
 
     pids = pilot_pids(name, procs, record)
 
-    if pids:
-        kill_pids(pids, timeout=timeout, killer=killer, alive=alive)
+    if not pids:
+        return []
 
-    return pids
+    gone  = kill_pids(pids, timeout=timeout, killer=killer, alive=alive)
+    stuck = [pid for pid in pids if pid not in gone]
+    if stuck:
+        sys.stderr.write('warning: pilot process(es) survived SIGKILL: %s\n'
+                         % ', '.join(str(pid) for pid in stuck))
+    return list(gone)
 
 
 def kill_pids(pids: Sequence[int], timeout: float = 5.0,

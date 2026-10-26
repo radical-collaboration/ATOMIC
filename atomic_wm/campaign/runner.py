@@ -41,6 +41,8 @@ log = logging.getLogger('radical.orbit')
 
 # dispatcher task states we treat as terminal (00-overview "Facts")
 TASK_TERMINAL = ('DONE', 'FAILED', 'CANCELED')
+# dispatcher task states of a task waiting for a pilot
+TASK_QUEUED   = ('NEW', 'PENDING', 'QUEUED')
 
 # tools that only exist on PATH inside a pilot whose venv has atomic-wm
 # installed; $ATOMIC_TOOL_PREFIX gives them an explicit home (see docs).
@@ -377,6 +379,13 @@ class StageRunner:
                        'size': len(produced.get(name) or b'')}
                       for name in stage.inputs]}
         self._finish_stage(stage, task_dict)
+
+        # the outcome is final BEFORE the manifest records it
+        missing = [c['name'] for c in collected if c['via'] is None]
+        if stage.state == DONE and missing:
+            stage.state  = FAILED
+            stage.reason = 'output(s) not collected: %s' % ', '.join(missing)
+
         try:
             self._store.write_manifest(
                 cid, wf.id, stage.name,
@@ -385,13 +394,8 @@ class StageRunner:
             log.warning('[atomic_campaign] manifest write failed for %s/%s: %s',
                         wf.id, stage.name, exc)
 
-        missing = [c['name'] for c in collected if c['via'] is None]
         if stage.state != DONE:
             raise StageFailed(stage.reason or 'task did not succeed')
-        if missing:
-            stage.state  = FAILED
-            stage.reason = 'output(s) not collected: %s' % ', '.join(missing)
-            raise StageFailed(stage.reason)
 
         # feed the next stage
         for entry in collected:
@@ -494,11 +498,15 @@ class StageRunner:
 
             if deadline is None and state == 'RUNNING':
                 deadline = self._clock() + self._timeout
-            elif deadline is not None and state != 'RUNNING':
+            elif deadline is not None and state in TASK_QUEUED:
                 # back in the queue (its member left, the task was
-                # re-queued): waiting again is not running time
+                # re-queued): waiting again is not running time.  Only an
+                # explicit queue state counts -- a failed poll ({}) does not
                 deadline       = None
                 queue_deadline = self._clock() + self._queue_timeout
+                if stage.state == RUNNING:
+                    stage.state = SUBMITTED
+                    self._changed()
 
             if deadline is None:
                 if self._clock() > queue_deadline:

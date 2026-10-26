@@ -144,6 +144,8 @@ class FakeFederation(FederationAPI):
             raise RuntimeError(plan['task_error'])
         polls = plan.get('polls') or [{'state': 'DONE', 'exit_code': 0}]
         entry = dict(polls[min(n, len(polls) - 1)])
+        if entry.get('raise'):
+            raise RuntimeError(entry['raise'])
         entry.setdefault('cwd', self._cwd.get(task_id))
         if 'resource' not in entry and 'member_id' not in entry:
             entry['resource'] = plan.get('resource', 'res-a')
@@ -313,9 +315,12 @@ class TestCollectionFallback:
         assert stage.outputs[0]['via'] == 'broker_local'
 
     def test_uncollectable_output_fails_the_stage(self, tmp_path):
-        stage, _, _ = self._one_stage(tmp_path, 'none')
+        stage, _, store = self._one_stage(tmp_path, 'none')
         assert stage.state == 'FAILED'
         assert 'not collected' in (stage.reason or '')
+        # the manifest records the final outcome, not the task's DONE
+        [path] = list(store.root.rglob('md/manifest.json'))
+        assert json.loads(path.read_text())['state'] == 'FAILED'
 
     def test_child_endpoint_is_derived_from_pool_and_pilot_id(self, tmp_path):
         plan = {'outputs': {'md.json': _envelope('simulation', 1)},
@@ -564,6 +569,25 @@ class TestFailures:
         stage = camp.workflows[0].stages[0]
         assert 'timed out' not in (stage.reason or '')
         assert fed.cancels == []
+
+    def test_a_failed_poll_is_not_a_requeue(self, tmp_path):
+        # a transient lookup error while RUNNING must not restart the
+        # stage deadline -- a hung task still times out
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'RUNNING'},
+                             {'raise': 'flaky'}] * 50}})
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        store = _store(tmp_path)
+
+        ticks = iter(range(0, 100000, 7))
+
+        _run(fed, camp, store, stage_timeout=20,
+             clock=lambda: float(next(ticks)))
+
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert 'timed out' in (stage.reason or '')
 
     def test_task_that_never_starts_hits_the_queue_bound(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
