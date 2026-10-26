@@ -95,6 +95,11 @@ class TestValidation:
         with pytest.raises(PlannerError):
             validate_workflow(spec)
 
+    def test_rejects_an_oversized_sweep(self):
+        with pytest.raises(PlannerError) as exc:
+            validate_sweep({'a': list(range(100)), 'b': list(range(100))})
+        assert 'limit' in str(exc.value)
+
     def test_rejects_manifest_as_output(self):
         spec = _spec()
         spec['stages'][0]['outputs'] = ['manifest.json']

@@ -572,7 +572,10 @@ class PluginAtomicCampaign(Plugin):
 
         await self._session(request)
         cid = request.query_params.get('cid') if request.query_params else None
-        return self._store.layout(cid or None)
+        try:
+            return self._store.layout(cid or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # -- driver ------------------------------------------------------------
     async def _drive(self, camp: Campaign, runner: CampaignRunner) -> None:

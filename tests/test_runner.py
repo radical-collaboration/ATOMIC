@@ -21,7 +21,7 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationUnavailable, StageRunner,
                                         TaskNotFound, MAX_POLL_FAILURES,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS,
-                                        REASON_STAGE_IN, REASON_STOPPED)
+                                        REASON_STAGE_IN, REASON_CANCELED_RS)
 from atomic_wm.campaign.state   import (CANCELED, Campaign, DONE, FAILED,
                                         PENDING, RUNNING, WorkflowInstance,
                                         load_campaigns, save_campaigns)
@@ -610,7 +610,7 @@ class TestFailures:
         _run(fed, camp, _store(tmp_path))
         stage = camp.workflows[0].stages[0]
         assert stage.state  == 'CANCELED'
-        assert stage.reason == REASON_STOPPED
+        assert stage.reason == REASON_CANCELED_RS
         assert stage.detail == 'pilot lost'
         assert camp.workflows[0].state == 'CANCELED'
         assert camp.state == 'CANCELED'

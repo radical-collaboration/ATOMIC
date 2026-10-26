@@ -56,6 +56,7 @@ REASON_NO_RESOURCE = 'no resource satisfies the stage requirements'
 REASON_NOT_STARTED = 'the stage could not be started'
 REASON_NO_STATUS   = 'the stage status could not be read'
 REASON_STOPPED     = 'the campaign was stopped'
+REASON_CANCELED_RS = 'the stage was cancelled on the resource'
 REASON_INCOMPLETE  = 'the stage did not complete'
 REASON_STAGE_IN    = 'the input file could not be placed on the resource'
 # an empty federation is a different story from one whose resources do not
@@ -632,8 +633,10 @@ class StageRunner:
             stage.state  = DONE
             stage.reason = None
         elif state == 'CANCELED':
+            # our own stops never get here (the poll loop raises first):
+            # this cancel came from the resource side -- leave, operator
             stage.state  = CANCELED
-            stage.reason = REASON_STOPPED
+            stage.reason = REASON_CANCELED_RS
             stage.detail = task_dict.get('error') or None
         else:
             stage.state  = FAILED

@@ -151,6 +151,11 @@ def _validate_stage(idx: int, stage: Any) -> str:
 
 
 # --------------------------------------------------------------------------
+# the cartesian product is expanded inside the submit request and every
+# instance is persisted -- bound it
+MAX_SWEEP_POINTS = 1000
+
+
 def validate_sweep(sweep: Any) -> Dict[str, List[Any]]:
     """Normalise the sweep to ``{param: [values]}``; reject anything else."""
 
@@ -167,6 +172,13 @@ def validate_sweep(sweep: Any) -> Dict[str, List[Any]]:
             raise PlannerError('sweep parameter %r needs a non-empty list '
                                'of values' % key)
         out[key] = list(values)
+
+    n_points = 1
+    for values in out.values():
+        n_points *= len(values)
+    if n_points > MAX_SWEEP_POINTS:
+        raise PlannerError('sweep expands to %d workflows; the limit is %d'
+                           % (n_points, MAX_SWEEP_POINTS))
     return out
 
 

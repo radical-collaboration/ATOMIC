@@ -3,8 +3,9 @@
 The counterpart of ``atomic-join --detach``: it
 
 1. tells the federation to drop the resource (``POST
-   /broker/federation/leave/default/<name>``, which cancels the pool's
-   tasks and unregisters its dispatcher session),
+   /broker/federation/leave/default/<name>``, which unregisters its
+   dispatcher session; the pool's tasks are cancelled only with
+   ``--cancel-tasks``),
 2. stops the endpoint child recorded in
    ``~/.radical/orbit/atomic/<name>/endpoint.pid``,
 3. terminates **surviving pilot children** -- psij's ``local`` executor
@@ -136,8 +137,10 @@ def endpoint_pid(args: argparse.Namespace) -> Optional[int]:
     record   = endpoint_proc.read_pidfile(args.name)
 
     if record:
-        pid     = int(record['pid'])
-        cmdline = endpoint_proc.cmdline_of(pid)
+        # a join with --endpoint records its own name; ep_<name> otherwise
+        endpoint = str(record.get('endpoint') or endpoint)
+        pid      = int(record['pid'])
+        cmdline  = endpoint_proc.cmdline_of(pid)
 
         if endpoint_proc.is_endpoint_cmdline(cmdline, endpoint):
             return pid
