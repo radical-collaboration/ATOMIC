@@ -404,7 +404,8 @@ class PluginAtomicCampaign(Plugin):
                            else _FederationAPI(app)
         self._planner    = SweepPlanner()
         self._max_wf     = int(max_concurrent_workflows)
-        self._timeout    = float(stage_timeout_sec)
+        # not `_timeout`: that is Plugin's session-expiry hook (orbit #157)
+        self._stage_timeout = float(stage_timeout_sec)
         self._poll       = float(poll_interval_sec)
         self._poll_max   = float(poll_max_interval_sec)
 
@@ -501,7 +502,8 @@ class PluginAtomicCampaign(Plugin):
 
         max_wf  = self._positive(body, 'max_concurrent_workflows',
                                  self._max_wf)
-        timeout = self._positive(body, 'stage_timeout_sec', self._timeout)
+        timeout = self._positive(body, 'stage_timeout_sec',
+                                 self._stage_timeout)
 
         try:
             instances = self._planner.expand(workflow, body.get('sweep'))
