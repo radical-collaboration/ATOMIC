@@ -227,6 +227,11 @@ class Campaign:
     # [{'task_id', 'dispatcher_sid'}]: cancels the federation has not
     # confirmed yet (it was unreachable); drained once it answers again
     pending_cancels: List[Dict[str, str]] = field(default_factory=list)
+    # who plans the campaign: 'sweep' (fixed instances) or 'aucam' (the
+    # Campaign Manager launches frames as it goes); AuCaM's outcome summary
+    # lands in `outcome` when the campaign ends
+    planner:     str                    = 'sweep'
+    outcome:     Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -273,6 +278,7 @@ class Campaign:
                 'state'      : self.state,
                 'reason'     : self.reason,
                 'sweep'      : self.sweep,
+                'planner'    : self.planner,
                 'created_at' : self.created_at,
                 'started_at' : self.started_at,
                 'finished_at': self.finished_at,

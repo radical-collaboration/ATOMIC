@@ -9,10 +9,8 @@ scores are exactly what a rehearsal would see.
 AuCaM (``src.aucam`` @ 6842888) must be importable -- put the clone on
 PYTHONPATH -- or the module is skipped.
 
-Tests marked ``needs_track_a`` exercise the contract "a cancelled
-``StageRunner.run_workflow`` cancels its ORBIT task", which the track-A
-runner change provides; until it lands they are expected to fail (xfail,
-not strict, so they turn into XPASS once it does).
+``TestTrackAContract`` exercises "a cancelled ``StageRunner.run_workflow``
+cancels its ORBIT task", which the runner provides since the endpoint work.
 """
 
 import asyncio
@@ -40,9 +38,6 @@ from atomic_wm.workload.frames import (GOOD_SCORE, POOR_SCORE,  # noqa: E402
                                        frame_workflow, synthetic_frames,
                                        synthetic_submit_body)
 
-needs_track_a = pytest.mark.xfail(
-    strict=False,
-    reason='needs track A: a cancelled run_workflow cancels its ORBIT task')
 
 # one synthetic second takes this long here (a 5 s stage runs 0.1 s)
 TIME_FACTOR = 0.02
@@ -439,7 +434,6 @@ class TestCampaign:
 # ---------------------------------------------------------------------------
 class TestTrackAContract:
 
-    @needs_track_a
     def test_cancel_reaches_orbit_when_the_runner_is_stuck(self, tmp_path,
                                                            store):
         # the poll of frame 0's analysis never returns: the runner never
@@ -469,3 +463,53 @@ def test_controller_requires_frames_in_obs_shape():
     plan = parse_aucam_request(_body(3, 0))
     ctl  = BigsimController(plan)
     assert [g.metric for g in ctl.goals()] == ['good_frames']
+
+
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def plugin_clients():
+    """Close the plugin TestClients this module opens (their fixture lives in
+    test_plugin_campaign and does not run here)."""
+
+    import test_plugin_campaign as tpc
+    yield tpc
+    while tpc._OPEN_CLIENTS:
+        try:
+            tpc._OPEN_CLIENTS.pop().__exit__(None, None, None)
+        except Exception:                                     # noqa: BLE001
+            pass
+
+
+class TestPluginRoute:
+    """``planner: aucam`` through the plugin's submit route."""
+
+    def test_aucam_campaign_runs_through_the_plugin(self, tmp_path,
+                                                    plugin_clients):
+        NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
+        _request = plugin_clients._request
+        _wait_terminal = plugin_clients._wait_terminal
+
+        fed = TimedFederation(tmp_path)
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+
+        resp = client.post('%s/campaigns/default' % NS, json=_body())
+        assert resp.status_code == 200, resp.text
+        cid = resp.json()['campaign_id']
+
+        camp = _wait_terminal(client, cid, timeout=60.0)
+        assert camp['planner'] == 'aucam'
+        assert camp['state'] == 'DONE', camp.get('reason')
+        assert camp['workflows'], 'AuCaM launched no frame'
+        assert camp['outcome'], 'no AuCaM outcome stored'
+        # every launch got its own task ids
+        assert len(set(fed.submits)) == len(fed.submits)
+
+    def test_bad_aucam_request_is_400(self, tmp_path, plugin_clients):
+        NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
+        _request = plugin_clients._request
+
+        _, plugin = _make_plugin(tmp_path, fed=TimedFederation(tmp_path))
+        body = _body(direction='sideways')
+        resp = _request(plugin).post('%s/campaigns/default' % NS, json=body)
+        assert resp.status_code == 400

@@ -585,7 +585,10 @@ class PluginAtomicCampaign(Plugin):
         self._stopping   = False
 
         self._campaigns: Dict[str, Campaign]       = {}
-        self._runners:   Dict[str, CampaignRunner] = {}
+        # CampaignRunner (sweep) or AucamCampaignDriver (aucam): both offer
+        # run(campaign) / cancel()
+        self._runners:   Dict[str, Any] = {}
+        self._aucam_backend: Any = None     # shared by every AuCaM driver
         self._drivers:   Dict[str, asyncio.Task]   = {}
 
         for camp in load_campaigns(self._state_file):
@@ -723,7 +726,11 @@ class PluginAtomicCampaign(Plugin):
         """``POST campaigns/{sid}`` -- plan a campaign and start driving it.
 
         Body: ``{"workflow": <spec>, "sweep": {"param": [values]},
-        "name"?, "max_concurrent_workflows"?, "stage_timeout_sec"?}``.
+        "name"?, "max_concurrent_workflows"?, "stage_timeout_sec"?,
+        "planner"?: "sweep"|"aucam", "aucam"?: {...}}``.  With
+        ``planner: aucam`` the Campaign Manager launches the frames itself
+        (see :mod:`atomic_wm.campaign.aucam_adapter` for the ``aucam`` keys);
+        503 when AuCaM is not installed.
 
         The spec is validated synchronously (400 on a bad one); everything
         that can only fail later -- no federation, no resource, a failing
@@ -738,31 +745,43 @@ class PluginAtomicCampaign(Plugin):
             raise HTTPException(status_code=400,
                                 detail="body needs a 'workflow' spec")
 
+        # imported here: the adapter is only needed for 'aucam' campaigns,
+        # and it imports without AuCaM installed
+        from atomic_wm.campaign import aucam_adapter
+        try:
+            planner = aucam_adapter.planner_of(body)
+        except PlannerError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         max_wf  = self._positive(body, 'max_concurrent_workflows',
                                  self._max_wf)
         timeout = self._positive(body, 'stage_timeout_sec',
                                  self._stage_timeout)
 
-        try:
-            instances = self._planner.expand(workflow, body.get('sweep'))
-        except PlannerError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        stage_kwargs = dict(stage_timeout=float(timeout),
+                            unreachable_budget=self._budget,
+                            poll_interval=self._poll,
+                            poll_max_interval=self._poll_max)
+        name = str(body.get('name') or workflow.get('name') or 'campaign')
 
-        camp = Campaign(campaign_id=new_campaign_id(),
-                        name=str(body.get('name')
-                                 or workflow.get('name') or 'campaign'),
-                        sweep=dict(body.get('sweep') or {}),
-                        workflows=instances)
+        if planner == 'aucam':
+            camp, runner = await self._aucam_campaign(body, name,
+                                                      stage_kwargs)
+        else:
+            try:
+                instances = self._planner.expand(workflow, body.get('sweep'))
+            except PlannerError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            camp = Campaign(campaign_id=new_campaign_id(), name=name,
+                            sweep=dict(body.get('sweep') or {}),
+                            workflows=instances)
+            runner = CampaignRunner(
+                self._fed, self._store,
+                max_concurrent_workflows=int(max_wf),
+                on_change=self._persist, **stage_kwargs)
+
         self._campaigns[camp.campaign_id] = camp
         self._persist()
-
-        runner = CampaignRunner(
-            self._fed, self._store,
-            max_concurrent_workflows=int(max_wf),
-            on_change=self._persist,
-            stage_timeout=float(timeout),
-            unreachable_budget=self._budget,
-            poll_interval=self._poll, poll_max_interval=self._poll_max)
         self._runners[camp.campaign_id] = runner
         self._drivers[camp.campaign_id] = asyncio.create_task(
             self._drive(camp, runner))
@@ -771,6 +790,28 @@ class PluginAtomicCampaign(Plugin):
                  self.instance_name, camp.campaign_id, len(camp.workflows),
                  camp.sweep)
         return camp.brief()
+
+    async def _aucam_campaign(self, body: Dict[str, Any], name: str,
+                              stage_kwargs: Dict[str, Any]
+                              ) -> Tuple[Campaign, Any]:
+        """Validate an ``aucam`` submit; return (campaign, driver)."""
+
+        from atomic_wm.campaign import aucam_adapter
+        try:
+            plan = aucam_adapter.parse_aucam_request(body)
+        except aucam_adapter.AucamUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except PlannerError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if self._aucam_backend is None:
+            self._aucam_backend = await aucam_adapter.make_backend()
+        camp = Campaign(campaign_id=new_campaign_id(), name=name,
+                        sweep=dict(body.get('sweep') or {}),
+                        planner='aucam', workflows=[])
+        driver = aucam_adapter.AucamCampaignDriver(
+            self._fed, self._store, plan, on_change=self._persist,
+            backend=self._aucam_backend, **stage_kwargs)
+        return camp, driver
 
     async def _route_list(self, request: Request) -> dict:
         """``GET campaigns/{sid}`` -- one summary per campaign, newest first."""
@@ -820,11 +861,12 @@ class PluginAtomicCampaign(Plugin):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # -- driver ------------------------------------------------------------
-    async def _drive(self, camp: Campaign, runner: CampaignRunner) -> None:
+    async def _drive(self, camp: Campaign, runner: Any) -> None:
         """Run one campaign to its end; never let an error escape the task."""
 
         try:
             await runner.run(camp)
+            camp.outcome = getattr(runner, 'outcome', None)
         except asyncio.CancelledError:
             # shutdown() has already stamped INTERRUPTED; a cancel from
             # anywhere else means the campaign was stopped

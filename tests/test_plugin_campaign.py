@@ -1002,3 +1002,10 @@ class TestPendingCancelsInThePlugin:
         _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path),
                                  unreachable_budget_sec=7)
         assert plugin._budget == 7.0
+
+
+def test_unknown_planner_is_400(tmp_path):
+    _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
+    body = {'workflow': _spec(), 'planner': 'magic'}
+    resp = _request(plugin).post('%s/campaigns/default' % NS, json=body)
+    assert resp.status_code == 400
