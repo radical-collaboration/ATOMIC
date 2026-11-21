@@ -1005,17 +1005,46 @@ class StageRunner:
         1. the pilot's own ``staging`` plugin (works without a shared FS),
         2. the dispatcher's ``stage_out`` (shared FS),
         3. a direct read on the broker host (localhost).
+
+        An output that no source delivered while one of them failed with a
+        transient error (:func:`is_transient` -- the broker went away right
+        after the task ended) is tried again within the unreachable budget,
+        like a poll; any round that collects something resets it.
         """
 
-        collected = await self._store.collect(
-            campaign.campaign_id, wf.id, stage.name,
-            list(stage.declared_outputs), self._sources(stage))
-        stage.outputs = collected
+        entries: Dict[str, Dict[str, Any]] = {}
+        names    = list(stage.declared_outputs)
+        interval = RETRY_MIN_INTERVAL
+        down_since: Optional[float] = None
+        while names:
+            transient: List[BaseException] = []
+            for entry in await self._store.collect(
+                    campaign.campaign_id, wf.id, stage.name, names,
+                    self._sources(stage, transient)):
+                entries[entry['name']] = entry
+            missing = [n for n in names if entries[n]['via'] is None]
+            if not missing or not transient:
+                break
+            now = self._clock()
+            if down_since is None or len(missing) < len(names):
+                down_since = now
+            if now - down_since >= self._budget:
+                break
+            log.info('[atomic_campaign] outputs of %s deferred: %s',
+                     stage.task_id, describe(transient[-1]))
+            await self._sleep(interval)
+            interval = min(interval * 2, RETRY_MAX_INTERVAL)
+            names = missing
+
+        stage.outputs = [entries[n] for n in stage.declared_outputs
+                         if n in entries]
         self._changed()
-        return collected
+        return stage.outputs
 
     # ----------------------------------------------------------------------
-    def _sources(self, stage: StageRun) -> List[Source]:
+    def _sources(self, stage: StageRun,
+                 transient: List[BaseException]) -> List[Source]:
+        """The collection sources; *transient* gathers their outages."""
 
         async def _pilot(name: str) -> Optional[bytes]:
             if not stage.child_endpoint or not stage.cwd:
@@ -1037,9 +1066,26 @@ class StageRunner:
                 return None
             return path.read_bytes()
 
-        return [('pilot_staging', _pilot),
-                ('dispatcher_stage_out', _stage_out),
+        return [_noting(('pilot_staging', _pilot), transient),
+                _noting(('dispatcher_stage_out', _stage_out), transient),
                 ('broker_local', _local)]
+
+
+# --------------------------------------------------------------------------
+def _noting(source: Source, transient: List[BaseException]) -> Source:
+    """*source*, recording its transient errors in *transient* (it still
+    raises them -- the store records every error per source)."""
+
+    label, call = source
+
+    async def _fetch(name: str) -> Optional[bytes]:
+        try:
+            return await call(name)
+        except Exception as exc:                              # noqa: BLE001
+            if is_transient(exc):
+                transient.append(exc)
+            raise
+    return label, _fetch
 
 
 # --------------------------------------------------------------------------

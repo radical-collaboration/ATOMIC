@@ -167,6 +167,10 @@ class FakeFederation(FederationAPI):
         return [{'name': 'res-a'}, {'name': 'res-b'}]
 
     async def stage_out(self, dispatcher_sid, task_id, filename):
+        # exceptions the next stage_out calls of this stage raise, in order
+        errors = self.plan(self._stage_of(task_id)).get('stage_out_errors')
+        if errors:
+            raise errors.pop(0)
         return self._scratch.get((task_id, filename))
 
     async def staging_get(self, endpoint, path):
@@ -1129,6 +1133,54 @@ class TestBrokerOutageWhilePolling:
         _run(fed, camp, _store(tmp_path))
         assert camp.workflows[0].stages[0].state == 'FAILED'
         assert camp.pending_cancels == []
+
+    @pytest.mark.parametrize('name', ['connection', '503', '500'])
+    def test_an_outage_after_the_task_ended_still_collects(self, tmp_path,
+                                                           name):
+        # the task finished, then the broker went away before its outputs
+        # were fetched: the collection waits the outage out like a poll
+        exc = _transients()[name]
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'stage_out_errors': [exc] * 6}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 5))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             clock=lambda: float(next(ticks)),
+             sleep=lambda _s: asyncio.sleep(0))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'DONE', (stage.reason, stage.outputs)
+        assert stage.outputs[0]['via'] == 'dispatcher_stage_out'
+
+    def test_an_outage_past_the_budget_leaves_outputs_uncollected(
+            self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'stage_out_errors': [ConnectionError('down')] * 1000}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 10))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             clock=lambda: float(next(ticks)),
+             sleep=lambda _s: asyncio.sleep(0))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert 'not collected: md.json' in stage.reason
+        errors = fed.plans['md']['stage_out_errors']
+        assert 1000 - len(errors) >= 5             # it waited, then gave up
+        assert 'ConnectionError' in \
+               stage.outputs[0]['errors']['dispatcher_stage_out']
+
+    def test_a_missing_output_is_not_waited_for(self, tmp_path):
+        # no source failed transiently: the file is simply not there
+        fed = FakeFederation(tmp_path, plans={'md': {'outputs': {}}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        sleeps = []
+        _run(fed, camp, _store(tmp_path),
+             sleep=lambda s: sleeps.append(s) or asyncio.sleep(0))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert 'not collected' in stage.reason
+        assert len(sleeps) == 1                    # the single poll's
 
     def test_a_success_resets_the_budget(self, tmp_path):
         # outages of ~60 s each, separated by one good answer, never add

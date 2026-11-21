@@ -55,7 +55,7 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationUnavailable,
                                         DEFAULT_UNREACHABLE_BUDGET,
                                         call_error, drain_pending_cancels,
-                                        is_transient_status,
+                                        is_transient, is_transient_status,
                                         REASON_INCOMPLETE, REASON_NOT_STARTED,
                                         REASON_NO_RESOURCE,
                                         REASON_NO_RESOURCES_JOINED,
@@ -325,6 +325,9 @@ class _FederationAPI(FederationAPI):
             DISPATCHER_PLUGIN, 'GET',
             '/%s/stage_out/%s/%s/%s' % (DISPATCHER_PLUGIN, dispatcher_sid,
                                         task_id, filename))
+        if status >= 400 and is_transient_status(status, self._detail(data)):
+            # an outage, not a missing file: the runner retries it
+            raise call_error(status, self._detail(data), REASON_INCOMPLETE)
         if status >= 400 or not isinstance(data, dict):
             return None
         content = data.get('content_b64')
@@ -505,6 +508,8 @@ class _RemoteFederationAPI(_FederationAPI):
         except Exception as exc:                              # noqa: BLE001
             log.info('[atomic_campaign] staging get %s:%s failed: %s',
                      endpoint, path, exc)
+            if is_transient(exc):
+                raise                     # the broker is away: retried
             return None
 
 

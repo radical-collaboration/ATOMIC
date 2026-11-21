@@ -374,6 +374,22 @@ class TestFederationAPICalls:
     def test_stage_out_returns_none_when_absent(self, tmp_path):
         api, _ = self._api(tmp_path, {})
         assert asyncio.run(api.stage_out('sid-a', 't1', 'md.json')) is None
+        api, _ = self._api(tmp_path, {
+            ('GET', '/task_dispatcher/stage_out/sid-a/t1/md.json'):
+                (404, {'detail': 'no such file: md.json'})})
+        assert asyncio.run(api.stage_out('sid-a', 't1', 'md.json')) is None
+
+    @pytest.mark.parametrize('status, detail', [
+        (503, 'endpoint suspect'), (500, 'boom'),
+        (410, '[task_dispatcher] shutting down')])
+    def test_stage_out_raises_an_outage(self, tmp_path, status, detail):
+        from atomic_wm.campaign.runner import is_transient
+        api, _ = self._api(tmp_path, {
+            ('GET', '/task_dispatcher/stage_out/sid-a/t1/md.json'):
+                (status, {'detail': detail})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.stage_out('sid-a', 't1', 'md.json'))
+        assert is_transient(exc.value)
 
     def test_staging_needs_a_broker_caller(self, tmp_path):
         api, _ = self._api(tmp_path, {})
@@ -934,8 +950,14 @@ class TestRemoteFederationAPI:
         assert '/staging/get/st.1' in paths
 
     def test_a_failing_staging_call_is_not_fatal(self):
-        api = self._api(FakeRuntime(raises=ConnectionError('gone')))
+        api = self._api(FakeRuntime(raises=RuntimeError('no such file')))
         assert asyncio.run(api.staging_get('fed-a_p1', '/tmp/x')) is None
+
+    def test_a_lost_connection_during_staging_is_raised(self):
+        # an outage, not a missing file: the runner retries it in budget
+        api = self._api(FakeRuntime(raises=ConnectionError('gone')))
+        with pytest.raises(ConnectionError):
+            asyncio.run(api.staging_get('fed-a_p1', '/tmp/x'))
 
 
 class TestPendingCancelsInThePlugin:
