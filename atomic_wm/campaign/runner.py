@@ -187,6 +187,15 @@ def call_error(status: int, detail: str, reason: str) -> FederationCallError:
 
 
 # --------------------------------------------------------------------------
+def describe(exc: BaseException) -> str:
+    """``'TimeoutError: ...'`` -- a bare ``TimeoutError()`` has no text."""
+
+    text = str(exc)
+    return '%s: %s' % (type(exc).__name__, text) if text \
+           else type(exc).__name__
+
+
+# --------------------------------------------------------------------------
 def is_transient(exc: BaseException) -> bool:
     """Transport errors and the transient HTTP answers above."""
 
@@ -228,7 +237,7 @@ async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
     except Exception as exc:                                  # noqa: BLE001
         if is_transient(exc):
             log.info('[atomic_campaign] cancel of %s deferred: %s',
-                     task_id, exc)
+                     task_id, describe(exc))
             return False
         log.info('[atomic_campaign] cancel of %s refused: %s', task_id, exc)
         ok = False
@@ -593,9 +602,9 @@ class StageRunner:
                     raise FederationCallError(
                         REASON_NOT_STARTED,
                         'federation unreachable for %.0f s: %s'
-                        % (now - down_since, exc)) from exc
+                        % (now - down_since, describe(exc))) from exc
                 log.info('[atomic_campaign] submit of %s deferred: %s',
-                         stage.task_id, exc)
+                         stage.task_id, describe(exc))
                 await self._sleep(interval)
                 interval = min(interval * 2, RETRY_MAX_INTERVAL)
                 # the submit may have landed: a stop must cancel it
@@ -797,12 +806,12 @@ class StageRunner:
         if down_since is None:
             down_since = now
         log.info('[atomic_campaign] status of %s unreadable for %.0f s: %s',
-                 stage.task_id, now - down_since, exc)
+                 stage.task_id, now - down_since, describe(exc))
         if now - down_since >= self._budget:
             stage.state  = FAILED
             stage.reason = REASON_NO_STATUS
             stage.detail = ('federation unreachable for %.0f s: %s'
-                            % (now - down_since, exc))
+                            % (now - down_since, describe(exc)))
             raise StageFailed(stage.reason) from exc
         return {}, down_since
 
