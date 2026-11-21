@@ -27,7 +27,7 @@ pytest.importorskip('src.aucam', reason='AuCaM (src.aucam) not importable')
 
 from atomic_wm.campaign.aucam_adapter import (                 # noqa: E402
     REASON_LIMIT, AucamCampaignDriver, BigsimController, launch_id,
-    make_backend, parse_aucam_request, planner_of, run_aucam_campaign)
+    make_backend, parse_aucam_request, planner_of)
 from atomic_wm.campaign.planner import PlannerError           # noqa: E402
 from atomic_wm.campaign.runner import (FederationAPI,         # noqa: E402
                                        FederationUnavailable)
@@ -420,12 +420,10 @@ class TestCampaign:
         assert camp.state == 'FAILED'
         assert camp.reason == FederationUnavailable.DEFAULT
 
-    def test_run_aucam_campaign_entry_point(self, tmp_path, store):
+    def test_the_driver_returns_the_outcome(self, tmp_path, store):
         fed  = TimedFederation(tmp_path)
-        camp = _campaign()
-        out  = asyncio.run(run_aucam_campaign(
-            camp, fed, store, _body(4, 3, goal_good_frames=None),
-            **STAGE_KW))
+        driver, camp = _drive(fed, store, _body(4, 3, goal_good_frames=None))
+        out  = _run(driver, camp)
         assert out['planner'] == 'aucam'
         assert out['frames'] == 4
         assert camp.state == 'DONE'

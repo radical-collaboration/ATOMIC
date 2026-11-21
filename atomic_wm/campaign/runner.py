@@ -204,23 +204,6 @@ def is_transient(exc: BaseException) -> bool:
 
 
 # --------------------------------------------------------------------------
-def queue_cancel(campaign: Campaign, task_id: str,
-                 dispatcher_sid: Optional[str]) -> bool:
-    """Put one task on the campaign's persisted pending-cancel list.
-
-    Returns ``False`` if it was there already (one entry per task id).
-    """
-
-    return campaign.queue_cancel(task_id, dispatcher_sid)
-
-
-# --------------------------------------------------------------------------
-def _unqueue_cancel(campaign: Campaign, task_id: str) -> None:
-    campaign.pending_cancels[:] = [e for e in campaign.pending_cancels
-                                   if e.get('task_id') != task_id]
-
-
-# --------------------------------------------------------------------------
 async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
                      task_id: str, dispatcher_sid: str) -> bool:
     """One cancel call; drop the task from the pending list unless the
@@ -244,7 +227,7 @@ async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
     if not ok:
         log.info('[atomic_campaign] cancel of %s not confirmed -- dropped',
                  task_id)
-    _unqueue_cancel(campaign, task_id)
+    campaign.unqueue_cancel(task_id)
     return True
 
 
@@ -261,7 +244,7 @@ async def drain_pending_cancels(fed: 'FederationAPI',
     for entry in list(campaign.pending_cancels):
         task_id = str(entry.get('task_id') or '')
         if not task_id:
-            _unqueue_cancel(campaign, task_id)
+            campaign.unqueue_cancel(task_id)
             continue
         if not await try_cancel(fed, campaign, task_id,
                                 str(entry.get('dispatcher_sid')
@@ -933,13 +916,12 @@ class StageRunner:
             return
         task_id = stage.task_id
         sid     = stage.dispatcher_sid or FED_DISPATCHER_SID
-        queue_cancel(campaign, task_id, sid)
+        campaign.queue_cancel(task_id, sid)
         self._changed()
 
         async def _attempts() -> None:
             for attempt in range(CANCEL_ATTEMPTS):
-                if not any(e.get('task_id') == task_id
-                           for e in campaign.pending_cancels):
+                if not campaign.cancel_pending(task_id):
                     return                        # someone else settled it
                 if await try_cancel(self._fed, campaign, task_id, sid):
                     self._changed()
@@ -953,11 +935,9 @@ class StageRunner:
         _BACKGROUND.add(job)
         job.add_done_callback(_BACKGROUND.discard)
         try:
-            await asyncio.shield(job)
-        except asyncio.CancelledError:
             # cancelled again while cancelling: the job carries on, the
             # caller's cancel is honoured
-            raise
+            await asyncio.shield(job)
         except Exception as exc:                              # noqa: BLE001
             log.info('[atomic_campaign] cancel of %s failed: %s',
                      task_id, exc)

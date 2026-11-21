@@ -89,7 +89,7 @@ The plugin calls, in this order::
     driver = AucamCampaignDriver(fed, store, plan, on_change=persist,
                                  backend=shared_backend, **stage_kwargs)
     await driver.run(camp)    # returns camp in its final state
-    driver.outcome            # the summary dict (also: run_aucam_campaign)
+    driver.outcome            # the summary dict
     driver.cancel()           # from the cancel route; CampaignManager.stop()
 
 ``driver`` has the same ``run(campaign)`` / ``cancel()`` shape as
@@ -966,23 +966,3 @@ def _dotted(doc: Any, key: str) -> Optional[float]:
         cur = cur[part]
     return float(cur) if _is_num(cur) else None
 
-
-# --------------------------------------------------------------------------
-async def run_aucam_campaign(campaign: Campaign, fed: FederationAPI,
-                             store: ResultStore, spec_params: Any,
-                             on_change: Optional[Callable[[], None]] = None,
-                             *, backend: Any = None,
-                             **stage_kwargs: Any) -> Dict[str, Any]:
-    """Run *campaign* with AuCaM; return the outcome summary.
-
-    *spec_params* is either the whole submit body or an :class:`AucamPlan`
-    from :func:`parse_aucam_request`.  The campaign is updated in place
-    (``workflows`` grows by one instance per AuCaM launch).
-    """
-
-    plan = spec_params if isinstance(spec_params, AucamPlan) \
-        else parse_aucam_request(spec_params)
-    driver = AucamCampaignDriver(fed, store, plan, on_change=on_change,
-                                 backend=backend, **stage_kwargs)
-    await driver.run(campaign)
-    return driver.outcome or {}

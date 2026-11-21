@@ -242,12 +242,23 @@ class Campaign:
                      dispatcher_sid: Optional[str] = None) -> bool:
         """Add one task to ``pending_cancels`` (once per task id)."""
 
-        if any(e.get('task_id') == task_id for e in self.pending_cancels):
+        if self.cancel_pending(task_id):
             return False
         self.pending_cancels.append(
             {'task_id': task_id,
              'dispatcher_sid': dispatcher_sid or FED_DISPATCHER_SID})
         return True
+
+    def unqueue_cancel(self, task_id: str) -> None:
+        """Drop one task from ``pending_cancels`` (it is settled)."""
+
+        self.pending_cancels[:] = [e for e in self.pending_cancels
+                                   if e.get('task_id') != task_id]
+
+    def cancel_pending(self, task_id: str) -> bool:
+        """Whether *task_id* still waits on ``pending_cancels``."""
+
+        return any(e.get('task_id') == task_id for e in self.pending_cancels)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Campaign':
