@@ -22,8 +22,14 @@ runs: stage by stage through the federation.  The seam between the two:
 - **Reports**: after every state change of its stages (and at least every
   ``report_interval_s``) the block emits ``score`` (``None`` until the
   score stage is collected) and running totals ``node_hours`` /
-  ``cpu_hours``, counted from the first RUNNING poll of each stage -- so
-  AuCaM never charges batch-queue wait or a broker outage.
+  ``cpu_hours``, counted from the first RUNNING poll of each stage to its
+  end.  Batch-queue wait before that poll is not charged.  Charged: a
+  broker outage while the stage runs (the stage stays RUNNING, as the
+  resource would bill it), and the time a stage spends re-queued after it
+  ran (``started_at`` is kept, so ``spent`` runs on).  Resetting
+  ``started_at`` on a re-queue would drop the time already run instead --
+  charging the wait is the lesser error, and ``frame_node_hours`` /
+  ``max_wall_time_s`` should leave room for it.
 - **Cancel**: when AuCaM cancels a frame, the block first sets the
   runner's own stop event (the runner cancels the ORBIT task at its next
   poll -- that works with today's runner) and waits up to
@@ -863,6 +869,8 @@ class AucamCampaignDriver:
         Counted from each stage's first RUNNING poll (``started_at``) to
         its end (or now): queue wait and the time before the task was
         placed are not charged, as a batch system would not charge them.
+        An outage while running is, and so is a re-queue after RUNNING
+        (``started_at`` is not reset; see the module docstring).
         """
 
         now = self._clock()
