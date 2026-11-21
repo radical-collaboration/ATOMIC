@@ -253,7 +253,11 @@ Submit, poll, output collection and cancel classify errors the same way:
 - **Cancels reach ORBIT.** Every cancel -- a stopped campaign, a stage
   timeout, a cancelled `run_workflow` -- is first put on the campaign's
   persisted `pending_cancels` list, then tried (shielded) up to three
-  times. An entry the federation could not take stays. One plugin
+  times. A stage that ends `FAILED` or `CANCELED` any other way while its
+  task may still run queues a cancel without trying it. That covers an
+  unreachable budget that runs out during the submit (the submit may have
+  landed) or the poll, a fatal poll answer, and a crash. An entry the
+  federation could not take stays. One plugin
   drainer settles the list; runners never retry an entry themselves.
   The drainer retries every `drain_interval_sec`, and wakes at once when
   a runner sees the federation answer after a failure, on any route, on

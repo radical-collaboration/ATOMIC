@@ -1075,6 +1075,61 @@ class TestBrokerOutageWhilePolling:
         # it waited (budget / tick polls), it did not give up at once
         assert fed.polls[stage.task_id] > 5
 
+    @pytest.mark.parametrize('name', sorted(_transients()))
+    def test_a_stage_out_of_budget_queues_its_cancel(self, tmp_path, name):
+        # the task was RUNNING when the federation went away: failing the
+        # stage must not leave it running on the resource
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        exc = _transients()[name]
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}, {'raise_exc': exc}]}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 5))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             stage_timeout=10 ** 6, clock=lambda: float(next(ticks)))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert camp.pending_cancels == [{'task_id': stage.task_id,
+                                         'dispatcher_sid': 'sid-a'}]
+        assert fed.cancel_calls == []          # it is down: only queued
+        # the federation is back: the drainer settles it
+        assert asyncio.run(drain_pending_cancels(fed, camp)) == 1
+        assert fed.cancels == [('sid-a', stage.task_id)]
+        assert camp.pending_cancels == []
+
+    def test_a_409_poll_queues_its_cancel(self, tmp_path):
+        # a known task whose class lost its members may still be queued
+        exc = call_error(409, 'class gpu has no members', REASON_NO_STATUS)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'raise_exc': exc}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert [e['task_id'] for e in camp.pending_cancels] == \
+               [stage.task_id]
+
+    def test_a_lost_task_queues_no_cancel(self, tmp_path):
+        exc = call_error(404, 'unknown task: x', REASON_NO_STATUS)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'raise_exc': exc}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        assert camp.workflows[0].stages[0].state == 'FAILED'
+        assert camp.pending_cancels == []
+
+    def test_a_finished_task_queues_no_cancel(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'FAILED', 'exit_code': 1}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        assert camp.workflows[0].stages[0].state == 'FAILED'
+        assert camp.pending_cancels == []
+
     def test_a_success_resets_the_budget(self, tmp_path):
         # outages of ~60 s each, separated by one good answer, never add
         # up to a failure under a 100 s budget
@@ -1172,6 +1227,10 @@ class TestSubmitRetry:
         assert stage.reason == REASON_NOT_STARTED
         assert 'unreachable' in stage.detail
         assert 5 <= len(fed.submit_attempts) <= 15
+        # one of those submits may have landed: its cancel is queued, on
+        # the federation's own dispatcher session (no answer named one)
+        assert camp.pending_cancels == [{'task_id': stage.task_id,
+                                         'dispatcher_sid': 'fed'}]
 
     def test_a_409_submit_is_not_retried(self, tmp_path):
         exc = call_error(409, 'no class has an eligible member', 'x')
@@ -1182,6 +1241,8 @@ class TestSubmitRetry:
         _run(fed, camp, _store(tmp_path))
         assert camp.workflows[0].stages[0].state == 'FAILED'
         assert len(fed.submit_attempts) == 1
+        # refused at the first try: there is no task to cancel
+        assert camp.pending_cancels == []
 
 
 def _start_and_cancel(fed, camp, store, *, before_cancel=None, **kwargs):

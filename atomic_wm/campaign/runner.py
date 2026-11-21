@@ -343,6 +343,9 @@ class StageRunner:
         self._wake_drainer = wake_drainer
         self._sleep        = sleep
         self._clock        = clock
+        # task ids whose ORBIT task may exist and is not settled -- not seen
+        # terminal, not cancelled (RULE B: such a task must not be left)
+        self._live: 'set[str]' = set()
 
     # ----------------------------------------------------------------------
     def _drain_cancels(self) -> None:
@@ -464,7 +467,31 @@ class StageRunner:
             stage.reason = REASON_INCOMPLETE
             stage.detail = '%s: %s' % (type(exc).__name__, exc)
         finally:
+            self._queue_if_live(campaign, stage)
             self._changed()
+
+    # ----------------------------------------------------------------------
+    def _queue_if_live(self, campaign: Campaign, stage: StageRun) -> None:
+        """A stage ended FAILED/CANCELED while its task may still run:
+        queue a cancel for it.
+
+        Covers every end that did not cancel the task already -- the
+        unreachable budget ran out during the submit (it may have landed)
+        or the poll, a fatal poll answer, a crash.  The federation is
+        likely down then, so nothing is tried here: the owner's drainer
+        settles the entry once it answers.  An orderly shutdown never gets
+        here -- its stages are INTERRUPTED, not FAILED or CANCELED.
+        """
+
+        task_id = stage.task_id
+        if not task_id or task_id not in self._live \
+                or stage.state not in (FAILED, CANCELED):
+            return
+        self._live.discard(task_id)
+        if campaign.queue_cancel(task_id, stage.dispatcher_sid):
+            log.info('[atomic_campaign] cancel of %s queued: stage %s',
+                     task_id, stage.state)
+        self._drain_cancels()
 
     # ----------------------------------------------------------------------
     async def _stage_cancelled(self, campaign: Campaign,
@@ -594,11 +621,15 @@ class StageRunner:
 
         down_since: Optional[float] = None
         interval = RETRY_MIN_INTERVAL
+        self._live.add(str(stage.task_id))
         while True:
             try:
                 resp = await self._fed.submit(task, dict(stage.requirements))
             except Exception as exc:                          # noqa: BLE001
                 if not is_transient(exc):
+                    if down_since is None:
+                        # refused at the first try: nothing landed
+                        self._live.discard(str(stage.task_id))
                     raise
                 now = self._clock()
                 if down_since is None:
@@ -721,6 +752,7 @@ class StageRunner:
 
             state = str(task_dict.get('state') or '')
             if state in TASK_TERMINAL:
+                self._live.discard(str(stage.task_id))
                 return task_dict
 
             if self._clock() > hard_deadline:
@@ -787,6 +819,8 @@ class StageRunner:
         except Exception as exc:                              # noqa: BLE001
             if is_transient(exc):
                 return self._poll_failed(stage, down_since, exc)
+            if isinstance(exc, TaskNotFound):
+                self._live.discard(str(stage.task_id))     # it is gone
             stage.state  = FAILED
             if isinstance(exc, FederationCallError):
                 stage.reason = exc.reason
@@ -935,6 +969,7 @@ class StageRunner:
             return
         task_id = stage.task_id
         sid     = stage.dispatcher_sid or FED_DISPATCHER_SID
+        self._live.discard(task_id)
         campaign.queue_cancel(task_id, sid)
         self._changed()
 
