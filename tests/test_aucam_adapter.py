@@ -568,10 +568,71 @@ class TestPluginRoute:
         client.portal.call(getattr(plugin, stop))
         took = time.monotonic() - t0
 
-        _assert_interrupted(plugin._campaigns[cid], fed)
+        camp = plugin._campaigns[cid]
+        _assert_interrupted(camp, fed)
         # well within ORBIT's host-stop bounds (5 s broker, 15 s endpoint)
         assert took < 3.0
         assert plugin._drivers == {}
+        # AuCaM's summary survives the stop
+        assert camp.outcome and camp.outcome['planner'] == 'aucam'
+        assert camp.outcome['frames'] == 4
+        # ... and the shared backend is shut down
+        assert plugin._aucam_backend is None
+
+    def test_one_backend_for_concurrent_first_submits(
+            self, tmp_path, plugin_clients, monkeypatch):
+        from atomic_wm.campaign import aucam_adapter
+        made, stopped = [], []
+
+        class _Backend:
+            async def shutdown(self):
+                stopped.append(self)
+
+        async def _make():
+            await asyncio.sleep(0.05)       # a real backend takes a while
+            made.append(_Backend())
+            return made[-1]
+
+        monkeypatch.setattr(aucam_adapter, 'make_backend', _make)
+        _, plugin = plugin_clients._make_plugin(
+            tmp_path, fed=TimedFederation(tmp_path))
+        client = plugin_clients._request(plugin)
+
+        async def _two():
+            return await asyncio.gather(
+                plugin._aucam_campaign(_body(2, 0), 'a', {}),
+                plugin._aucam_campaign(_body(2, 1), 'b', {}))
+
+        client.portal.call(_two)
+        assert len(made) == 1
+        client.portal.call(plugin.shutdown)
+        assert stopped == made
+        assert plugin._aucam_backend is None
+
+    def test_cancel_route_reaches_orbit(self, tmp_path, plugin_clients):
+        # an explicit cancel is what DOES stop the ORBIT tasks
+        NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
+        _request = plugin_clients._request
+        _wait_terminal = plugin_clients._wait_terminal
+
+        fed = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        cid = client.post('%s/campaigns/default' % NS,
+                          json=_body(4, 0, node_hour_scale=1.0)
+                          ).json()['campaign_id']
+        deadline = time.time() + 10
+        while len(fed.submits) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+
+        resp = client.post('%s/cancel/default/%s' % (NS, cid))
+        assert resp.json()['canceled'] is True
+        camp = _wait_terminal(client, cid, timeout=30.0)
+        assert camp['state'] == 'CANCELED'
+        assert camp['outcome']['exit_reason'] == 'signal'
+        assert set(fed.cancels) == set(fed.submits)
+        for wf in camp['workflows']:
+            assert wf['state'] == 'CANCELED'
 
     def test_bad_aucam_request_is_400(self, tmp_path, plugin_clients):
         NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin

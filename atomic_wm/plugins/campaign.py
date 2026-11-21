@@ -54,7 +54,8 @@ from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationCallError,
                                         FederationUnavailable,
                                         DEFAULT_UNREACHABLE_BUDGET,
-                                        call_error, drain_pending_cancels,
+                                        call_error, describe,
+                                        drain_pending_cancels,
                                         is_transient, is_transient_status,
                                         REASON_INCOMPLETE, REASON_NOT_STARTED,
                                         REASON_NO_RESOURCE,
@@ -85,6 +86,10 @@ REMOTE_STAGING_TIMEOUT = 120.0
 
 # how often the plugin retries cancels the federation has not confirmed
 DRAIN_INTERVAL = 10.0
+
+# how long a stop waits for the shared AuCaM backend to shut down (the whole
+# stop must stay within ORBIT's host-stop bounds: 5 s broker, 15 s endpoint)
+BACKEND_STOP_TIMEOUT = 2.0
 
 # $ATOMIC_CAMPAIGN_UNREACHABLE_SEC overrides the unreachable budget
 _BUDGET_ENV = 'ATOMIC_CAMPAIGN_UNREACHABLE_SEC'
@@ -596,6 +601,8 @@ class PluginAtomicCampaign(Plugin):
         # run(campaign) / cancel()
         self._runners:   Dict[str, Any] = {}
         self._aucam_backend: Any = None     # shared by every AuCaM driver
+        # two first AuCaM submits at once must not build two backends
+        self._aucam_lock = asyncio.Lock()
         self._drivers:   Dict[str, asyncio.Task]   = {}
 
         for camp in load_campaigns(self._state_file):
@@ -824,8 +831,9 @@ class PluginAtomicCampaign(Plugin):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except PlannerError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if self._aucam_backend is None:
-            self._aucam_backend = await aucam_adapter.make_backend()
+        async with self._aucam_lock:
+            if self._aucam_backend is None:
+                self._aucam_backend = await aucam_adapter.make_backend()
         camp = Campaign(campaign_id=new_campaign_id(), name=name,
                         sweep=dict(body.get('sweep') or {}),
                         planner='aucam', workflows=[])
@@ -887,7 +895,6 @@ class PluginAtomicCampaign(Plugin):
 
         try:
             await runner.run(camp)
-            camp.outcome = getattr(runner, 'outcome', None)
         except asyncio.CancelledError:
             # shutdown() has already stamped INTERRUPTED; a cancel from
             # anywhere else means the campaign was stopped
@@ -906,6 +913,11 @@ class PluginAtomicCampaign(Plugin):
             self._terminate(camp, FAILED, REASON_INCOMPLETE,
                             '%s: %s' % (type(exc).__name__, exc))
         finally:
+            # an AuCaM driver builds its outcome on every way out -- a
+            # shutdown or a crash included -- and it must not be lost
+            outcome = getattr(runner, 'outcome', None)
+            if outcome is not None:
+                camp.outcome = outcome
             self._drivers.pop(camp.campaign_id, None)
             self._runners.pop(camp.campaign_id, None)
             self._persist()
@@ -1008,3 +1020,17 @@ class PluginAtomicCampaign(Plugin):
         self._drivers.clear()
         self._runners.clear()
         self._persist()
+        await self._stop_aucam_backend()
+
+    async def _stop_aucam_backend(self) -> None:
+        """Shut the shared AuCaM backend down -- after every driver that
+        used it has stopped; bounded, a stop must not hang on it."""
+
+        backend, self._aucam_backend = self._aucam_backend, None
+        if backend is None:
+            return
+        try:
+            await asyncio.wait_for(backend.shutdown(), BACKEND_STOP_TIMEOUT)
+        except Exception as exc:                              # noqa: BLE001
+            log.warning('[%s] AuCaM backend shutdown: %s',
+                        self.instance_name, describe(exc))
