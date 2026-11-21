@@ -103,9 +103,12 @@ broker's origin). The ATOMIC broker sets it to `atomic_campaign`.
     session; this plan does not depend on it while the runner polls.
 - **Idempotent submit.** A submit whose reply is lost must not become a second
   task. The runner's task ids are deterministic (`<cid>-wf-NNN-<stage>`).
-  To verify: what the federation `submit` answers for a known id (409, or a
-  duplicate task). If it does not refuse, the runner looks the id up before
-  resubmitting. Generic ORBIT support is #148.
+  Verified 2026-11-21 (with the ORBIT session): the dispatcher pool submit is
+  idempotent by task_id, but the federation `_route_submit` re-picks a class
+  pool before consulting its ledger, so a retry can duplicate across pools.
+  ORBIT fix for the demo: route a known task_id to its recorded pool (the
+  ledger is persisted in the federation's state.json). Generic #148 is
+  deferred; the CM does not use RhapsodyClient multi-batch submits.
 
 ### 3.4 Scale and data
 
@@ -135,9 +138,13 @@ broker's origin). The ATOMIC broker sets it to `atomic_campaign`.
   122 is still open).
 - bigsim standalone run and its workflow form are prerequisites (status
   unknown as of 2026-11-19).
-- ORBIT follow-ups, worked in an ORBIT session: #149 reconcile, #148
-  idempotent submit, session-scoped dispatcher events, the dispatcher
-  failing a task on a retryable 503 (requeue instead; noted on #166).
+- ORBIT scope for 12-04, agreed with the ORBIT session 2026-11-21:
+  (1) the dispatcher requeues on a retryable 503 instead of failing the task;
+  (2) the federation submit routes a known task_id to its recorded pool.
+  Deferred past the demo: #149 reconcile (the runner polls), #148 generic
+  idempotent submit, session-scoped dispatcher events, #150 subscribe dedup.
+  The live broker-restart rehearsal decides whether anything else is in the
+  way.
 - AuCaM's asks (section 4) unanswered; the plan works around 1 (signal
   handlers: patch or subclass) and 2 (controller fills `obs`) if needed.
 
