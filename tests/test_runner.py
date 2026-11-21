@@ -151,12 +151,8 @@ class FakeFederation(FederationAPI):
         plan  = self.plan(self._stage_of(task_id))
         if plan.get('task_404'):
             raise TaskNotFound('unknown task: %s' % task_id)
-        if plan.get('task_error'):
-            raise RuntimeError(plan['task_error'])
         polls = plan.get('polls') or [{'state': 'DONE', 'exit_code': 0}]
         entry = dict(polls[min(n, len(polls) - 1)])
-        if entry.get('raise'):
-            raise RuntimeError(entry['raise'])
         if entry.get('raise_exc'):
             raise entry['raise_exc']
         entry.setdefault('cwd', self._cwd.get(task_id))
@@ -593,7 +589,7 @@ class TestFailures:
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},
                    'polls': [{'state': 'RUNNING'},
-                             {'raise': 'flaky'}] * 50}})
+                             {'raise_exc': ConnectionError('flaky')}] * 50}})
         camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
         store = _store(tmp_path)
 
@@ -673,7 +669,8 @@ class TestFailures:
                                                              tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': b'{}'},
-                   'task_error': 'gateway said no'}})
+                   'polls': [{'raise_exc': call_error(
+                       502, 'gateway said no', REASON_NO_STATUS)}]}})
         camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
         ticks = iter(range(0, 10 ** 6, 10))
         _run(fed, camp, _store(tmp_path), stage_timeout=10 ** 6,
@@ -1010,6 +1007,8 @@ def _transients():
                                       REASON_NO_STATUS),
         '404-session'    : call_error(404, 'unknown session: fed',
                                       REASON_NO_STATUS),
+        '500'            : call_error(500, 'internal error', REASON_NO_STATUS),
+        '502'            : call_error(502, 'bad gateway', REASON_NO_STATUS),
     }
 
 
@@ -1028,7 +1027,8 @@ class TestErrorClasses:
         (409, 'class gpu has no members', FederationCallError),
         (404, 'unknown task: t1',         TaskNotFound),
         (410, 'session fed is closing',   FederationCallError),
-        (400, 'bad body',                 FederationCallError)])
+        (400, 'bad body',                 FederationCallError),
+        (422, 'unprocessable',            FederationCallError)])
     def test_answers_are_not_transient(self, status, detail, cls):
         from atomic_wm.campaign.runner import is_transient
         exc = call_error(status, detail, REASON_NO_STATUS)
@@ -1107,6 +1107,22 @@ class TestBrokerOutageWhilePolling:
         _run(fed, camp, _store(tmp_path))
         stage = camp.workflows[0].stages[0]
         assert stage.state == 'FAILED'
+        assert fed.polls[stage.task_id] == 1
+
+    @pytest.mark.parametrize('exc', [
+        call_error(400, 'bad request', REASON_NO_STATUS),
+        RuntimeError('a bug, not an outage')], ids=['400', 'unexpected'])
+    def test_a_4xx_or_an_unexpected_error_fails_at_once(self, tmp_path, exc):
+        # submit and poll classify alike: only the transients are waited
+        # out, everything else fails the stage on the first look
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'raise_exc': exc}, {'state': 'DONE'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path), unreachable_budget=10 ** 6)
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert stage.reason == REASON_NO_STATUS
         assert fed.polls[stage.task_id] == 1
 
     def test_a_409_fails_at_once(self, tmp_path):

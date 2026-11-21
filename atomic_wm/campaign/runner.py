@@ -158,14 +158,17 @@ def is_transient_status(status: int, detail: str = '') -> bool:
       suspect endpoint or a full call table, a replay that is not done;
     - 410 "shutting down": the plugin answers that while the broker stops;
     - 404 "unknown session": the federation's dispatcher session is not
-      re-registered yet after a broker restart.
+      re-registered yet after a broker restart;
+    - any other 5xx: the far side broke, not the request.
 
-    Everything else is an answer, not an outage: a 409 (a known task whose
-    class has no members now) and any other 404 (the task is gone).
+    Every other 4xx is an answer, not an outage: a 409 (a known task whose
+    class has no members now), any other 404 (the task is gone), a 400.
+    Submit, poll, collection and cancel all classify by this one function
+    (with :func:`is_transient` on top for transport errors).
     """
 
     text = str(detail or '').lower()
-    if status == 503:
+    if 500 <= status <= 599:
         return True
     if status == 410 and 'shutting down' in text:
         return True
@@ -755,28 +758,32 @@ class StageRunner:
                          ) -> Tuple[Dict[str, Any], Optional[float]]:
         """One status lookup; returns ``(task dict, unreachable since)``.
 
-        Two answers fail the stage immediately, because no amount of waiting
-        changes them: a 404 that is not about the session (the task is
-        gone) and a 409 (its class has no members any more).  Every other
-        error -- a transport error, a 503, a 410 "shutting down", a 404
-        "unknown session" while the broker replays, or anything unexpected
-        -- is waited out for up to the unreachable budget, counted from the
-        first failure of an uninterrupted run; any success resets it.
+        Errors are classified as for the submit (:func:`is_transient`): a
+        transport error, a 5xx, a 410 "shutting down" or a 404 "unknown
+        session" while the broker replays is waited out for up to the
+        unreachable budget, counted from the first failure of an
+        uninterrupted run; any success resets it.  Anything else -- a 409
+        (the class has no members any more), any other 4xx (a 404: the task
+        is gone), an unexpected error -- fails the stage at once, because
+        no amount of waiting changes it.  A missing federation is re-raised
+        for the campaign to report.
         """
 
         try:
             task_dict = await self._fed.task(stage.task_id or '') or {}
         except FederationUnavailable:
             raise
-        except FederationCallError as exc:
-            if isinstance(exc, TaskNotFound) or exc.status == 409:
-                stage.state  = FAILED
+        except Exception as exc:                              # noqa: BLE001
+            if is_transient(exc):
+                return self._poll_failed(stage, down_since, exc)
+            stage.state  = FAILED
+            if isinstance(exc, FederationCallError):
                 stage.reason = exc.reason
                 stage.detail = exc.detail or None
-                raise StageFailed(stage.reason) from exc
-            return self._poll_failed(stage, down_since, exc)
-        except Exception as exc:                              # noqa: BLE001
-            return self._poll_failed(stage, down_since, exc)
+            else:
+                stage.reason = REASON_NO_STATUS
+                stage.detail = describe(exc)
+            raise StageFailed(stage.reason) from exc
         await self._federation_ok(campaign)
         return task_dict, None
 

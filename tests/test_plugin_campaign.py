@@ -411,6 +411,17 @@ class TestErrorMapping:
         assert 'dispatcher' in exc.value.detail          # kept for the log
         assert 'dispatcher' not in exc.value.reason
 
+    @pytest.mark.parametrize('status', [500, 502, 503])
+    def test_a_5xx_submit_is_transient(self, tmp_path, status):
+        # retried within the budget, like the same answer to a poll
+        from atomic_wm.campaign.runner import is_transient
+        api, _ = self._api(tmp_path, {
+            ('POST', '/federation/submit/default'):
+                (status, {'detail': 'boom'})})
+        with pytest.raises(FederationCallError) as exc:
+            asyncio.run(api.submit({'task_id': 't'}, {}))
+        assert is_transient(exc.value)
+
     def test_409_no_resource_names_the_members_that_lost(self, tmp_path):
         # the phrase alone leaves the audience guessing what was missing,
         # so a small federation's per-member texts ride on the reason

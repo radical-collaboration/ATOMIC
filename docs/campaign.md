@@ -232,22 +232,24 @@ A broker restart must not fail a campaign. The runner pulls state, so it
 only has to tell an outage from an answer (the ORBIT contract, plans/11
 §4):
 
+Submit, poll, output collection and cancel classify errors the same way:
+
 | transient -- retried | fatal -- the stage fails |
 |---|---|
 | `ConnectionError`, `TimeoutError` (the transport) | `409`: a known task whose class has no members now |
 | `503`, with or without `Retry-After` | any other `404`: the task is gone |
-| `410` "shutting down" | |
-| `404` "unknown session" (the federation is still replaying) | |
+| `410` "shutting down" | any other `4xx` (a `400`: a refused or malformed call) |
+| `404` "unknown session" (the federation is still replaying) | an unexpected error (a bug, not an outage) |
+| any other `5xx` | |
 
 - **Unreachable budget.** Transient errors are retried for up to
   `unreachable_budget_sec` (default **300 s**,
   `$ATOMIC_CAMPAIGN_UNREACHABLE_SEC`), counted from the first failure of an
-  uninterrupted run; any successful call resets it. While polling, any
-  other unexpected error counts against the same budget.
+  uninterrupted run; any successful call resets it.
 - **Submit retry.** A transient submit error is retried within the same
   budget with the **same task id**: a known task id answers with its
   existing record, so a submit whose answer got lost does not run twice.
-  Other submit errors (400, 409) fail the stage at once.
+  Fatal submit errors fail the stage at once.
 - **Cancels reach ORBIT.** Every cancel -- a stopped campaign, a stage
   timeout, a cancelled `run_workflow` -- is first put on the campaign's
   persisted `pending_cancels` list, then tried (shielded) up to three
