@@ -121,3 +121,24 @@ envelope}}]}`; non-JSON outputs are listed by name/size only.
   placed across ≥2 distinct local resources (visible in `status`), and
   `results --json` returns three metric sets with different
   `final_accuracy`.
+
+## Notes since (2026-11-21, plans/11 track A)
+
+What changed in behaviour; `docs/campaign.md` has the details.
+
+- **Placement.** Broker-only is gone: the plugin also runs on a service
+  endpoint (`ep_cm`, `--plugins atomic_campaign`) and then reaches the
+  federation over `EndpointRuntime.call(dst='broker')` in a thread, 15 s
+  per call (`_RemoteFederationAPI`). The broker serves its Explorer module
+  with `RADICAL_ORBIT_ENDPOINT_UI_MODULES=atomic_campaign`; the CLI takes
+  `--campaign-endpoint` / `$ATOMIC_CAMPAIGN_ENDPOINT`.
+- **Errors.** `MAX_POLL_FAILURES = 10` is replaced by a 300 s unreachable
+  budget for transient errors (transport, 503, 410 "shutting down", 404
+  "unknown session"); 409 and other 404s stay fatal. Submits retry
+  transient errors with the same task id.
+- **Cancel.** A cancelled `run_workflow` now cancels its ORBIT task. Every
+  cancel goes through the persisted `pending_cancels` list, drained after
+  the federation answers again.
+- **Restart.** Shutdown still marks campaigns `INTERRUPTED` and does not
+  cancel tasks; the interrupted tasks (and those of a campaign found
+  running after a crash) are queued and cancelled by the next start.

@@ -3,7 +3,7 @@
 A **campaign** is one workflow specification plus a parameter sweep. The
 plugin expands it into one *workflow instance* per sweep point, runs each
 instance's *stages* sequentially through the resource federation, collects
-every declared output into a central store on the broker host, and exposes
+every declared output into a central store on the host that runs it, and exposes
 state and results over HTTP for the CLI and the demo UI.
 
 ```
@@ -16,14 +16,45 @@ POST campaigns/default          planner              runner (one asyncio
                                                  collect → manifest
 ```
 
-It is a broker-hosted plugin (`is_enabled` is broker-only) and talks to its
-sibling plugins **in process**, never over HTTP:
-`app.state.endpoint_service.handle_request('POST', '/federation/submit/
-default', …)`. Only the CLI and the Explorer UI use HTTP.
+It runs on the broker or on a **service endpoint** next to it (`ep_cm`,
+plans/11), never on a compute node (`is_enabled`: roles `broker`, `login`,
+`standalone`). It is in no default plugin set, so an endpoint hosts it
+only when asked to. Where it runs decides how it reaches the federation:
+
+- **on the broker** -- the sibling plugins **in process**:
+  `app.state.endpoint_service.handle_request('POST', '/federation/submit/
+  default', …)`;
+- **on an endpoint** -- the same routes over the endpoint runtime's
+  WebSocket, `EndpointRuntime.call(dst='broker', …)`, each call in a
+  thread (the call blocks on the endpoint's own loop) with a 15 s timeout.
+  A broker restart does not touch the campaign state there: the runner
+  waits the outage out (see *Broker outages* below).
+
+Only the CLI and the Explorer UI use HTTP.
+
+### Running it on a service endpoint (`ep_cm`)
+
+```sh
+# the broker: federation + dispatcher, and serve the endpoint's UI module
+RADICAL_ORBIT_ENDPOINT_UI_MODULES=atomic_campaign \
+    radical-orbit-broker.py --plugins task_dispatcher,federation …
+
+# next to it: a participant with no compute that only hosts the campaigns
+radical-orbit-endpoint.py --name ep_cm --plugins atomic_campaign \
+                          --url https://<broker>:<port>
+
+# the CLI then talks to /ep_cm/atomic_campaign/…
+export ATOMIC_CAMPAIGN_ENDPOINT=ep_cm      # or --campaign-endpoint ep_cm
+```
+
+`ep_cm` never joins the federation. `$ATOMIC_CAMPAIGN_STATE`,
+`$ATOMIC_STORE_ROOT` and `$ATOMIC_CAMPAIGN_UNREACHABLE_SEC` are read by the
+`ep_cm` process, and the central store lives on its host.
 
 ## Routes
 
-All routes live under `/broker/atomic_campaign/…` through the gateway and
+All routes live under `/<campaign endpoint>/atomic_campaign/…` through the
+gateway (`/broker/atomic_campaign/…`, or `/ep_cm/atomic_campaign/…`) and
 always use the reserved session id **`default`** (created on demand, always
 persistent — never register your own campaign session).
 
@@ -102,7 +133,7 @@ dispatchers or plugins:
 | `the stage could not be started` | any other submit failure, including a 400 that is not a placement refusal (a malformed body earns a 400 too, and blaming the resources for it would send the reader looking in the wrong place) |
 | `the stage failed on resource <name>` | the task ended FAILED / non-zero **and** a poll had confirmed the placement (`member_id`) |
 | `the stage failed` | the task ended FAILED / non-zero before any poll named a member — the resource on the record is still the advisory one |
-| `the stage status could not be read` | task 404, or 10 unreadable polls |
+| `the stage status could not be read` | task 404, a 409, or the federation unreachable for longer than the budget (300 s) |
 | `the input file could not be placed on the resource` | an input could not be read out of the previous stage's outputs |
 | `output(s) not collected: …` | a declared output was nowhere to be found |
 | `stage timed out after N s (last state: …)` | the per-stage timeout |
@@ -164,9 +195,9 @@ further JSON ones — are listed under `files[stage]` by name and size only.
    - poll `GET federation/task/default/{task_id}` every 1 s, backing off to
      3 s, until the task state is terminal. The per-stage timeout (default
      15 min) counts **task** state only — a pilot that takes a minute to
-     boot never fails a stage. A **404** fails the stage at once (the task
-     is gone; waiting cannot help), and 10 consecutive unreadable polls do
-     the same rather than burning the whole timeout;
+     boot never fails a stage. A **404** (other than "unknown session") and
+     a **409** fail the stage at once -- waiting cannot help. Every other
+     error is waited out within the unreachable budget (*Broker outages*);
    - **placement is what the poll says.** Each poll may carry
      `member_id` (`<resource>.<member>`, split on the *last* dot),
      `member`, `resource`, `cwd` and — not guaranteed — `class`;
@@ -195,6 +226,42 @@ further JSON ones — are listed under `files[stage]` by name and size only.
    cancelling its driver, so a restart shows "interrupted", not "stopped" —
    nobody asked for it to stop.
 
+### Broker outages and cancels
+
+A broker restart must not fail a campaign. The runner pulls state, so it
+only has to tell an outage from an answer (the ORBIT contract, plans/11
+§4):
+
+| transient -- retried | fatal -- the stage fails |
+|---|---|
+| `ConnectionError`, `TimeoutError` (the transport) | `409`: a known task whose class has no members now |
+| `503`, with or without `Retry-After` | any other `404`: the task is gone |
+| `410` "shutting down" | |
+| `404` "unknown session" (the federation is still replaying) | |
+
+- **Unreachable budget.** Transient errors are retried for up to
+  `unreachable_budget_sec` (default **300 s**,
+  `$ATOMIC_CAMPAIGN_UNREACHABLE_SEC`), counted from the first failure of an
+  uninterrupted run; any successful call resets it. While polling, any
+  other unexpected error counts against the same budget.
+- **Submit retry.** A transient submit error is retried within the same
+  budget with the **same task id**: a known task id answers with its
+  existing record, so a submit whose answer got lost does not run twice.
+  Other submit errors (400, 409) fail the stage at once.
+- **Cancels reach ORBIT.** Every cancel -- a stopped campaign, a stage
+  timeout, a cancelled `run_workflow` -- is first put on the campaign's
+  persisted `pending_cancels` list, then tried (shielded) up to three
+  times. An entry the federation could not take stays, and is retried
+  after the next successful federation call and by a plugin drainer
+  (kicked by any route, a reconnect, a finished campaign). A refused or
+  unknown task settles the entry.
+- **Shutdown does not cancel.** An orderly stop (`shutdown`, or
+  `on_host_stop` on `ep_cm`) marks running campaigns `INTERRUPTED` and
+  leaves their tasks running; a broker restart therefore never kills HPC
+  work. Their task ids are queued in `pending_cancels`, as are those of a
+  campaign found running in the state file after a crash, and the next
+  start cancels them: there is no resume, so nobody would collect them.
+
 ### Output collection order
 
 Per declared output, the first path that delivers bytes wins; the winner is
@@ -206,8 +273,9 @@ recorded as `via` in the stage record and the manifest:
 | `dispatcher_stage_out` | `GET task_dispatcher/stage_out/{dispatcher_sid}/{task_id}/{name}` → base64 in **`content_b64`** | broker and pilot share a filesystem |
 | `broker_local` | direct read of `<cwd>/<name>` | localhost |
 
-The pilot path uses the broker caller (a *remote* participant, unlike the
-in-process sibling plugins) with orbit's own `StagingClient`; it registers
+The pilot path uses orbit's own `StagingClient` -- on the broker over the
+broker caller, on `ep_cm` over `_RuntimeHTTP(runtime, child_endpoint)`
+(120 s per call); it registers
 and unregisters its staging session per call. Paths must resolve under `~`
 or `/tmp` — the staging plugin refuses anything else, which is why
 `scratch_base` defaults live there.
@@ -235,11 +303,13 @@ inputs — `inputs_staged: [{name, via: "submit", size}]`.
 | `ATOMIC_CAMPAIGN_STATE` | directory holding `state.json` | `~/.radical/orbit/atomic_campaign` |
 | `ATOMIC_STORE_ROOT` | central result store root | `~/.radical/orbit/atomic_store` |
 | `ATOMIC_TOOL_PREFIX` | bin directory prepended to a bare `atomic-fake-*` command | unset |
+| `ATOMIC_CAMPAIGN_UNREACHABLE_SEC` | how long the federation may be unreachable before a stage fails | `300` |
+| `ATOMIC_CAMPAIGN_ENDPOINT` | (CLI) the endpoint hosting the plugin | `broker` |
 
 `ATOMIC_TOOL_PREFIX` exists because the synthetic workload is only on
 `PATH` inside a pilot whose venv has `atomic-wm` installed. Where it is
-not, point it at the bin directory (e.g. `/…/ve3/bin`) **in the broker
-process** and the runner rewrites `argv[0]` to an absolute path. Commands
+not, point it at the bin directory (e.g. `/…/ve3/bin`) **in the process
+hosting the plugin** and the runner rewrites `argv[0]` to an absolute path. Commands
 that already carry a path, and anything not named `atomic-fake-*`, are left
 alone.
 
@@ -249,9 +319,9 @@ come back as `INTERRUPTED` — there is no resume; re-submit. Unfinished
 campaigns are always kept; the **50 most recently finished** ones are kept
 too, older ones are dropped from the state file and the listing.
 
-Plugin construction knobs (broker config): `state_root`, `store_root`,
+Plugin construction knobs: `state_root`, `store_root`,
 `max_concurrent_workflows`, `stage_timeout_sec`, `poll_interval_sec`,
-`poll_max_interval_sec`. `max_concurrent_workflows` and
+`poll_max_interval_sec`, `unreachable_budget_sec`, `drain_interval_sec`. `max_concurrent_workflows` and
 `stage_timeout_sec` can also be overridden per campaign in the submit body
 (a non-positive value is a 400).
 
@@ -272,7 +342,8 @@ atomic-campaign cancel  CID
 multi-parameter sweep; values are parsed as JSON where possible, so numbers
 stay numbers. Connection flags are the shared `--broker` / `--token` /
 `--cert` (defaults `$RADICAL_ORBIT_BROKER_URL`, `$RADICAL_ORBIT_TOKEN`,
-`$RADICAL_ORBIT_BROKER_CERT`).
+`$RADICAL_ORBIT_BROKER_CERT`), plus `--campaign-endpoint`
+(`$ATOMIC_CAMPAIGN_ENDPOINT`, default `broker`) for a plugin on `ep_cm`.
 
 `status` prints one row per workflow — id, parameters, state, and the
 per-stage `stage:STATE@resource/member` chips (the placement is the one
@@ -307,6 +378,7 @@ Exit codes: `0` success · `1` error or a campaign that did not finish
   keeps the reason and the other workflows continue.
 - **Cancel is cooperative.** `POST cancel` sets a flag: the driver stops
   before the next stage and, while polling, asks the dispatcher to cancel
-  the running task. It does not tear down pilots.
+  the running task (retried, see *Broker outages and cancels*). It does
+  not tear down pilots.
 - **`GET store/{sid}` walks the filesystem** on every call. Fine for a demo
   (tens of files), not a paging API.
