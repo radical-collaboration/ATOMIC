@@ -24,7 +24,8 @@ import time
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from ..client import ClientError, add_connection_args, client_from_args
+from ..client import (ClientError, add_campaign_endpoint_arg,
+                      add_connection_args, client_from_args)
 
 TOOL = 'atomic-campaign'
 
@@ -362,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=TOOL,
         description='submit and inspect ATOMIC campaigns')
     add_connection_args(parser)
+    add_campaign_endpoint_arg(parser)
     subs = parser.add_subparsers(dest='command')
 
     sub = subs.add_parser('submit', help='submit a campaign')

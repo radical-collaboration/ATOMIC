@@ -14,6 +14,11 @@ REST routes return these dicts verbatim (see ``docs/campaign.md``).  The whole
 set is persisted to a single JSON file after every state change; on restart
 campaigns that were still ``RUNNING`` are marked ``INTERRUPTED`` (there is no
 resume -- the demo re-submits).
+
+Interrupting a campaign puts the tasks of its unfinished stages on the
+campaign's ``pending_cancels`` list, which is persisted with it and drained
+by the plugin once the federation answers -- without a resume nobody would
+collect those tasks, and they would hold HPC resources until they end.
 """
 
 from __future__ import annotations
@@ -53,6 +58,11 @@ REASON_INTERRUPTED = 'the service was restarted while this was running'
 
 # how many finished campaigns to keep (in memory and on disk)
 KEEP_TERMINAL = 50
+
+# the dispatcher session the federation submits every task through
+# (``FED_SESSION_SID`` in radical.orbit's ``plugin_federation``) -- the
+# fallback for a cancel of a task whose submit answer never arrived
+FED_DISPATCHER_SID = 'fed'
 
 
 # --------------------------------------------------------------------------
@@ -214,11 +224,25 @@ class Campaign:
     created_at:  float                  = field(default_factory=time.time)
     started_at:  float                  = field(default_factory=time.time)
     finished_at: Optional[float]        = None
+    # [{'task_id', 'dispatcher_sid'}]: cancels the federation has not
+    # confirmed yet (it was unreachable); drained once it answers again
+    pending_cancels: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d['workflows'] = [w.to_dict() for w in self.workflows]
         return d
+
+    def queue_cancel(self, task_id: str,
+                     dispatcher_sid: Optional[str] = None) -> bool:
+        """Add one task to ``pending_cancels`` (once per task id)."""
+
+        if any(e.get('task_id') == task_id for e in self.pending_cancels):
+            return False
+        self.pending_cancels.append(
+            {'task_id': task_id,
+             'dispatcher_sid': dispatcher_sid or FED_DISPATCHER_SID})
+        return True
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Campaign':
@@ -397,6 +421,11 @@ def mark_interrupted(camp: Campaign) -> None:
 
     Used both on restart -- a campaign found ``RUNNING`` in the state file --
     and on an orderly shutdown, before the driver tasks are cancelled.
+
+    The task of every stage interrupted here is queued for a cancel
+    (``pending_cancels``).  Nothing is called from here: on shutdown the
+    federation may be going down too, and the plugin drains the list once
+    it answers -- at the latest after the next start.
     """
 
     why = REASON_INTERRUPTED
@@ -409,5 +438,7 @@ def mark_interrupted(camp: Campaign) -> None:
             wf.reason = wf.reason or why
         for stage in wf.stages:
             if not stage.is_terminal():
+                if stage.task_id and stage.state != PENDING:
+                    camp.queue_cancel(stage.task_id, stage.dispatcher_sid)
                 stage.state  = INTERRUPTED
                 stage.reason = stage.reason or why

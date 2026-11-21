@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, \
 
 from .state import Campaign, StageRun, WorkflowInstance
 from .state import (CANCELED, DONE, FAILED, PENDING, RUNNING, SKIPPED,
-                    STAGING, SUBMITTED, TERMINAL_STATES)
+                    STAGING, SUBMITTED, TERMINAL_STATES, FED_DISPATCHER_SID)
 from .store import ResultStore, Source, stage_manifest
 
 log = logging.getLogger('radical.orbit')
@@ -48,8 +48,21 @@ TASK_QUEUED   = ('NEW', 'PENDING', 'QUEUED')
 # installed; $ATOMIC_TOOL_PREFIX gives them an explicit home (see docs).
 _TOOL_PREFIX_ENV = 'ATOMIC_TOOL_PREFIX'
 
-# consecutive failed status lookups before a stage gives up
-MAX_POLL_FAILURES = 10
+# How long the federation may stay unreachable (transient errors only, see
+# :func:`is_transient`) before a stage gives up -- counted from the first
+# failed call of an uninterrupted run of failures, reset by every success.
+# It must cover a broker restart: the broker comes back, the federation
+# replays its state, the pilots reconnect (plans/11 §3.3).
+DEFAULT_UNREACHABLE_BUDGET = 300.0
+
+# back-off between two retries of a failed call while within the budget
+RETRY_MIN_INTERVAL = 1.0
+RETRY_MAX_INTERVAL = 10.0
+
+# how often one cancel is tried in place before it is left to the
+# persisted pending-cancel list (drained after the federation is back)
+CANCEL_ATTEMPTS = 3
+
 
 # Every ``reason`` below is shown on screen verbatim, so the set is small,
 # fixed and written in the demo's vocabulary.  Whatever ORBIT said goes to
@@ -81,6 +94,11 @@ def reason_failed(stage: 'StageRun') -> str:
     return 'the stage failed'
 
 
+# shielded cancels still running after their caller went away (a strong
+# reference, so the loop does not drop them)
+_BACKGROUND: 'set[asyncio.Future]' = set()
+
+
 # --------------------------------------------------------------------------
 class FederationUnavailable(RuntimeError):
     """The resource federation is not reachable on this service.
@@ -107,10 +125,18 @@ class FederationCallError(RuntimeError):
     the other plugin actually said.
     """
 
-    def __init__(self, reason: str, detail: str = '') -> None:
+    def __init__(self, reason: str, detail: str = '',
+                 status: Optional[int] = None) -> None:
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail
+        self.status = status
+
+
+# --------------------------------------------------------------------------
+class FederationTransient(FederationCallError):
+    """A federation call failed for a reason that passes (see
+    :func:`is_transient_status`): retried within the unreachable budget."""
 
 
 # --------------------------------------------------------------------------
@@ -119,7 +145,130 @@ class TaskNotFound(FederationCallError):
     keep polling for the whole stage timeout."""
 
     def __init__(self, detail: str = '') -> None:
-        super().__init__(REASON_NO_STATUS, detail)
+        super().__init__(REASON_NO_STATUS, detail, status=404)
+
+
+# --------------------------------------------------------------------------
+def is_transient_status(status: int, detail: str = '') -> bool:
+    """Whether an HTTP answer from the federation is worth waiting out.
+
+    The ORBIT contract (plans/11 §3.3, §4):
+
+    - 503, with or without Retry-After: the broker's fast-fail for a
+      suspect endpoint or a full call table, a replay that is not done;
+    - 410 "shutting down": the plugin answers that while the broker stops;
+    - 404 "unknown session": the federation's dispatcher session is not
+      re-registered yet after a broker restart.
+
+    Everything else is an answer, not an outage: a 409 (a known task whose
+    class has no members now) and any other 404 (the task is gone).
+    """
+
+    text = str(detail or '').lower()
+    if status == 503:
+        return True
+    if status == 410 and 'shutting down' in text:
+        return True
+    if status == 404 and 'unknown session' in text:
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------
+def call_error(status: int, detail: str, reason: str) -> FederationCallError:
+    """The exception a failed federation call raises, by its class."""
+
+    detail = detail or 'HTTP %d' % status
+    if is_transient_status(status, detail):
+        return FederationTransient(reason, detail, status=status)
+    if status == 404:
+        return TaskNotFound(detail)
+    return FederationCallError(reason, detail, status=status)
+
+
+# --------------------------------------------------------------------------
+def describe(exc: BaseException) -> str:
+    """``'TimeoutError: ...'`` -- a bare ``TimeoutError()`` has no text."""
+
+    text = str(exc)
+    return '%s: %s' % (type(exc).__name__, text) if text \
+           else type(exc).__name__
+
+
+# --------------------------------------------------------------------------
+def is_transient(exc: BaseException) -> bool:
+    """Transport errors and the transient HTTP answers above."""
+
+    return isinstance(exc, (FederationTransient, ConnectionError,
+                            TimeoutError))
+
+
+# --------------------------------------------------------------------------
+def queue_cancel(campaign: Campaign, task_id: str,
+                 dispatcher_sid: Optional[str]) -> bool:
+    """Put one task on the campaign's persisted pending-cancel list.
+
+    Returns ``False`` if it was there already (one entry per task id).
+    """
+
+    return campaign.queue_cancel(task_id, dispatcher_sid)
+
+
+# --------------------------------------------------------------------------
+def _unqueue_cancel(campaign: Campaign, task_id: str) -> None:
+    campaign.pending_cancels[:] = [e for e in campaign.pending_cancels
+                                   if e.get('task_id') != task_id]
+
+
+# --------------------------------------------------------------------------
+async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
+                     task_id: str, dispatcher_sid: str) -> bool:
+    """One cancel call; drop the task from the pending list unless the
+    federation is unreachable.  Returns whether the entry is settled.
+
+    A transient failure (:func:`is_transient`) keeps the entry; anything
+    else settles it -- a refused or unknown task is nothing left to stop.
+    """
+
+    try:
+        ok = await fed.cancel_task(dispatcher_sid, task_id)
+    except FederationUnavailable:
+        return False
+    except Exception as exc:                                  # noqa: BLE001
+        if is_transient(exc):
+            log.info('[atomic_campaign] cancel of %s deferred: %s',
+                     task_id, describe(exc))
+            return False
+        log.info('[atomic_campaign] cancel of %s refused: %s', task_id, exc)
+        ok = False
+    if not ok:
+        log.info('[atomic_campaign] cancel of %s not confirmed -- dropped',
+                 task_id)
+    _unqueue_cancel(campaign, task_id)
+    return True
+
+
+# --------------------------------------------------------------------------
+async def drain_pending_cancels(fed: 'FederationAPI',
+                                campaign: Campaign) -> int:
+    """Try every pending cancel of *campaign* once; return how many settled.
+
+    Stops at the first entry the federation could not take -- it is down
+    again, the rest would only fail the same way.
+    """
+
+    settled = 0
+    for entry in list(campaign.pending_cancels):
+        task_id = str(entry.get('task_id') or '')
+        if not task_id:
+            _unqueue_cancel(campaign, task_id)
+            continue
+        if not await try_cancel(fed, campaign, task_id,
+                                str(entry.get('dispatcher_sid')
+                                    or FED_DISPATCHER_SID)):
+            break
+        settled += 1
+    return settled
 
 
 # --------------------------------------------------------------------------
@@ -167,7 +316,13 @@ class FederationAPI:
         raise NotImplementedError
 
     async def cancel_task(self, dispatcher_sid: str, task_id: str) -> bool:
-        """Best-effort dispatcher task cancel."""
+        """Dispatcher task cancel.
+
+        ``True`` once the task is cancelled or there is nothing left to
+        cancel, ``False`` for a refusal that retrying does not change.
+        Raises a transient error (:func:`is_transient`) when the federation
+        could not be reached -- the caller then keeps the cancel pending.
+        """
         raise NotImplementedError
 
 
@@ -180,6 +335,7 @@ class StageRunner:
                  poll_max_interval: float = 3.0,
                  stage_timeout:     float = 900.0,
                  queue_timeout:     float = 4 * 3600.0,
+                 unreachable_budget: float = DEFAULT_UNREACHABLE_BUDGET,
                  tool_prefix:       Optional[str] = None,
                  on_change:         Optional[Callable[[], None]] = None,
                  sleep:             Callable[[float], Any] = asyncio.sleep,
@@ -191,6 +347,7 @@ class StageRunner:
         self._poll_max     = float(poll_max_interval)
         self._timeout      = float(stage_timeout)
         self._queue_timeout = float(queue_timeout)
+        self._budget       = float(unreachable_budget)
         self._tool_prefix  = tool_prefix if tool_prefix is not None \
                              else os.environ.get(_TOOL_PREFIX_ENV)
         self._on_change    = on_change
@@ -293,15 +450,7 @@ class StageRunner:
             stage.reason = exc.reason
             stage.detail = exc.detail or None
         except asyncio.CancelledError:
-            # an orderly shutdown stamps INTERRUPTED *before* cancelling the
-            # driver -- never overwrite a state that is already final
-            if stage.state not in TERMINAL_STATES:
-                stage.state  = CANCELED
-                stage.reason = REASON_STOPPED
-            if wf.state not in TERMINAL_STATES:
-                wf.state  = CANCELED
-                wf.reason = wf.reason or stage.reason
-            self._changed()
+            await self._stage_cancelled(campaign, wf, stage)
             raise
         except Exception as exc:                              # noqa: BLE001
             log.exception('[atomic_campaign] stage %s/%s crashed',
@@ -311,6 +460,29 @@ class StageRunner:
             stage.detail = '%s: %s' % (type(exc).__name__, exc)
         finally:
             self._changed()
+
+    # ----------------------------------------------------------------------
+    async def _stage_cancelled(self, campaign: Campaign,
+                               wf: WorkflowInstance, stage: StageRun) -> None:
+        """The driver (or whoever runs this workflow) was cancelled.
+
+        An orderly shutdown stamps INTERRUPTED *before* it cancels the
+        driver: then a final state is never overwritten and the task is not
+        cancelled here -- a service restart must not kill the work on the
+        resource (``mark_interrupted`` queued it for later).  Any other
+        cancel (a stopped campaign, a caller cancelling ``run_workflow``)
+        must reach the task, or it keeps running unobserved.
+        """
+
+        if stage.state not in TERMINAL_STATES:
+            if stage.state in (SUBMITTED, RUNNING):
+                await self._cancel_task(campaign, stage)
+            stage.state  = CANCELED
+            stage.reason = REASON_STOPPED
+        if wf.state not in TERMINAL_STATES:
+            wf.state  = CANCELED
+            wf.reason = wf.reason or stage.reason
+        self._changed()
 
     # ----------------------------------------------------------------------
     def _finish_workflow(self, wf: WorkflowInstance,
@@ -361,12 +533,12 @@ class StageRunner:
             task['inputs_b64'] = inputs
 
         stage.state = SUBMITTED
-        resp = await self._fed.submit(task, dict(stage.requirements))
+        resp = await self._submit(campaign, stage, task, cancel)
         self._record_submit(stage, resp)
         self._changed()
 
         try:
-            task_dict = await self._poll_task(stage, cancel)
+            task_dict = await self._poll_task(campaign, stage, cancel)
         finally:
             self._changed()
 
@@ -403,6 +575,63 @@ class StageRunner:
                                            entry['name'])
             if data is not None:
                 produced[entry['name']] = data
+
+    # ----------------------------------------------------------------------
+    async def _submit(self, campaign: Campaign, stage: StageRun,
+                      task: Dict[str, Any],
+                      cancel: Optional[asyncio.Event]) -> Dict[str, Any]:
+        """Submit, retrying transient errors within the unreachable budget.
+
+        Every retry sends the same task id.  That is safe by the ORBIT
+        contract (plans/11 §4): a known task id answers with the existing
+        record, so a submit whose answer got lost is not run twice.
+        """
+
+        down_since: Optional[float] = None
+        interval = RETRY_MIN_INTERVAL
+        while True:
+            try:
+                resp = await self._fed.submit(task, dict(stage.requirements))
+            except Exception as exc:                          # noqa: BLE001
+                if not is_transient(exc):
+                    raise
+                now = self._clock()
+                if down_since is None:
+                    down_since = now
+                if now - down_since >= self._budget:
+                    raise FederationCallError(
+                        REASON_NOT_STARTED,
+                        'federation unreachable for %.0f s: %s'
+                        % (now - down_since, describe(exc))) from exc
+                log.info('[atomic_campaign] submit of %s deferred: %s',
+                         stage.task_id, describe(exc))
+                await self._sleep(interval)
+                interval = min(interval * 2, RETRY_MAX_INTERVAL)
+                # the submit may have landed: a stop must cancel it
+                await self._stop_if_canceled(campaign, stage, cancel)
+                continue
+            await self._federation_ok(campaign)
+            return resp
+
+    # ----------------------------------------------------------------------
+    async def _stop_if_canceled(self, campaign: Campaign, stage: StageRun,
+                                cancel: Optional[asyncio.Event]) -> None:
+        """The campaign was stopped: cancel the task, end the stage."""
+
+        if cancel is None or not cancel.is_set():
+            return
+        await self._cancel_task(campaign, stage)
+        stage.state  = CANCELED
+        stage.reason = REASON_STOPPED
+        raise StageFailed(stage.reason)
+
+    # ----------------------------------------------------------------------
+    async def _federation_ok(self, campaign: Campaign) -> None:
+        """A federation call worked: settle the cancels that waited for it."""
+
+        if campaign.pending_cancels:
+            if await drain_pending_cancels(self._fed, campaign):
+                self._changed()
 
     # ----------------------------------------------------------------------
     @staticmethod
@@ -461,7 +690,7 @@ class StageRunner:
         return out
 
     # ----------------------------------------------------------------------
-    async def _poll_task(self, stage: StageRun,
+    async def _poll_task(self, campaign: Campaign, stage: StageRun,
                          cancel: Optional[asyncio.Event]) -> Dict[str, Any]:
         """Poll until the task is terminal; 1 s, backing off to 3 s.
 
@@ -480,19 +709,16 @@ class StageRunner:
         deadline: Optional[float] = None
         interval = self._poll
         task_dict: Dict[str, Any] = {}
-        failures = 0
+        down_since: Optional[float] = None
 
         while True:
             await self._sleep(interval)
             interval = min(interval * 1.5, self._poll_max)
 
-            if cancel is not None and cancel.is_set():
-                await self._cancel_task(stage)
-                stage.state  = CANCELED
-                stage.reason = REASON_STOPPED
-                raise StageFailed(stage.reason)
+            await self._stop_if_canceled(campaign, stage, cancel)
 
-            task_dict, failures = await self._poll_once(stage, failures)
+            task_dict, down_since = await self._poll_once(campaign, stage,
+                                                          down_since)
 
             self._observe(stage, task_dict)
 
@@ -501,7 +727,7 @@ class StageRunner:
                 return task_dict
 
             if self._clock() > hard_deadline:
-                await self._cancel_task(stage)
+                await self._cancel_task(campaign, stage)
                 stage.state  = FAILED
                 stage.reason = ('stage did not complete within %.0f s '
                                 '(last state: %s)'
@@ -523,7 +749,7 @@ class StageRunner:
 
             if deadline is None:
                 if self._clock() > queue_deadline:
-                    await self._cancel_task(stage)
+                    await self._cancel_task(campaign, stage)
                     stage.state  = FAILED
                     stage.reason = ('stage did not start within %.0f s '
                                     '(last state: %s)'
@@ -533,7 +759,7 @@ class StageRunner:
                 continue
 
             if self._clock() > deadline:
-                await self._cancel_task(stage)
+                await self._cancel_task(campaign, stage)
                 stage.state  = FAILED
                 stage.reason = ('stage timed out after %.0f s (last '
                                 'state: %s)'
@@ -541,35 +767,53 @@ class StageRunner:
                 raise StageFailed(stage.reason)
 
     # ----------------------------------------------------------------------
-    async def _poll_once(self, stage: StageRun,
-                         failures: int) -> Tuple[Dict[str, Any], int]:
-        """One status lookup; returns ``(task dict, consecutive failures)``.
+    async def _poll_once(self, campaign: Campaign, stage: StageRun,
+                         down_since: Optional[float]
+                         ) -> Tuple[Dict[str, Any], Optional[float]]:
+        """One status lookup; returns ``(task dict, unreachable since)``.
 
-        A 404 fails the stage immediately -- the task is gone and no amount
-        of waiting brings it back.  Any other error is transient *until* it
-        has happened :data:`MAX_POLL_FAILURES` times in a row; that stops a
-        broken federation from burning the whole stage timeout.
+        Two answers fail the stage immediately, because no amount of waiting
+        changes them: a 404 that is not about the session (the task is
+        gone) and a 409 (its class has no members any more).  Every other
+        error -- a transport error, a 503, a 410 "shutting down", a 404
+        "unknown session" while the broker replays, or anything unexpected
+        -- is waited out for up to the unreachable budget, counted from the
+        first failure of an uninterrupted run; any success resets it.
         """
 
         try:
-            return await self._fed.task(stage.task_id or '') or {}, 0
+            task_dict = await self._fed.task(stage.task_id or '') or {}
         except FederationUnavailable:
             raise
-        except TaskNotFound as exc:
-            stage.state  = FAILED
-            stage.reason = exc.reason
-            stage.detail = exc.detail or None
-            raise StageFailed(stage.reason) from exc
-        except Exception as exc:                              # noqa: BLE001
-            failures += 1
-            log.info('[atomic_campaign] status of %s unreadable (%d/%d): %s',
-                     stage.task_id, failures, MAX_POLL_FAILURES, exc)
-            if failures >= MAX_POLL_FAILURES:
+        except FederationCallError as exc:
+            if isinstance(exc, TaskNotFound) or exc.status == 409:
                 stage.state  = FAILED
-                stage.reason = REASON_NO_STATUS
-                stage.detail = str(exc)
+                stage.reason = exc.reason
+                stage.detail = exc.detail or None
                 raise StageFailed(stage.reason) from exc
-            return {}, failures
+            return self._poll_failed(stage, down_since, exc)
+        except Exception as exc:                              # noqa: BLE001
+            return self._poll_failed(stage, down_since, exc)
+        await self._federation_ok(campaign)
+        return task_dict, None
+
+    # ----------------------------------------------------------------------
+    def _poll_failed(self, stage: StageRun, down_since: Optional[float],
+                     exc: BaseException
+                     ) -> Tuple[Dict[str, Any], Optional[float]]:
+
+        now = self._clock()
+        if down_since is None:
+            down_since = now
+        log.info('[atomic_campaign] status of %s unreadable for %.0f s: %s',
+                 stage.task_id, now - down_since, describe(exc))
+        if now - down_since >= self._budget:
+            stage.state  = FAILED
+            stage.reason = REASON_NO_STATUS
+            stage.detail = ('federation unreachable for %.0f s: %s'
+                            % (now - down_since, describe(exc)))
+            raise StageFailed(stage.reason) from exc
+        return {}, down_since
 
     # ----------------------------------------------------------------------
     def _observe(self, stage: StageRun, task_dict: Dict[str, Any]) -> None:
@@ -673,14 +917,50 @@ class StageRunner:
                                % (state or 'unknown', stage.exit_code))
 
     # ----------------------------------------------------------------------
-    async def _cancel_task(self, stage: StageRun) -> None:
-        if not stage.dispatcher_sid or not stage.task_id:
+    async def _cancel_task(self, campaign: Campaign,
+                           stage: StageRun) -> None:
+        """Cancel the stage's task on the federation -- shielded, retried.
+
+        The cancel is put on the campaign's persisted pending-cancel list
+        *first*, then tried up to :data:`CANCEL_ATTEMPTS` times.  If the
+        federation stays unreachable the entry remains and is drained by
+        the next successful federation call (or the plugin's drainer, after
+        a reconnect or a restart).  The shield lets a cancel that is under
+        way finish even when the caller is cancelled again.
+        """
+
+        if not stage.task_id:
             return
+        task_id = stage.task_id
+        sid     = stage.dispatcher_sid or FED_DISPATCHER_SID
+        queue_cancel(campaign, task_id, sid)
+        self._changed()
+
+        async def _attempts() -> None:
+            for attempt in range(CANCEL_ATTEMPTS):
+                if not any(e.get('task_id') == task_id
+                           for e in campaign.pending_cancels):
+                    return                        # someone else settled it
+                if await try_cancel(self._fed, campaign, task_id, sid):
+                    self._changed()
+                    return
+                if attempt + 1 < CANCEL_ATTEMPTS:
+                    await self._sleep(min(self._poll_max * (attempt + 1),
+                                          RETRY_MAX_INTERVAL))
+            log.info('[atomic_campaign] cancel of %s left pending', task_id)
+
+        job = asyncio.ensure_future(_attempts())
+        _BACKGROUND.add(job)
+        job.add_done_callback(_BACKGROUND.discard)
         try:
-            await self._fed.cancel_task(stage.dispatcher_sid, stage.task_id)
+            await asyncio.shield(job)
+        except asyncio.CancelledError:
+            # cancelled again while cancelling: the job carries on, the
+            # caller's cancel is honoured
+            raise
         except Exception as exc:                              # noqa: BLE001
             log.info('[atomic_campaign] cancel of %s failed: %s',
-                     stage.task_id, exc)
+                     task_id, exc)
 
     # ----------------------------------------------------------------------
     async def _collect(self, campaign: Campaign, wf: WorkflowInstance,
