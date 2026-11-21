@@ -209,9 +209,25 @@ dispatcher events, #150.
 evaluated on workflow metrics. Neither is on the demo's critical path (§3.2).
 The demo pins 6842888.
 
-**Bigsim.** The prerequisites are open as of 2026-11-21: the validated
-scripts, a test frame plus model files, and accounts. Without them the demo
-runs synthetic stages only.
+**Science workflow (decided 2026-11-21).** The real-science part of the demo
+is the grain-boundary chain, not bigsim: the same pipeline, but frames of
+4-7k atoms at about 4 min each, against bigsim's 35-45 min per 1M-atom frame.
+It runs on Perlmutter. Bigsim does not fit a live slot, and its 36 MB frames
+exceed ORBIT's 4 MiB message cap as inline inputs. Requested from Yating
+(mail drafted 2026-11-21):
+- the validated repository revision;
+- 3-5 grain-boundary frames with their reference scores;
+- the models and descriptor file;
+- per-stage commands, software versions, resources and file sizes, including
+  whether ACE needs multi-node MPI (the dispatcher rejects a `nodes`
+  requirement);
+- the score field and the good/poor threshold.
+
+Work in the week of 11-23: run one frame by hand on Perlmutter and match the
+reference scores; write the 5-stage workflow spec (PTM and ACE in sequence,
+since the runner runs a workflow's stages one after another); run a few frames
+under AuCaM. Synthetic stages stay the demo's safe core; grain boundaries join
+only if the hand run passes by about 11-28.
 
 ## 5. Synthetic workload for the demo
 
