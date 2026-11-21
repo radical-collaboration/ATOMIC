@@ -94,9 +94,17 @@ The plugin calls, in this order::
 
 ``driver`` has the same ``run(campaign)`` / ``cancel()`` shape as
 :class:`~atomic_wm.campaign.runner.CampaignRunner`, so the plugin's
-``_drive`` / ``_route_cancel`` work unchanged.  Cancelling the task that
-awaits ``run()`` (plugin shutdown) stops AuCaM, and every running frame
-cancels its ORBIT task on the way out.
+``_drive`` / ``_route_cancel`` work unchanged.
+
+Shutdown never cancels an ORBIT task: a broker or CM restart must not kill
+HPC work.  The plugin stamps the campaign INTERRUPTED, calls
+:meth:`AucamCampaignDriver.interrupt` (every frame's runner task is
+cancelled at once), then cancels the task that awaits ``run()``, and AuCaM
+stops.  It does not set the stop event and does not wait
+``cancel_wait_s``, so shutdown stays within ORBIT's host-stop bounds.  The
+runner sees the INTERRUPTED stamp and leaves the ORBIT task alone.  Only
+:meth:`AucamCampaignDriver.cancel`, a stage timeout or a definitive stage
+failure cancels ORBIT tasks.
 
 This module imports without AuCaM; :data:`AUCAM_ERROR` says why it is not
 usable, and :func:`parse_aucam_request` / the driver raise
@@ -138,6 +146,10 @@ log = logging.getLogger('radical.orbit')
 
 PLANNERS      = ('sweep', 'aucam')
 WORKFLOW_TYPE = 'frame'
+
+# how long a shutdown waits for a cancelled runner task to unwind (it only
+# has to persist; nothing is called on the federation)
+SHUTDOWN_WAIT_S = 1.0
 
 # on-screen reasons (demo vocabulary, see runner.py)
 REASON_POOR      = 'cancelled by the campaign manager: score %s is worse ' \
@@ -662,6 +674,22 @@ class AucamCampaignDriver:
         self.manager.stop()
 
     # ----------------------------------------------------------------------
+    def interrupt(self) -> None:
+        """The service stops (the campaign is stamped INTERRUPTED): cancel
+        every frame's runner task NOW.
+
+        The runners are tasks of their own, outside the task that awaits
+        :meth:`run`.  Left alone until AuCaM's shutdown reaches their frame
+        they keep polling, and a poll would turn an INTERRUPTED stage back
+        to RUNNING (and then cancel its ORBIT task), or a finished stage
+        would start the next one.  Cancelled here, synchronously right
+        after the stamp, they see the stamp and leave ORBIT alone.
+        """
+
+        for task in self._inner:
+            task.cancel()
+
+    # ----------------------------------------------------------------------
     def _changed(self) -> None:
         if self._on_change is None:
             return
@@ -712,28 +740,33 @@ class AucamCampaignDriver:
         try:
             out = await self.manager.run(spec)
         except asyncio.CancelledError:
-            await self._drain()
+            if campaign.state == INTERRUPTED:
+                self.interrupt()        # a shutdown: no frame stops a task
+            await self._drain(campaign)
             self._finish(campaign, None, interrupted=True)
             raise
         except Exception as exc:                              # noqa: BLE001
             log.exception('[atomic_campaign] AuCaM campaign %s crashed',
                           campaign.campaign_id)
-            await self._drain()
+            await self._drain(campaign)
             self._fatal = self._fatal or exc
             self._finish(campaign, None)
             return campaign
 
-        await self._drain()
+        await self._drain(campaign)
         self._finish(campaign, out)
         return campaign
 
     # ----------------------------------------------------------------------
-    async def _drain(self) -> None:
-        """Wait for cancelled frames to take their ORBIT tasks down."""
+    async def _drain(self, campaign: Campaign) -> None:
+        """Wait for cancelled frames to take their ORBIT tasks down -- or,
+        on a shutdown, just for their runners to unwind."""
 
         pending = [t for t in self._inner if not t.done()]
         if pending:
-            await asyncio.wait(pending, timeout=2 * self._plan.cancel_wait_s)
+            await asyncio.wait(pending, timeout=SHUTDOWN_WAIT_S
+                               if campaign.state == INTERRUPTED
+                               else 2 * self._plan.cancel_wait_s)
 
     # ----------------------------------------------------------------------
     async def _run_frame(self, campaign: Campaign, reporter: Any,
@@ -777,7 +810,7 @@ class AucamCampaignDriver:
             await self._report(campaign, reporter, wf)
             task.result()
         except asyncio.CancelledError:
-            await self._stop_frame(task, stop, wf, wf_id)
+            await self._stop_frame(campaign, task, stop, wf, wf_id)
             raise
         except FederationUnavailable as exc:
             # no federation: no frame can run -- end the whole campaign
@@ -789,15 +822,25 @@ class AucamCampaignDriver:
             raise RuntimeError(wf.reason or 'the frame did not complete')
 
     # ----------------------------------------------------------------------
-    async def _stop_frame(self, task: asyncio.Future, stop: asyncio.Event,
-                          wf: WorkflowInstance, wf_id: str) -> None:
+    async def _stop_frame(self, campaign: Campaign, task: asyncio.Future,
+                          stop: asyncio.Event, wf: WorkflowInstance,
+                          wf_id: str) -> None:
         """AuCaM cancelled the frame: take its ORBIT task down as well.
 
         First the runner's own stop event -- it cancels the ORBIT task at
         its next poll.  A runner stuck in a call (a hung submit or poll)
         does not see it; after ``cancel_wait_s`` it is cancelled as an
         asyncio task, and the runner (track A) cancels the ORBIT task.
+
+        Not on a shutdown (the campaign is INTERRUPTED already): then the
+        runner task is cancelled at once, sees the stamp and leaves the
+        ORBIT task running -- nothing is cancelled, nothing is waited for.
         """
+
+        if campaign.state == INTERRUPTED:
+            task.cancel()
+            await asyncio.wait({task}, timeout=SHUTDOWN_WAIT_S)
+            return
 
         stop.set()
         wait = self._plan.cancel_wait_s

@@ -412,6 +412,34 @@ class TestCampaign:
         # the stages that were running were cancelled on the resource
         assert set(fed.cancels) == set(fed.submits)
 
+    def test_a_shutdown_leaves_the_orbit_tasks_alone(self, tmp_path, store):
+        # the plugin's _stop_drivers: stamp INTERRUPTED, interrupt the
+        # runners, then cancel the driver task.  A restart must not kill
+        # HPC work, and the stop must not wait cancel_wait_s per frame
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
+        # node_hour_scale 1: no frame reaches its node-hour limit (an
+        # AuCaM cancel, legitimately) before the stop
+        body = _body(4, 0, cancel_wait_s=10.0, node_hour_scale=1.0)
+        driver, camp = _drive(fed, store, body)
+        took = {}
+
+        async def main():
+            task = asyncio.ensure_future(driver.run(camp))
+            while not fed.submits:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
+            mark_interrupted(camp)
+            driver.interrupt()
+            t0 = time.monotonic()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            took['s'] = time.monotonic() - t0
+
+        asyncio.run(main())
+        _assert_interrupted(camp, fed)
+        assert took['s'] < 3.0
+
     def test_federation_unavailable_fails_the_campaign(self, tmp_path,
                                                        store):
         fed = TimedFederation(tmp_path, unavailable=True)
@@ -427,6 +455,22 @@ class TestCampaign:
         assert out['planner'] == 'aucam'
         assert out['frames'] == 4
         assert camp.state == 'DONE'
+
+
+def _assert_interrupted(camp, fed):
+    """A shut-down campaign: INTERRUPTED all through, nothing cancelled."""
+
+    assert fed.submits
+    assert camp.state == 'INTERRUPTED'
+    assert fed.cancels == []
+    for wf in camp.workflows:
+        assert wf.state == 'INTERRUPTED', (wf.id, wf.state, wf.reason)
+        for st in wf.stages:
+            assert st.state != 'CANCELED', (wf.id, st.name, st.reason)
+    # queued for the next start, like a sweep's (mark_interrupted)
+    running = {st.task_id for wf in camp.workflows for st in wf.stages
+               if st.task_id}
+    assert {e['task_id'] for e in camp.pending_cancels} == running
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +546,32 @@ class TestPluginRoute:
         assert camp['outcome'], 'no AuCaM outcome stored'
         # every launch got its own task ids
         assert len(set(fed.submits)) == len(fed.submits)
+
+    @pytest.mark.parametrize('stop', ['shutdown', 'on_host_stop'])
+    def test_a_plugin_stop_interrupts_without_cancelling(
+            self, tmp_path, plugin_clients, stop):
+        NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
+        _request = plugin_clients._request
+
+        fed = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        resp = client.post('%s/campaigns/default' % NS,
+                           json=_body(4, 0, cancel_wait_s=10.0,
+                                      node_hour_scale=1.0))
+        cid = resp.json()['campaign_id']
+        deadline = time.time() + 10
+        while len(fed.submits) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+
+        t0 = time.monotonic()
+        client.portal.call(getattr(plugin, stop))
+        took = time.monotonic() - t0
+
+        _assert_interrupted(plugin._campaigns[cid], fed)
+        # well within ORBIT's host-stop bounds (5 s broker, 15 s endpoint)
+        assert took < 3.0
+        assert plugin._drivers == {}
 
     def test_bad_aucam_request_is_400(self, tmp_path, plugin_clients):
         NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
