@@ -19,8 +19,10 @@ from atomic_wm.campaign.planner import SweepPlanner
 from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationCallError,
                                         FederationUnavailable, StageRunner,
-                                        TaskNotFound, MAX_POLL_FAILURES,
+                                        TaskNotFound,
+                                        call_error,
                                         REASON_NO_RESOURCE, REASON_NO_STATUS,
+                                        REASON_NOT_STARTED,
                                         REASON_STAGE_IN, REASON_CANCELED_RS)
 from atomic_wm.campaign.state   import (CANCELED, Campaign, DONE, FAILED,
                                         PENDING, RUNNING, WorkflowInstance,
@@ -69,7 +71,10 @@ class FakeFederation(FederationAPI):
         self.unavailable = unavailable
 
         self.submits    = []                  # [(task, requirements)]
-        self.cancels    = []                  # [(sid, task_id)]
+        self.cancels    = []                  # [(sid, task_id)] confirmed
+        self.cancel_calls = []                # [(sid, task_id)] attempted
+        # exceptions the next cancel calls raise, in order (then success)
+        self.cancel_errors = []
         self.polls      = {}                  # task_id -> n polls
 
         self._pilot     = {}                  # (endpoint, path) -> bytes
@@ -96,6 +101,12 @@ class FakeFederation(FederationAPI):
         if plan.get('submit_error'):
             raise FederationCallError(REASON_NO_RESOURCE,
                                       plan['submit_error'])
+        self.submit_attempts = getattr(self, 'submit_attempts', [])
+        self.submit_attempts.append(task_id)
+        errors = plan.get('submit_errors') or []
+        n_try  = self.submit_attempts.count(task_id)
+        if n_try <= len(errors):
+            raise errors[n_try - 1]
 
         self._stage[task_id] = stage
         cwd = self.root / task_id
@@ -146,6 +157,8 @@ class FakeFederation(FederationAPI):
         entry = dict(polls[min(n, len(polls) - 1)])
         if entry.get('raise'):
             raise RuntimeError(entry['raise'])
+        if entry.get('raise_exc'):
+            raise entry['raise_exc']
         entry.setdefault('cwd', self._cwd.get(task_id))
         if 'resource' not in entry and 'member_id' not in entry:
             entry['resource'] = plan.get('resource', 'res-a')
@@ -163,6 +176,9 @@ class FakeFederation(FederationAPI):
         return self._pilot.get((endpoint, path))
 
     async def cancel_task(self, dispatcher_sid, task_id):
+        self.cancel_calls.append((dispatcher_sid, task_id))
+        if self.cancel_errors:
+            raise self.cancel_errors.pop(0)
         self.cancels.append((dispatcher_sid, task_id))
         return True
 
@@ -653,16 +669,21 @@ class TestFailures:
         assert 'unknown task' in (stage.detail or '')
         assert fed.polls[stage.task_id] == 1        # one look, then out
 
-    def test_repeated_status_errors_give_up_after_the_cap(self, tmp_path):
+    def test_repeated_status_errors_give_up_after_the_budget(self,
+                                                             tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': b'{}'},
                    'task_error': 'gateway said no'}})
-        camp = _campaign(tmp_path, stages=[_spec()['stages'][0]])
-        _run(fed, camp, _store(tmp_path), stage_timeout=10 ** 6)
+        camp  = _campaign(tmp_path, stages=[_spec()['stages'][0]])
+        ticks = iter(range(0, 10 ** 6, 10))
+        _run(fed, camp, _store(tmp_path), stage_timeout=10 ** 6,
+             unreachable_budget=100, clock=lambda: float(next(ticks)))
         stage = camp.workflows[0].stages[0]
         assert stage.state  == 'FAILED'
         assert stage.reason == REASON_NO_STATUS
-        assert fed.polls[stage.task_id] == MAX_POLL_FAILURES
+        assert 'unreachable' in (stage.detail or '')
+        # ~100 s of 10 s ticks, not a fixed number of tries
+        assert 5 <= fed.polls[stage.task_id] <= 12
 
     def test_a_canceled_task_is_not_a_failure_text(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
@@ -971,3 +992,337 @@ class TestCampaignRollup:
         assert camp.refresh_state() == DONE
         assert camp.reason is None
         assert camp.detail is None
+
+
+# ---------------------------------------------------------------------------
+# a broker restart, as the runner sees it (plans/11 §3.3, §4 contract)
+# ---------------------------------------------------------------------------
+def _transients():
+    """One instance per transient class the contract names."""
+
+    return {
+        'connection'     : ConnectionError('transport not up'),
+        'timeout'        : TimeoutError('call timed out'),
+        '503'            : call_error(503, 'endpoint suspect', REASON_NO_STATUS),
+        '503-retry-after': call_error(503, 'replay pending; retry-after 1',
+                                      REASON_NO_STATUS),
+        '410-shutdown'   : call_error(410, '[federation] shutting down',
+                                      REASON_NO_STATUS),
+        '404-session'    : call_error(404, 'unknown session: fed',
+                                      REASON_NO_STATUS),
+    }
+
+
+def _md_only():
+    return [_spec()['stages'][0]]
+
+
+class TestErrorClasses:
+
+    @pytest.mark.parametrize('name', sorted(_transients()))
+    def test_the_contract_transients_are_transient(self, name):
+        from atomic_wm.campaign.runner import is_transient
+        assert is_transient(_transients()[name])
+
+    @pytest.mark.parametrize('status, detail, cls', [
+        (409, 'class gpu has no members', FederationCallError),
+        (404, 'unknown task: t1',         TaskNotFound),
+        (410, 'session fed is closing',   FederationCallError),
+        (400, 'bad body',                 FederationCallError)])
+    def test_answers_are_not_transient(self, status, detail, cls):
+        from atomic_wm.campaign.runner import is_transient
+        exc = call_error(status, detail, REASON_NO_STATUS)
+        assert type(exc) is cls
+        assert exc.status == status
+        assert not is_transient(exc)
+
+
+class TestBrokerOutageWhilePolling:
+
+    @pytest.mark.parametrize('name', sorted(_transients()))
+    def test_an_outage_within_the_budget_is_waited_out(self, tmp_path, name):
+        exc = _transients()[name]
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'RUNNING'}]
+                            + [{'raise_exc': exc}] * 20
+                            + [{'state': 'DONE', 'exit_code': 0}]}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 5))            # 20 polls ~ 200 s
+        _run(fed, camp, _store(tmp_path), unreachable_budget=300,
+             clock=lambda: float(next(ticks)))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'DONE', (stage.reason, stage.detail)
+        assert camp.state  == 'DONE'
+
+    @pytest.mark.parametrize('name', sorted(_transients()))
+    def test_an_outage_past_the_budget_fails_the_stage(self, tmp_path, name):
+        exc = _transients()[name]
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}, {'raise_exc': exc}]}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 5))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             stage_timeout=10 ** 6, clock=lambda: float(next(ticks)))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert stage.reason == REASON_NO_STATUS
+        assert 'unreachable for' in stage.detail
+        # it waited (budget / tick polls), it did not give up at once
+        assert fed.polls[stage.task_id] > 5
+
+    def test_a_success_resets_the_budget(self, tmp_path):
+        # outages of ~60 s each, separated by one good answer, never add
+        # up to a failure under a 100 s budget
+        exc = ConnectionError('down')
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': ([{'raise_exc': exc}] * 6
+                             + [{'state': 'RUNNING'}]) * 5
+                            + [{'state': 'DONE'}]}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 5))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             stage_timeout=10 ** 6, clock=lambda: float(next(ticks)))
+        assert camp.workflows[0].stages[0].state == 'DONE'
+
+    def test_a_404_unknown_session_is_not_a_lost_task(self, tmp_path):
+        # the replay race after a broker restart: one 404 'unknown
+        # session: fed' must not fail the stage (it used to, at once)
+        exc = call_error(404, 'unknown session: fed', REASON_NO_STATUS)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'raise_exc': exc}, {'state': 'DONE'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        assert camp.workflows[0].stages[0].state == 'DONE'
+
+    def test_any_other_404_still_fails_at_once(self, tmp_path):
+        exc = call_error(404, 'unknown task: x', REASON_NO_STATUS)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'raise_exc': exc}, {'state': 'DONE'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'FAILED'
+        assert fed.polls[stage.task_id] == 1
+
+    def test_a_409_fails_at_once(self, tmp_path):
+        exc = call_error(409, 'class gpu has no members', REASON_NO_STATUS)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'raise_exc': exc}, {'state': 'DONE'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path), unreachable_budget=10 ** 6)
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert 'no members' in stage.detail
+        assert fed.polls[stage.task_id] == 1
+
+
+class TestSubmitRetry:
+
+    @pytest.mark.parametrize('name', sorted(_transients()))
+    def test_a_transient_submit_error_is_retried_with_the_same_id(
+            self, tmp_path, name):
+        exc = _transients()[name]
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'submit_errors': [exc, exc]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path),
+             sleep=lambda _s: asyncio.sleep(0))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'DONE', (stage.reason, stage.detail)
+        assert fed.submit_attempts == ['cmp-test-wf-000-md'] * 3
+
+    def test_submit_gives_up_after_the_budget(self, tmp_path):
+        exc = ConnectionError('down')
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'submit_errors': [exc] * 1000}})
+        camp  = _campaign(tmp_path, stages=_md_only())
+        ticks = iter(range(0, 10 ** 6, 10))
+        _run(fed, camp, _store(tmp_path), unreachable_budget=100,
+             clock=lambda: float(next(ticks)),
+             sleep=lambda _s: asyncio.sleep(0))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state  == 'FAILED'
+        assert stage.reason == REASON_NOT_STARTED
+        assert 'unreachable' in stage.detail
+        assert 5 <= len(fed.submit_attempts) <= 15
+
+    def test_a_409_submit_is_not_retried(self, tmp_path):
+        exc = call_error(409, 'no class has an eligible member', 'x')
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'submit_errors': [exc, exc]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        _run(fed, camp, _store(tmp_path))
+        assert camp.workflows[0].stages[0].state == 'FAILED'
+        assert len(fed.submit_attempts) == 1
+
+
+def _start_and_cancel(fed, camp, store, *, before_cancel=None, **kwargs):
+    """Run one workflow as a task, cancel the TASK once it was submitted."""
+
+    kwargs.setdefault('poll_interval', 0)
+    kwargs.setdefault('poll_max_interval', 0)
+    runner = StageRunner(fed, store, **kwargs)
+    wf     = camp.workflows[0]
+
+    async def _scenario():
+        task = asyncio.ensure_future(runner.run_workflow(camp, wf))
+        for _ in range(200):
+            if fed.submits:
+                break
+            await asyncio.sleep(0)
+        if before_cancel is not None:
+            before_cancel()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_scenario())
+    return wf
+
+
+class TestCancelReachesTheFederation:
+
+    def test_a_cancelled_run_workflow_cancels_its_task(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        wf   = _start_and_cancel(fed, camp, _store(tmp_path))
+        assert wf.stages[0].state == 'CANCELED'
+        assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+        assert camp.pending_cancels == []
+
+    def test_the_cancel_is_retried_when_the_first_call_fails(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        fed.cancel_errors = [ConnectionError('down')]
+        camp = _campaign(tmp_path, stages=_md_only())
+        _start_and_cancel(fed, camp, _store(tmp_path))
+        assert len(fed.cancel_calls) == 2
+        assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+        assert camp.pending_cancels == []
+
+    def test_a_stopped_campaign_retries_its_cancel(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        fed.cancel_errors = [TimeoutError('slow')]
+        camp   = _campaign(tmp_path, stages=_md_only())
+        runner = CampaignRunner(fed, _store(tmp_path), poll_interval=0,
+                                poll_max_interval=0)
+
+        async def _scenario():
+            task = asyncio.ensure_future(runner.run(camp))
+            for _ in range(200):
+                if fed.submits:
+                    break
+                await asyncio.sleep(0)
+            runner.cancel()
+            await task
+
+        asyncio.run(_scenario())
+        assert camp.state  == 'CANCELED'
+        assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+
+    def test_an_unreachable_federation_leaves_the_cancel_pending(
+            self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        fed.cancel_errors = [ConnectionError('down')] * 10
+        camp = _campaign(tmp_path, stages=_md_only())
+        _start_and_cancel(fed, camp, _store(tmp_path))
+        assert fed.cancels == []
+        assert camp.pending_cancels == [
+            {'task_id': 'cmp-test-wf-000-md', 'dispatcher_sid': 'sid-a'}]
+
+    def test_pending_cancels_survive_a_reload_and_drain(self, tmp_path):
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        fed.cancel_errors = [ConnectionError('down')] * 10
+        camp = _campaign(tmp_path, stages=_md_only())
+        _start_and_cancel(fed, camp, _store(tmp_path))
+
+        path = tmp_path / 'state.json'
+        save_campaigns(path, [camp])
+        back = load_campaigns(path)[0]
+        assert back.pending_cancels == camp.pending_cancels
+
+        # still down: the entry stays
+        fed.cancel_errors = [call_error(503, 'replay pending', 'x')]
+        assert asyncio.run(drain_pending_cancels(fed, back)) == 0
+        assert back.pending_cancels
+        # back up: settled
+        assert asyncio.run(drain_pending_cancels(fed, back)) == 1
+        assert back.pending_cancels == []
+        assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
+
+    def test_the_next_good_federation_call_drains_the_list(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)}}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.queue_cancel('cmp-old-wf-000-md', 'fed')
+        _run(fed, camp, _store(tmp_path))
+        assert ('fed', 'cmp-old-wf-000-md') in fed.cancels
+        assert camp.pending_cancels == []
+
+    def test_a_refused_cancel_is_not_retried_forever(self, tmp_path):
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed  = FakeFederation(tmp_path)
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.queue_cancel('t1', 'fed')
+        fed.cancel_errors = [call_error(400, 'bad', 'x')]
+        assert asyncio.run(drain_pending_cancels(fed, camp)) == 1
+        assert camp.pending_cancels == []
+
+    def test_an_interrupted_stage_is_not_cancelled_by_the_shutdown(
+            self, tmp_path):
+        # shutdown stamps INTERRUPTED before it cancels the driver: no
+        # cancel call then, but the task is queued for the next start
+        from atomic_wm.campaign.state import mark_interrupted
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        wf   = _start_and_cancel(fed, camp, _store(tmp_path),
+                                 before_cancel=lambda: mark_interrupted(camp))
+        assert wf.stages[0].state == 'INTERRUPTED'
+        assert fed.cancel_calls == []
+        assert [e['task_id'] for e in camp.pending_cancels] == \
+               ['cmp-test-wf-000-md']
+
+
+class TestRestartQueuesOrphans:
+
+    def test_a_running_stage_found_on_load_is_queued_for_cancel(
+            self, tmp_path):
+        camp  = _campaign(tmp_path)
+        md, train = camp.workflows[0].stages
+        md.state, md.task_id, md.dispatcher_sid = 'DONE', 't-md', 'fed'
+        train.state, train.task_id, train.dispatcher_sid = \
+            'RUNNING', 't-train', 'fed'
+        path = tmp_path / 'state.json'
+        save_campaigns(path, [camp])
+
+        back = load_campaigns(path)[0]
+        assert back.state == 'INTERRUPTED'
+        assert back.pending_cancels == [{'task_id': 't-train',
+                                         'dispatcher_sid': 'fed'}]
+
+    def test_a_stage_without_a_task_queues_nothing(self, tmp_path):
+        camp = _campaign(tmp_path)
+        path = tmp_path / 'state.json'
+        save_campaigns(path, [camp])
+        assert load_campaigns(path)[0].pending_cancels == []
