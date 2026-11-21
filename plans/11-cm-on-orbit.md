@@ -184,7 +184,23 @@ What the code does today, and what changes:
    explicit error if that pool is gone.
 3. The federation replay race (§3.3): wait for the replay, retry
    `_register_fed`.
-4. Pending the rehearsal: the #149 slice for lost pilot events.
+4. Pilots replayed after a broker restart are paused until their endpoint
+   reconnects (it is unknown to the new broker for up to ~10 s of backoff).
+   After 300 s absent, the pilot is failed and its tasks requeue elsewhere.
+   Without this, queued and new tasks fail in that window. (Found by the
+   ORBIT session, 2026-11-21.)
+5. Pending the rehearsal: the #149 slice for lost pilot events.
+
+Contract for the runner after these ORBIT PRs:
+- a federation submit with a known task_id returns the existing record
+  (DONE / QUEUED / RUNNING); FAILED / CANCELED re-runs in the recorded pool;
+- 409 means a known id whose class has no members now: fail the stage;
+- 503 is transient everywhere: replay pending, or a suspect endpoint.
+
+Staging-put is on the demo path: Perlmutter and Odo join with
+`shared_fs=false` (`demo/2026_09_08/env.sh:1134-1207`), and inputs travel as
+`inputs_b64` in the submit (`runner.py:351-361`). Paused or requeued tasks must
+keep their inputs across a restart.
 
 Deferred: #149 in full, #148 generic idempotent submit, session-scoped
 dispatcher events, #150.
