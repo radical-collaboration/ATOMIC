@@ -253,10 +253,12 @@ Submit, poll, output collection and cancel classify errors the same way:
 - **Cancels reach ORBIT.** Every cancel -- a stopped campaign, a stage
   timeout, a cancelled `run_workflow` -- is first put on the campaign's
   persisted `pending_cancels` list, then tried (shielded) up to three
-  times. An entry the federation could not take stays, and is retried
-  after the next successful federation call and by a plugin drainer
-  (kicked by any route, a reconnect, a finished campaign). A refused or
-  unknown task settles the entry.
+  times. An entry the federation could not take stays. One plugin
+  drainer settles the list; runners never retry an entry themselves.
+  The drainer retries every `drain_interval_sec`, and wakes at once when
+  a runner sees the federation answer after a failure, on any route, on
+  a reconnect and when a campaign finishes. A refused or unknown task
+  settles the entry.
 - **Shutdown does not cancel.** An orderly stop (`shutdown`, or
   `on_host_stop` on `ep_cm`) marks running campaigns `INTERRUPTED` and
   leaves their tasks running; a broker restart therefore never kills HPC

@@ -324,6 +324,7 @@ class StageRunner:
                  unreachable_budget: float = DEFAULT_UNREACHABLE_BUDGET,
                  tool_prefix:       Optional[str] = None,
                  on_change:         Optional[Callable[[], None]] = None,
+                 wake_drainer:      Optional[Callable[[], None]] = None,
                  sleep:             Callable[[float], Any] = asyncio.sleep,
                  clock:             Callable[[], float] = time.time) -> None:
 
@@ -337,8 +338,26 @@ class StageRunner:
         self._tool_prefix  = tool_prefix if tool_prefix is not None \
                              else os.environ.get(_TOOL_PREFIX_ENV)
         self._on_change    = on_change
+        # the owner's pending-cancel drainer: the ONE place that settles
+        # the list, so N runners never retry the same entry at once
+        self._wake_drainer = wake_drainer
         self._sleep        = sleep
         self._clock        = clock
+
+    # ----------------------------------------------------------------------
+    def _drain_cancels(self) -> None:
+        """Tell the owner's drainer to try the pending cancels now.
+
+        Called when the federation answers again after a failure, and when
+        a cancel is left pending.  The runner never drains the list itself.
+        """
+
+        if self._wake_drainer is None:
+            return
+        try:
+            self._wake_drainer()
+        except Exception as exc:                              # noqa: BLE001
+            log.warning('[atomic_campaign] drainer wake failed: %s', exc)
 
     # ----------------------------------------------------------------------
     def _changed(self) -> None:
@@ -596,7 +615,8 @@ class StageRunner:
                 # the submit may have landed: a stop must cancel it
                 await self._stop_if_canceled(campaign, stage, cancel)
                 continue
-            await self._federation_ok(campaign)
+            if down_since is not None:
+                self._drain_cancels()             # it answers again
             return resp
 
     # ----------------------------------------------------------------------
@@ -610,14 +630,6 @@ class StageRunner:
         stage.state  = CANCELED
         stage.reason = REASON_STOPPED
         raise StageFailed(stage.reason)
-
-    # ----------------------------------------------------------------------
-    async def _federation_ok(self, campaign: Campaign) -> None:
-        """A federation call worked: settle the cancels that waited for it."""
-
-        if campaign.pending_cancels:
-            if await drain_pending_cancels(self._fed, campaign):
-                self._changed()
 
     # ----------------------------------------------------------------------
     @staticmethod
@@ -703,8 +715,7 @@ class StageRunner:
 
             await self._stop_if_canceled(campaign, stage, cancel)
 
-            task_dict, down_since = await self._poll_once(campaign, stage,
-                                                          down_since)
+            task_dict, down_since = await self._poll_once(stage, down_since)
 
             self._observe(stage, task_dict)
 
@@ -753,7 +764,7 @@ class StageRunner:
                 raise StageFailed(stage.reason)
 
     # ----------------------------------------------------------------------
-    async def _poll_once(self, campaign: Campaign, stage: StageRun,
+    async def _poll_once(self, stage: StageRun,
                          down_since: Optional[float]
                          ) -> Tuple[Dict[str, Any], Optional[float]]:
         """One status lookup; returns ``(task dict, unreachable since)``.
@@ -784,7 +795,8 @@ class StageRunner:
                 stage.reason = REASON_NO_STATUS
                 stage.detail = describe(exc)
             raise StageFailed(stage.reason) from exc
-        await self._federation_ok(campaign)
+        if down_since is not None:
+            self._drain_cancels()                 # it answers again
         return task_dict, None
 
     # ----------------------------------------------------------------------
@@ -913,10 +925,10 @@ class StageRunner:
 
         The cancel is put on the campaign's persisted pending-cancel list
         *first*, then tried up to :data:`CANCEL_ATTEMPTS` times.  If the
-        federation stays unreachable the entry remains and is drained by
-        the next successful federation call (or the plugin's drainer, after
-        a reconnect or a restart).  The shield lets a cancel that is under
-        way finish even when the caller is cancelled again.
+        federation stays unreachable the entry remains, and the owner's
+        drainer settles it once the federation answers again.  The shield
+        lets a cancel that is under way finish even when the caller is
+        cancelled again.
         """
 
         if not stage.task_id:
@@ -937,6 +949,7 @@ class StageRunner:
                     await self._sleep(min(self._poll_max * (attempt + 1),
                                           RETRY_MAX_INTERVAL))
             log.info('[atomic_campaign] cancel of %s left pending', task_id)
+            self._drain_cancels()
 
         job = asyncio.ensure_future(_attempts())
         _BACKGROUND.add(job)

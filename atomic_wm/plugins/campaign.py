@@ -581,6 +581,8 @@ class PluginAtomicCampaign(Plugin):
         self._budget     = self._budget_from(unreachable_budget_sec)
         self._drain_every = float(drain_interval_sec)
         self._drainer: Optional[asyncio.Task] = None
+        # set to make the drainer try now instead of after `_drain_every`
+        self._drain_wake = asyncio.Event()
         # set by a stop: interrupted tasks wait for the next start
         self._stopping   = False
 
@@ -629,6 +631,7 @@ class PluginAtomicCampaign(Plugin):
     def _ensure_drainer(self) -> None:
         """Start the pending-cancel drainer if there is work for it.
 
+        The drainer is the one place that settles ``pending_cancels``.
         Called whenever the plugin gets a chance to run on its loop (a
         route, a topology change -- i.e. after a reconnect --, a finished
         driver); a no-op while nothing is pending or a drainer runs.
@@ -646,10 +649,18 @@ class PluginAtomicCampaign(Plugin):
         except RuntimeError:                       # no loop (yet)
             self._drainer = None
 
+    def _wake_drainer(self) -> None:
+        """A runner saw the federation answer again (or left a cancel
+        pending): try the pending cancels now."""
+
+        self._ensure_drainer()
+        self._drain_wake.set()
+
     async def _drain_loop(self) -> None:
         """Retry the unconfirmed cancels until none is left."""
 
         while True:
+            self._drain_wake.clear()
             pending = [c for c in list(self._campaigns.values())
                        if c.pending_cancels]
             if not pending:
@@ -665,7 +676,11 @@ class PluginAtomicCampaign(Plugin):
                 log.info('[%s] %d pending cancel(s) settled',
                          self.instance_name, settled)
                 self._persist()
-            await asyncio.sleep(self._drain_every)
+            try:
+                await asyncio.wait_for(self._drain_wake.wait(),
+                                       self._drain_every)
+            except asyncio.TimeoutError:
+                pass
 
     async def on_topology_change(self, participants: dict) -> None:
         """A (re)connect is the moment to retry the pending cancels."""
@@ -761,7 +776,8 @@ class PluginAtomicCampaign(Plugin):
         stage_kwargs = dict(stage_timeout=float(timeout),
                             unreachable_budget=self._budget,
                             poll_interval=self._poll,
-                            poll_max_interval=self._poll_max)
+                            poll_max_interval=self._poll_max,
+                            wake_drainer=self._wake_drainer)
         name = str(body.get('name') or workflow.get('name') or 'campaign')
 
         if planner == 'aucam':

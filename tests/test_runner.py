@@ -75,6 +75,7 @@ class FakeFederation(FederationAPI):
         self.cancel_calls = []                # [(sid, task_id)] attempted
         # exceptions the next cancel calls raise, in order (then success)
         self.cancel_errors = []
+        self.cancel_delay  = 0.0              # seconds one cancel call takes
         self.polls      = {}                  # task_id -> n polls
 
         self._pilot     = {}                  # (endpoint, path) -> bytes
@@ -173,6 +174,8 @@ class FakeFederation(FederationAPI):
 
     async def cancel_task(self, dispatcher_sid, task_id):
         self.cancel_calls.append((dispatcher_sid, task_id))
+        if self.cancel_delay:
+            await asyncio.sleep(self.cancel_delay)
         if self.cancel_errors:
             raise self.cancel_errors.pop(0)
         self.cancels.append((dispatcher_sid, task_id))
@@ -1285,14 +1288,48 @@ class TestCancelReachesTheFederation:
         assert back.pending_cancels == []
         assert fed.cancels == [('sid-a', 'cmp-test-wf-000-md')]
 
-    def test_the_next_good_federation_call_drains_the_list(self, tmp_path):
+    def test_runners_wake_the_drainer_instead_of_draining(self, tmp_path):
+        # three workflows see the federation come back at the same moment:
+        # none of them retries the pending cancel itself (they used to,
+        # all three at once), each wakes the owner's drainer instead
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'raise_exc': ConnectionError('down')},
+                             {'state': 'DONE', 'exit_code': 0}]}})
+        fed.cancel_delay = 0.05
+        camp = _campaign(tmp_path, sweep={'temperature': [300, 600, 900]},
+                         stages=_md_only())
+        camp.queue_cancel('cmp-old-wf-000-md', 'fed')
+        wakes = []
+        _run(fed, camp, _store(tmp_path),
+             wake_drainer=lambda: wakes.append(1))
+        assert camp.state == 'DONE'
+        assert fed.cancel_calls == []
+        assert camp.pending_cancels == [{'task_id': 'cmp-old-wf-000-md',
+                                         'dispatcher_sid': 'fed'}]
+        assert len(wakes) == 3
+
+    def test_no_wake_while_the_federation_never_failed(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': _envelope('simulation', 1)}}})
-        camp = _campaign(tmp_path, stages=_md_only())
-        camp.queue_cancel('cmp-old-wf-000-md', 'fed')
-        _run(fed, camp, _store(tmp_path))
-        assert ('fed', 'cmp-old-wf-000-md') in fed.cancels
-        assert camp.pending_cancels == []
+        camp  = _campaign(tmp_path, stages=_md_only())
+        wakes = []
+        _run(fed, camp, _store(tmp_path),
+             wake_drainer=lambda: wakes.append(1))
+        assert camp.state == 'DONE'
+        assert wakes == []
+
+    def test_a_cancel_left_pending_wakes_the_drainer(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        fed.cancel_errors = [ConnectionError('down')] * 10
+        camp  = _campaign(tmp_path, stages=_md_only())
+        wakes = []
+        _start_and_cancel(fed, camp, _store(tmp_path),
+                          wake_drainer=lambda: wakes.append(1))
+        assert camp.pending_cancels
+        assert wakes == [1]
 
     def test_a_refused_cancel_is_not_retried_forever(self, tmp_path):
         from atomic_wm.campaign.runner import drain_pending_cancels
