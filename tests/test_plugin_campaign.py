@@ -141,14 +141,19 @@ def _fed(tmp_path):
 # ---------------------------------------------------------------------------
 class TestPluginBasics:
 
-    def test_is_enabled_on_broker_only(self):
+    def test_is_enabled_on_the_broker_and_service_endpoints(self):
         from unittest.mock import patch
         with patch('radical.orbit.utils.host_role') as m:
-            m.return_value = {'role': 'broker'}
-            assert PluginAtomicCampaign.is_enabled(FastAPI()) is True
-            for role in ('login', 'compute', 'standalone'):
+            for role in ('broker', 'login', 'standalone'):
                 m.return_value = {'role': role}
-                assert PluginAtomicCampaign.is_enabled(FastAPI()) is False
+                assert PluginAtomicCampaign.is_enabled(FastAPI()) is True
+            # a pilot never steers campaigns
+            m.return_value = {'role': 'compute'}
+            assert PluginAtomicCampaign.is_enabled(FastAPI()) is False
+
+    def test_not_in_any_default_plugin_set(self):
+        # an endpoint hosts it only with an explicit --plugins
+        assert PluginAtomicCampaign.default_roles == ()
 
     def test_routes_are_registered(self, tmp_path):
         app, plugin = _make_plugin(tmp_path)
@@ -742,3 +747,258 @@ class TestPersistenceAcrossRestart:
         plugin = PluginAtomicCampaign(app, fed_api=_fed(tmp_path))
         assert plugin._state_file == tmp_path / 'cs' / 'state.json'
         assert plugin.store.root  == tmp_path / 'st'
+
+
+# ---------------------------------------------------------------------------
+# hosted on a service endpoint (ep_cm): the remote federation API
+# ---------------------------------------------------------------------------
+class FakeRuntime:
+    """Stand-in for ``EndpointRuntime``: a synchronous, blocking ``call``.
+
+    Like the real one, ``call`` blocks on a future scheduled on the loop the
+    plugin runs on -- so calling it ON that loop deadlocks (here: times out
+    after 2 s and the test fails), and only a call from a thread works.
+    """
+
+    def __init__(self, responses=None, raises=None):
+        self.responses = responses or {}
+        self.raises    = raises
+        self.calls     = []
+        self.loop      = None
+
+    def call(self, dst, method, path, *, body=b'', headers=None,
+             timeout=None):
+        import threading
+        from radical.orbit.runtime_client import RuntimeResponse
+
+        self.calls.append({'dst': dst, 'method': method, 'path': path,
+                           'body': body, 'timeout': timeout,
+                           'thread': threading.get_ident()})
+        if self.loop is not None:
+            async def _hop():
+                return True
+            asyncio.run_coroutine_threadsafe(_hop(), self.loop).result(2)
+        if self.raises is not None:
+            raise self.raises
+        entry = self.responses.get((method, path), {})
+        status, payload = entry if isinstance(entry, tuple) else (200, entry)
+        return RuntimeResponse(status, {'content-type': 'application/json'},
+                               json.dumps(payload).encode())
+
+
+def _endpoint_app(runtime):
+    app = FastAPI()
+    app.state.endpoint_name    = 'ep_cm'
+    app.state.is_broker        = False
+    app.state.broker_url       = 'https://localhost:9999'
+    app.state.endpoint_service = runtime
+    return app
+
+
+class TestRemoteFederationAPI:
+
+    def _api(self, runtime):
+        from atomic_wm.plugins.campaign import _RemoteFederationAPI
+        return _RemoteFederationAPI(_endpoint_app(runtime))
+
+    def test_the_host_role_picks_the_api(self, tmp_path):
+        from atomic_wm.plugins.campaign import (_RemoteFederationAPI,
+                                                make_federation_api)
+        app = _endpoint_app(FakeRuntime())
+        assert type(make_federation_api(app)) is _RemoteFederationAPI
+        bapp, _ = _make_plugin(tmp_path)
+        assert type(make_federation_api(bapp)) is _FederationAPI
+
+    def test_calls_run_off_the_loop_with_a_timeout(self):
+        import threading
+        rt  = FakeRuntime({('POST', '/federation/submit/default'):
+                           {'task': {'task_id': 't1'}, 'pool': 'fed-cpu',
+                            'dispatcher_sid': 'fed'}})
+        api = self._api(rt)
+
+        async def _go():
+            rt.loop = asyncio.get_running_loop()
+            return await api.submit({'task_id': 't1', 'cmd': ['x']}, {})
+
+        out = asyncio.run(_go())
+        assert out['dispatcher_sid'] == 'fed'
+        call = rt.calls[0]
+        assert call['dst']     == 'broker'
+        assert call['path']    == '/federation/submit/default'
+        assert call['timeout'] == 15.0
+        assert call['thread']  != threading.get_ident()
+        assert json.loads(call['body'])['task']['task_id'] == 't1'
+
+    def test_routes_of_task_cancel_resources_and_stage_out(self):
+        import base64
+        rt  = FakeRuntime({
+            ('GET', '/federation/task/default/t1'): {'state': 'RUNNING'},
+            ('POST', '/task_dispatcher/cancel/fed/t1'): {'ok': True},
+            ('GET', '/federation/resources/default'):
+                {'resources': [{'name': 'a'}]},
+            ('GET', '/task_dispatcher/stage_out/fed/t1/o.json'):
+                {'content_b64': base64.b64encode(b'hi').decode()}})
+        api = self._api(rt)
+        assert asyncio.run(api.task('t1'))['state'] == 'RUNNING'
+        assert asyncio.run(api.cancel_task('fed', 't1')) is True
+        assert asyncio.run(api.resources()) == [{'name': 'a'}]
+        assert asyncio.run(api.stage_out('fed', 't1', 'o.json')) == b'hi'
+        assert {c['dst'] for c in rt.calls} == {'broker'}
+        assert {c['timeout'] for c in rt.calls} == {15.0}
+
+    @pytest.mark.parametrize('exc', [ConnectionError('transport not up'),
+                                     TimeoutError()])
+    def test_transport_errors_reach_the_runner_as_transient(self, exc):
+        from atomic_wm.campaign.runner import is_transient
+        api = self._api(FakeRuntime(raises=exc))
+        with pytest.raises(type(exc)) as got:
+            asyncio.run(api.task('t1'))
+        assert is_transient(got.value)
+
+    @pytest.mark.parametrize('status, detail, transient', [
+        (503, 'endpoint suspect',            True),
+        (410, '[federation] shutting down',  True),
+        (404, 'unknown session: fed',        True),
+        (404, 'unknown task: t1',            False),
+        (409, 'class has no members',        False)])
+    def test_http_answers_are_classified(self, status, detail, transient):
+        from atomic_wm.campaign.runner import is_transient
+        api = self._api(FakeRuntime({('GET', '/federation/task/default/t1'):
+                                     (status, {'detail': detail})}))
+        with pytest.raises(FederationCallError) as got:
+            asyncio.run(api.task('t1'))
+        assert is_transient(got.value) is transient
+        assert got.value.status == status
+
+    def test_a_transient_submit_answer_is_retryable(self):
+        from atomic_wm.campaign.runner import is_transient
+        api = self._api(FakeRuntime({('POST', '/federation/submit/default'):
+                                     (503, {'detail': 'replay pending'})}))
+        with pytest.raises(FederationCallError) as got:
+            asyncio.run(api.submit({'task_id': 't1', 'cmd': ['x']}, {}))
+        assert is_transient(got.value)
+
+    def test_a_cancel_during_an_outage_raises_transient(self):
+        from atomic_wm.campaign.runner import is_transient
+        api = self._api(FakeRuntime({('POST',
+                                      '/task_dispatcher/cancel/fed/t1'):
+                                     (404, {'detail':
+                                            'unknown session: fed'})}))
+        with pytest.raises(FederationCallError) as got:
+            asyncio.run(api.cancel_task('fed', 't1'))
+        assert is_transient(got.value)
+
+    def test_a_cancel_of_an_unknown_task_is_settled(self):
+        api = self._api(FakeRuntime({('POST',
+                                      '/task_dispatcher/cancel/fed/t1'):
+                                     (404, {'detail': 'unknown task: t1'})}))
+        assert asyncio.run(api.cancel_task('fed', 't1')) is True
+
+    def test_without_a_runtime_the_federation_is_unavailable(self):
+        from atomic_wm.campaign.runner import FederationUnavailable
+        api = self._api(object())                     # no `call`
+        with pytest.raises(FederationUnavailable):
+            asyncio.run(api.task('t1'))
+
+    def test_staging_goes_to_the_pilot_endpoint_with_a_timeout(self):
+        import base64
+
+        class _StagingRuntime(FakeRuntime):
+            def call(self, dst, method, path, **kw):
+                if path.endswith('register_session'):
+                    self.responses[(method, path)] = {'sid': 'st.1'}
+                elif '/staging/get/' in path:
+                    self.responses[(method, path)] = {
+                        'path': '/tmp/x/md.json', 'size': 2,
+                        'content': base64.b64encode(b'hi').decode()}
+                return super().call(dst, method, path, **kw)
+
+        rt   = _StagingRuntime()
+        api  = self._api(rt)
+        data = asyncio.run(api.staging_get('fed-a_p1', '/tmp/x/md.json'))
+        assert data == b'hi'
+        assert {c['dst'] for c in rt.calls} == {'fed-a_p1'}
+        assert {c['timeout'] for c in rt.calls} == {120.0}
+        paths = [c['path'] for c in rt.calls]
+        assert '/staging/get/st.1' in paths
+
+    def test_a_failing_staging_call_is_not_fatal(self):
+        api = self._api(FakeRuntime(raises=ConnectionError('gone')))
+        assert asyncio.run(api.staging_get('fed-a_p1', '/tmp/x')) is None
+
+
+class TestPendingCancelsInThePlugin:
+
+    def _orphaned_state(self, tmp_path):
+        """A state file as a crashed CM leaves it: one stage RUNNING."""
+        from atomic_wm.campaign.state import save_campaigns
+        from atomic_wm.campaign.planner import SweepPlanner
+        from atomic_wm.campaign.state import Campaign
+        wfs  = SweepPlanner().expand(_spec([_spec()['stages'][0]]),
+                                     {'temperature': [300]})
+        camp = Campaign(campaign_id='cmp-old', workflows=wfs)
+        st   = camp.workflows[0].stages[0]
+        st.state, st.task_id, st.dispatcher_sid = 'RUNNING', 't-old', 'fed'
+        save_campaigns(Path(tmp_path) / 'state' / 'state.json', [camp])
+
+    def test_a_restart_cancels_the_orphaned_tasks(self, tmp_path):
+        self._orphaned_state(tmp_path)
+        fed = FakeFederation(tmp_path)
+        _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=0.01)
+        assert plugin._campaigns['cmp-old'].state == 'INTERRUPTED'
+        client = _request(plugin)
+        client.get('%s/campaigns/default' % NS)       # the loop is up
+
+        deadline = time.time() + 5
+        while not fed.cancels and time.time() < deadline:
+            time.sleep(0.02)
+        assert fed.cancels == [('fed', 't-old')]
+        deadline = time.time() + 5
+        while plugin._campaigns['cmp-old'].pending_cancels \
+                and time.time() < deadline:
+            time.sleep(0.02)
+        assert plugin._campaigns['cmp-old'].pending_cancels == []
+
+    def test_the_drainer_retries_until_the_federation_answers(self, tmp_path):
+        self._orphaned_state(tmp_path)
+        fed = FakeFederation(tmp_path)
+        fed.cancel_errors = [ConnectionError('down')] * 3
+        _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=0.01)
+        client = _request(plugin)
+        client.portal.call(plugin.on_topology_change, {'broker': {}})
+
+        deadline = time.time() + 5
+        while not fed.cancels and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(fed.cancel_calls) == 4
+        assert fed.cancels == [('fed', 't-old')]
+
+    def test_host_stop_interrupts_without_cancelling(self, tmp_path):
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        cid = client.post('%s/campaigns/default' % NS,
+                          json={'workflow': _spec([_spec()['stages'][0]]),
+                                'sweep': {'temperature': [300]}}
+                          ).json()['campaign_id']
+        deadline = time.time() + 5
+        while not fed.submits and time.time() < deadline:
+            time.sleep(0.02)
+
+        client.portal.call(plugin.on_host_stop)
+        camp = plugin._campaigns[cid]
+        assert camp.state == 'INTERRUPTED'
+        assert fed.cancel_calls == []
+        # queued, on disk, for the next start to cancel
+        assert [e['task_id'] for e in camp.pending_cancels] == \
+               ['%s-wf-000-md' % cid]
+
+    def test_the_budget_comes_from_the_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('ATOMIC_CAMPAIGN_UNREACHABLE_SEC', '42')
+        _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
+        assert plugin._budget == 42.0
+        _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path),
+                                 unreachable_budget_sec=7)
+        assert plugin._budget == 7.0

@@ -1,4 +1,4 @@
-"""``atomic_campaign`` -- the broker-hosted campaign plugin.
+"""``atomic_campaign`` -- the campaign plugin (broker or service endpoint).
 
 One POST creates a campaign: a workflow spec plus a parameter sweep is
 expanded into N workflow instances, each of which runs its stages
@@ -8,10 +8,21 @@ the campaign state, and the REST surface the CLI and the demo UI use.
 
 Everything ATOMIC-specific about *how* a campaign is planned and executed
 lives in :mod:`atomic_wm.campaign`; this module is the orbit shell around it:
-plugin lifetime, routes, sessions, persistence, and the in-process calls to
-the sibling broker plugins (see ``plans/00-overview.md`` §Facts -- broker
-plugins call each other through ``app.state.endpoint_service.handle_request``,
-never through the broker caller, which cannot address the broker itself).
+plugin lifetime, routes, sessions, persistence, and the calls to the
+``federation`` / ``task_dispatcher`` plugins on the broker.
+
+Two placements, chosen by the host role (plans/11 §3.1):
+
+- **on the broker** (``app.state.is_broker``): the federation is reached
+  in-process (:class:`_FederationAPI`; ``plans/00-overview.md`` §Facts --
+  broker plugins call each other through
+  ``app.state.endpoint_service.handle_request``, never through the broker
+  caller, which cannot address the broker itself);
+- **on a service endpoint** (``ep_cm``, started with ``--plugins
+  atomic_campaign``): over the endpoint runtime's WebSocket to
+  ``dst='broker'`` (:class:`_RemoteFederationAPI`).  A broker restart then
+  does not touch the campaign state: the runner waits the outage out
+  (``unreachable_budget_sec``).
 """
 
 from __future__ import annotations
@@ -41,7 +52,10 @@ from fastapi import FastAPI, HTTPException, Request
 from atomic_wm.campaign.planner import PlannerError, SweepPlanner
 from atomic_wm.campaign.runner  import (CampaignRunner, FederationAPI,
                                         FederationCallError,
-                                        FederationUnavailable, TaskNotFound,
+                                        FederationUnavailable,
+                                        DEFAULT_UNREACHABLE_BUDGET,
+                                        call_error, drain_pending_cancels,
+                                        is_transient_status,
                                         REASON_INCOMPLETE, REASON_NOT_STARTED,
                                         REASON_NO_RESOURCE,
                                         REASON_NO_RESOURCES_JOINED,
@@ -58,6 +72,22 @@ log = logging.getLogger('radical.orbit')
 
 FEDERATION_PLUGIN = 'federation'
 DISPATCHER_PLUGIN = 'task_dispatcher'
+
+# the participant name the remote API addresses the federation on
+BROKER_DST = 'broker'
+
+# per-call bound of a remote federation call.  ``EndpointRuntime.call``
+# waits 600 s by default, and a pending call survives a reconnect by
+# design -- one poll could hang for ten minutes without this.
+REMOTE_CALL_TIMEOUT = 15.0
+# a staging get moves a whole output file: a longer bound
+REMOTE_STAGING_TIMEOUT = 120.0
+
+# how often the plugin retries cancels the federation has not confirmed
+DRAIN_INTERVAL = 10.0
+
+# $ATOMIC_CAMPAIGN_UNREACHABLE_SEC overrides the unreachable budget
+_BUDGET_ENV = 'ATOMIC_CAMPAIGN_UNREACHABLE_SEC'
 
 _JSON_HEADERS = {'content-type': 'application/json'}
 
@@ -173,10 +203,13 @@ class _FederationAPI(FederationAPI):
             {'task': task, 'requirements': requirements})
         if status >= 400:
             detail = self._detail(data)
+            if is_transient_status(status, detail):
+                raise call_error(status, detail, REASON_NOT_STARTED)
             reason = self._submit_reason(status, detail, data)
             if status == 409:
                 detail = self._submit_detail(detail, data)
-            raise FederationCallError(reason, detail or 'HTTP %d' % status)
+            raise FederationCallError(reason, detail or 'HTTP %d' % status,
+                                      status=status)
         return data if isinstance(data, dict) else {}
 
     @staticmethod
@@ -272,11 +305,8 @@ class _FederationAPI(FederationAPI):
         status, data = await self._call(
             FEDERATION_PLUGIN, 'GET',
             '/%s/task/%s/%s' % (FEDERATION_PLUGIN, DEFAULT_SID, task_id))
-        if status == 404:
-            raise TaskNotFound(self._detail(data) or 'HTTP 404')
         if status >= 400:
-            raise FederationCallError(
-                REASON_NO_STATUS, self._detail(data) or 'HTTP %d' % status)
+            raise call_error(status, self._detail(data), REASON_NO_STATUS)
         return data if isinstance(data, dict) else {}
 
     async def resources(self) -> List[Dict[str, Any]]:
@@ -307,10 +337,17 @@ class _FederationAPI(FederationAPI):
 
     async def cancel_task(self, dispatcher_sid: str, task_id: str) -> bool:
 
-        status, _ = await self._call(
+        status, data = await self._call(
             DISPATCHER_PLUGIN, 'POST',
             '/%s/cancel/%s/%s' % (DISPATCHER_PLUGIN, dispatcher_sid, task_id))
-        return status < 400
+        if status < 400:
+            return True
+        detail = self._detail(data)
+        if is_transient_status(status, detail):
+            raise call_error(status, detail, REASON_STOPPED)
+        # an unknown task (404) has nothing left to cancel; anything else
+        # is a refusal that a retry does not change
+        return status == 404
 
     # -- pilot-side staging (remote participant, broker caller) -----------
     def _staging_client(self, endpoint: str) -> Any:
@@ -356,8 +393,134 @@ class _FederationAPI(FederationAPI):
 
 
 # --------------------------------------------------------------------------
+class _TimedRuntime:
+    """An ``EndpointRuntime`` whose ``call`` has a bounded default timeout.
+
+    ``_RuntimeHTTP`` (what ``StagingClient`` rides on) calls the runtime
+    without a timeout, i.e. with the runtime's 600 s default.
+    """
+
+    def __init__(self, runtime: Any, timeout: float) -> None:
+        self._runtime = runtime
+        self._timeout = timeout
+
+    def call(self, dst: str, method: str, path: str, *,
+             body: bytes = b'', headers: Optional[Dict[str, str]] = None,
+             timeout: Optional[float] = None) -> Any:
+        return self._runtime.call(dst, method, path, body=body,
+                                  headers=headers,
+                                  timeout=timeout or self._timeout)
+
+
+# --------------------------------------------------------------------------
+class _RemoteFederationAPI(_FederationAPI):
+    """The runner's view of the broker from a service endpoint (``ep_cm``).
+
+    Same routes, bodies and error mapping as the in-process API; only the
+    transport differs: ``EndpointRuntime.call(dst='broker', ...)``.
+
+    - ``call`` is **synchronous** and blocks on a future that is scheduled
+      on the endpoint's own work loop -- the loop this plugin's coroutines
+      run on.  Called from a coroutine it would deadlock, so every call
+      runs in a thread (``asyncio.to_thread``).
+    - every call carries an explicit :data:`REMOTE_CALL_TIMEOUT`; a timeout
+      or a lost connection surfaces as ``TimeoutError`` / ``ConnectionError``
+      (transient for the runner).
+    - the federation and dispatcher routes are called with the reserved
+      ``default`` session (federation) and the dispatcher sid the submit
+      answered with, both reachable from any participant.
+    - a pilot's ``staging`` plugin is reached the same way
+      (``StagingClient`` over ``_RuntimeHTTP(runtime, child_endpoint)``);
+      the broker caller that the in-process API uses does not exist here.
+    """
+
+    def __init__(self, app: FastAPI, *, runtime: Any = None,
+                 dst: str = BROKER_DST,
+                 call_timeout: float = REMOTE_CALL_TIMEOUT,
+                 staging_timeout: float = REMOTE_STAGING_TIMEOUT) -> None:
+        super().__init__(app, call_timeout=call_timeout)
+        self._rt              = runtime
+        self._dst             = dst
+        self._staging_timeout = staging_timeout
+
+    def _runtime(self) -> Any:
+        if self._rt is not None:
+            return self._rt
+        rt = getattr(self._app.state, 'endpoint_service', None)
+        return rt if callable(getattr(rt, 'call', None)) else None
+
+    def has_plugin(self, name: str) -> bool:
+        # what the broker hosts is the broker's to say (a 404 / 503)
+        return self._runtime() is not None
+
+    async def _call(self, plugin: str, method: str, path: str,
+                    body: Optional[Dict[str, Any]] = None
+                    ) -> Tuple[int, Any]:
+
+        rt = self._runtime()
+        if rt is None:
+            log.warning('[atomic_campaign] no endpoint runtime to reach the '
+                        'broker through')
+            raise FederationUnavailable(FederationUnavailable.DEFAULT)
+
+        payload = json.dumps(body).encode() if body is not None else b''
+        resp = await asyncio.to_thread(rt.call, self._dst, method, path,
+                                       body=payload,
+                                       headers=dict(_JSON_HEADERS),
+                                       timeout=self._timeout)
+        raw = bytes(getattr(resp, 'content', b'') or b'')
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {'detail': raw.decode('utf-8', 'replace')}
+        return int(getattr(resp, 'status_code', 502)), data
+
+    async def staging_get(self, endpoint: str,
+                          path: str) -> Optional[bytes]:
+
+        rt = self._runtime()
+        if rt is None:
+            return None
+
+        def _work() -> Optional[bytes]:
+            from radical.orbit.plugin_staging import StagingClient
+            from radical.orbit.runtime_client import _RuntimeHTTP
+
+            http   = _RuntimeHTTP(_TimedRuntime(rt, self._staging_timeout),
+                                  endpoint)
+            client = StagingClient(http, '/staging', endpoint_id=endpoint,
+                                   plugin_name='staging')
+            client.register_session()
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    tgt = os.path.join(tmp, os.path.basename(path))
+                    client.get(path, tgt)
+                    with open(tgt, 'rb') as fd:
+                        return fd.read()
+            finally:
+                client.close()
+
+        try:
+            return await asyncio.to_thread(_work)
+        except Exception as exc:                              # noqa: BLE001
+            log.info('[atomic_campaign] staging get %s:%s failed: %s',
+                     endpoint, path, exc)
+            return None
+
+
+# --------------------------------------------------------------------------
+def make_federation_api(app: FastAPI) -> FederationAPI:
+    """The federation API for this host: in-process on the broker, over
+    the endpoint runtime everywhere else."""
+
+    if getattr(app.state, 'is_broker', False):
+        return _FederationAPI(app)
+    return _RemoteFederationAPI(app)
+
+
+# --------------------------------------------------------------------------
 class PluginAtomicCampaign(Plugin):
-    """Broker-hosted campaign manager for the ATOMIC demo."""
+    """Campaign manager for the ATOMIC demo (broker or service endpoint)."""
 
     plugin_name   = 'atomic_campaign'
     session_class = AtomicCampaignSession
@@ -377,10 +540,15 @@ class PluginAtomicCampaign(Plugin):
     # ----------------------------------------------------------------------
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        """Broker hosts only: the campaign owns broker-wide state."""
+        """The broker or a service endpoint -- never a compute node.
+
+        It is not in any role's default plugin set: an endpoint hosts it
+        only when started with ``--plugins atomic_campaign`` (``ep_cm``).
+        A pilot (role ``compute``) has no business steering campaigns.
+        """
 
         from radical.orbit.utils import host_role
-        return host_role(app)['role'] == 'broker'
+        return host_role(app)['role'] in ('broker', 'login', 'standalone')
 
     # ----------------------------------------------------------------------
     def __init__(self, app: FastAPI,
@@ -391,7 +559,9 @@ class PluginAtomicCampaign(Plugin):
                  max_concurrent_workflows: int = 8,
                  stage_timeout_sec: float = 900.0,
                  poll_interval_sec: float = 1.0,
-                 poll_max_interval_sec: float = 3.0) -> None:
+                 poll_max_interval_sec: float = 3.0,
+                 unreachable_budget_sec: Optional[float] = None,
+                 drain_interval_sec: float = DRAIN_INTERVAL) -> None:
 
         super().__init__(app, instance_name)
 
@@ -401,13 +571,18 @@ class PluginAtomicCampaign(Plugin):
         self._store      = ResultStore(Path(store_root) if store_root
                                        else default_store_root())
         self._fed        = fed_api if fed_api is not None \
-                           else _FederationAPI(app)
+                           else make_federation_api(app)
         self._planner    = SweepPlanner()
         self._max_wf     = int(max_concurrent_workflows)
         # not `_timeout`: that is Plugin's session-expiry hook (orbit #157)
         self._stage_timeout = float(stage_timeout_sec)
         self._poll       = float(poll_interval_sec)
         self._poll_max   = float(poll_max_interval_sec)
+        self._budget     = self._budget_from(unreachable_budget_sec)
+        self._drain_every = float(drain_interval_sec)
+        self._drainer: Optional[asyncio.Task] = None
+        # set by a stop: interrupted tasks wait for the next start
+        self._stopping   = False
 
         self._campaigns: Dict[str, Campaign]       = {}
         self._runners:   Dict[str, CampaignRunner] = {}
@@ -433,6 +608,68 @@ class PluginAtomicCampaign(Plugin):
     def store(self) -> ResultStore:
         return self._store
 
+    @staticmethod
+    def _budget_from(value: Optional[float]) -> float:
+        """The unreachable budget: argument, then the env, then 300 s."""
+
+        if value is None:
+            env = os.environ.get(_BUDGET_ENV)
+            try:
+                value = float(env) if env else DEFAULT_UNREACHABLE_BUDGET
+            except ValueError:
+                log.warning('[atomic_campaign] ignoring $%s=%r', _BUDGET_ENV,
+                            env)
+                value = DEFAULT_UNREACHABLE_BUDGET
+        return max(0.0, float(value))
+
+    # -- pending cancels ---------------------------------------------------
+    def _ensure_drainer(self) -> None:
+        """Start the pending-cancel drainer if there is work for it.
+
+        Called whenever the plugin gets a chance to run on its loop (a
+        route, a topology change -- i.e. after a reconnect --, a finished
+        driver); a no-op while nothing is pending or a drainer runs.
+        """
+
+        if self._stopping:
+            return
+        if self._drainer is not None and not self._drainer.done():
+            return
+        if not any(c.pending_cancels for c in self._campaigns.values()):
+            return
+        try:
+            self._drainer = asyncio.get_running_loop().create_task(
+                self._drain_loop())
+        except RuntimeError:                       # no loop (yet)
+            self._drainer = None
+
+    async def _drain_loop(self) -> None:
+        """Retry the unconfirmed cancels until none is left."""
+
+        while True:
+            pending = [c for c in list(self._campaigns.values())
+                       if c.pending_cancels]
+            if not pending:
+                return
+            settled = 0
+            for camp in pending:
+                try:
+                    settled += await drain_pending_cancels(self._fed, camp)
+                except Exception as exc:                      # noqa: BLE001
+                    log.info('[%s] cancel drain failed: %s',
+                             self.instance_name, exc)
+            if settled:
+                log.info('[%s] %d pending cancel(s) settled',
+                         self.instance_name, settled)
+                self._persist()
+            await asyncio.sleep(self._drain_every)
+
+    async def on_topology_change(self, participants: dict) -> None:
+        """A (re)connect is the moment to retry the pending cancels."""
+
+        await super().on_topology_change(participants)
+        self._ensure_drainer()
+
     def _persist(self) -> None:
         """Write the campaign set out (small, atomic, after every change).
 
@@ -457,6 +694,7 @@ class PluginAtomicCampaign(Plugin):
         """Resolve the route's ``{sid}`` (always ``default`` in practice)."""
 
         sid = request.path_params['sid']
+        self._ensure_drainer()
         await self._ensure_default_session()
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
@@ -523,6 +761,7 @@ class PluginAtomicCampaign(Plugin):
             max_concurrent_workflows=int(max_wf),
             on_change=self._persist,
             stage_timeout=float(timeout),
+            unreachable_budget=self._budget,
             poll_interval=self._poll, poll_max_interval=self._poll_max)
         self._runners[camp.campaign_id] = runner
         self._drivers[camp.campaign_id] = asyncio.create_task(
@@ -607,6 +846,7 @@ class PluginAtomicCampaign(Plugin):
             self._drivers.pop(camp.campaign_id, None)
             self._runners.pop(camp.campaign_id, None)
             self._persist()
+            self._ensure_drainer()
             log.info('[%s] campaign %s -> %s (%s)', self.instance_name,
                      camp.campaign_id, camp.state, camp.reason or 'ok')
             try:
@@ -656,7 +896,29 @@ class PluginAtomicCampaign(Plugin):
         down is INTERRUPTED, not CANCELED -- nobody asked for it to stop.  So
         every unfinished campaign is stamped *before* its driver task is
         cancelled, and ``_terminate`` refuses to overwrite that stamp.
+
+        Shutdown does **not** cancel ORBIT tasks.  Only an explicit campaign
+        cancel does that at once.  The tasks of interrupted stages are
+        queued (``pending_cancels``, persisted) and cancelled once the
+        federation answers after the next start: without a resume their
+        outputs are never collected, but a shutdown must not depend on a
+        federation that may be going down with it.
         """
+
+        await self._stop_drivers()
+        await super().shutdown()
+
+    async def on_host_stop(self) -> None:
+        """The endpoint (``ep_cm``) stops: same as :meth:`shutdown`, but
+        sessions are the runtime's to keep (it does not call ``shutdown``
+        on an endpoint)."""
+
+        await self._stop_drivers()
+
+    async def _stop_drivers(self) -> None:
+        """Mark unfinished campaigns INTERRUPTED, cancel drivers, persist."""
+
+        self._stopping = True
 
         for cid, camp in self._campaigns.items():
             if not camp.is_terminal():
@@ -669,8 +931,11 @@ class PluginAtomicCampaign(Plugin):
         pending = [task for task in self._drivers.values() if not task.done()]
         for task in pending:
             task.cancel()
+        if self._drainer is not None:
+            self._drainer.cancel()
+            pending.append(self._drainer)
+            self._drainer = None
         await asyncio.gather(*pending, return_exceptions=True)
         self._drivers.clear()
         self._runners.clear()
         self._persist()
-        await super().shutdown()
