@@ -49,7 +49,8 @@ def clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))
 
     for var in ['RADICAL_ORBIT_BROKER_URL', 'RADICAL_ORBIT_TOKEN',
-                'RADICAL_ORBIT_BROKER_TOKEN', 'RADICAL_ORBIT_BROKER_CERT']:
+                'RADICAL_ORBIT_BROKER_TOKEN', 'RADICAL_ORBIT_BROKER_CERT',
+                'ATOMIC_CAMPAIGN_ENDPOINT']:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -583,6 +584,40 @@ def test_campaign_routes_use_the_default_sid(broker):
 
         assert broker.calls[-1]['path'] == path
         assert exc.value.status == 503
+
+
+def test_campaign_routes_follow_the_campaign_endpoint(broker, monkeypatch):
+
+    # the plugin hosted on a service endpoint next to the broker (ep_cm)
+    c = make_client(campaign_endpoint='ep_cm')
+    with pytest.raises(ClientError):
+        c.campaign('cid')
+    assert broker.calls[-1]['path'] == \
+        '/ep_cm/atomic_campaign/campaign/default/cid'
+
+    monkeypatch.setenv('ATOMIC_CAMPAIGN_ENDPOINT', 'ep_env')
+    assert make_client()._cmp('x') == '/ep_env/atomic_campaign/x'
+    # the argument wins over the environment
+    assert make_client(campaign_endpoint='ep_arg')._cmp('x') == \
+        '/ep_arg/atomic_campaign/x'
+    # the federation stays on the broker either way
+    assert make_client()._fed('x') == '/broker/federation/x'
+
+
+def test_client_from_args_passes_the_campaign_endpoint():
+
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    client.add_connection_args(parser)
+    client.add_campaign_endpoint_arg(parser)
+    args = parser.parse_args(['--broker', 'https://127.0.0.1:8013',
+                              '--token', '', '--campaign-endpoint', 'ep_cm'])
+    assert client.client_from_args(args).campaign_endpoint == 'ep_cm'
+
+    args = parser.parse_args(['--broker', 'https://127.0.0.1:8013',
+                              '--token', ''])
+    assert client.client_from_args(args).campaign_endpoint == 'broker'
 
 
 # ---------------------------------------------------------------------------

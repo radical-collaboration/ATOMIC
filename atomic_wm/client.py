@@ -7,6 +7,10 @@ pieces are written against them.
 
 Conventions:
 - Every broker-hosted route lives under ``/broker/<plugin>/<route>``.
+- The campaign plugin lives on the broker or on a service endpoint
+  (``ep_cm``): its routes are ``/<campaign endpoint>/atomic_campaign/...``,
+  the endpoint from ``campaign_endpoint=`` / ``$ATOMIC_CAMPAIGN_ENDPOINT``
+  (default ``broker``).
 - Federation and campaign routes always use the reserved session id
   ``default`` (never register a session for them).
 - Endpoint-side plugins reached via ``/<endpoint>/<plugin>/<route>``;
@@ -38,6 +42,10 @@ DEFAULT_SID = 'default'
 
 # the broker's own hosted plugins live under this pseudo endpoint name
 BROKER_EP = 'broker'
+
+# where the atomic_campaign plugin is hosted: the broker, or a service
+# endpoint next to it (plans/11, ``ep_cm``)
+CAMPAIGN_ENDPOINT_ENV = 'ATOMIC_CAMPAIGN_ENDPOINT'
 
 
 class ClientError(RuntimeError):
@@ -139,9 +147,13 @@ class Client:
                  broker: Optional[str] = None,
                  token: Optional[str] = None,
                  cert: Optional[str] = None,
-                 timeout: float = 30.0):
+                 timeout: float = 30.0,
+                 campaign_endpoint: Optional[str] = None):
         self.broker = (broker or os.environ.get('RADICAL_ORBIT_BROKER_URL')
                        or '').rstrip('/')
+        self.campaign_endpoint = (campaign_endpoint
+                                  or os.environ.get(CAMPAIGN_ENDPOINT_ENV)
+                                  or BROKER_EP).strip('/')
         self.token = token if token is not None else _default_token()
         self.cert = cert or os.environ.get(
             'RADICAL_ORBIT_BROKER_CERT') or _default_cert()
@@ -336,7 +348,7 @@ class Client:
     # ------------------------------------------------------------ campaign
     def campaign_submit(self, workflow: Dict[str, Any],
                         sweep: Dict[str, List[Any]]) -> Dict[str, Any]:
-        """``POST /broker/atomic_campaign/campaigns/default``."""
+        """``POST /<campaign endpoint>/atomic_campaign/campaigns/default``."""
 
         return self.request('POST', self._cmp('campaigns/%s' % DEFAULT_SID),
                             json={'workflow': workflow, 'sweep': sweep})
@@ -370,9 +382,8 @@ class Client:
     def _fed(route: str) -> str:
         return '/%s/federation/%s' % (BROKER_EP, route)
 
-    @staticmethod
-    def _cmp(route: str) -> str:
-        return '/%s/atomic_campaign/%s' % (BROKER_EP, route)
+    def _cmp(self, route: str) -> str:
+        return '/%s/atomic_campaign/%s' % (self.campaign_endpoint, route)
 
 
 # ---------------------------------------------------------------------------
@@ -665,5 +676,14 @@ def add_connection_args(parser) -> None:
                              '~/.radical/orbit/broker_cert.pem)')
 
 
+def add_campaign_endpoint_arg(parser) -> None:
+    """Add ``--campaign-endpoint`` (where ``atomic_campaign`` is hosted)."""
+    parser.add_argument('--campaign-endpoint', default=None, metavar='NAME',
+                        help='endpoint hosting the atomic_campaign plugin '
+                             '(default $%s, then %s)'
+                             % (CAMPAIGN_ENDPOINT_ENV, BROKER_EP))
+
+
 def client_from_args(args) -> Client:
-    return Client(broker=args.broker, token=args.token, cert=args.cert)
+    return Client(broker=args.broker, token=args.token, cert=args.cert,
+                  campaign_endpoint=getattr(args, 'campaign_endpoint', None))
