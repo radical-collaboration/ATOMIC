@@ -278,6 +278,15 @@ Submit, poll, output collection and cancel classify errors the same way:
   that is not running, but a route never wakes a sleeping one: with the
   federation down, UI polls would otherwise set the drain rate, each
   pass a failed cancel. A refused or unknown task settles the entry.
+  A pass stops at the first entry the federation could not take (it is
+  down) and moves that entry to the end, so the next pass starts with
+  the ones behind it. An entry is abandoned after
+  `CANCEL_MAX_ATTEMPTS` (360) failed tries or `CANCEL_MAX_AGE` (1 h)
+  since its first failed try -- not since it was queued, so a cancel
+  queued by a shutdown waits for the next start however late. An
+  abandoned entry is logged as a warning, named in the campaign's
+  `detail` ("cancel of task … abandoned"), and dropped; its task may
+  still run.
 - **Shutdown does not cancel.** An orderly stop (`shutdown`, or
   `on_host_stop` on `ep_cm`) marks running campaigns `INTERRUPTED` and
   leaves their tasks running; a broker restart therefore never kills HPC
@@ -340,7 +349,10 @@ State is persisted to `<state root>/state.json` after every transition
 (atomic temp-file + rename). On restart, campaigns that were still running
 come back as `INTERRUPTED` — there is no resume; re-submit. Unfinished
 campaigns are always kept; the **50 most recently finished** ones are kept
-too, older ones are dropped from the state file and the listing.
+too, older ones are dropped from the state file and the listing. A
+finished campaign with entries on `pending_cancels` counts as unfinished
+until each entry is settled or abandoned: it holds the only record of
+tasks still to be cancelled.
 
 Plugin construction knobs: `state_root`, `store_root`,
 `max_concurrent_workflows`, `stage_timeout_sec`, `poll_interval_sec`,

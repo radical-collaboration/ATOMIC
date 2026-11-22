@@ -224,9 +224,10 @@ class Campaign:
     created_at:  float                  = field(default_factory=time.time)
     started_at:  float                  = field(default_factory=time.time)
     finished_at: Optional[float]        = None
-    # [{'task_id', 'dispatcher_sid'}]: cancels the federation has not
-    # confirmed yet (it was unreachable); drained once it answers again
-    pending_cancels: List[Dict[str, str]] = field(default_factory=list)
+    # [{'task_id', 'dispatcher_sid'[, 'attempts', 'failing_since']}]:
+    # cancels the federation has not confirmed yet (it was unreachable);
+    # drained once it answers again, abandoned when that takes too long
+    pending_cancels: List[Dict[str, Any]] = field(default_factory=list)
     # who plans the campaign: 'sweep' (fixed instances) or 'aucam' (the
     # Campaign Manager launches frames as it goes); AuCaM's outcome summary
     # lands in `outcome` when the campaign ends
@@ -254,6 +255,30 @@ class Campaign:
 
         self.pending_cancels[:] = [e for e in self.pending_cancels
                                    if e.get('task_id') != task_id]
+
+    def note_cancel_failure(self, task_id: str, now: float) -> None:
+        """One more try of *task_id*'s cancel could not reach the
+        federation; the first such failure starts its clock."""
+
+        for entry in self.pending_cancels:
+            if entry.get('task_id') == task_id:
+                entry['attempts'] = int(entry.get('attempts') or 0) + 1
+                entry.setdefault('failing_since', now)
+
+    def requeue_cancel_last(self, task_id: str) -> None:
+        """Move *task_id*'s entry to the end: the next drain pass starts
+        with the entries behind it."""
+
+        mine = [e for e in self.pending_cancels if e.get('task_id') == task_id]
+        self.unqueue_cancel(task_id)
+        self.pending_cancels.extend(mine)
+
+    def abandon_cancel(self, task_id: str, why: str) -> None:
+        """Give up on *task_id*'s cancel; say so in ``detail``."""
+
+        self.unqueue_cancel(task_id)
+        note = 'cancel of task %s abandoned (%s)' % (task_id, why)
+        self.detail = '%s; %s' % (self.detail, note) if self.detail else note
 
     def cancel_pending(self, task_id: str) -> bool:
         """Whether *task_id* still waits on ``pending_cancels``."""

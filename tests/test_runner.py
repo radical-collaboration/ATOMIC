@@ -1444,8 +1444,63 @@ class TestCancelReachesTheFederation:
         camp = _campaign(tmp_path, stages=_md_only())
         _start_and_cancel(fed, camp, _store(tmp_path))
         assert fed.cancels == []
-        assert camp.pending_cancels == [
-            {'task_id': 'cmp-test-wf-000-md', 'dispatcher_sid': 'sid-a'}]
+        [entry] = camp.pending_cancels
+        assert (entry['task_id'], entry['dispatcher_sid']) == \
+               ('cmp-test-wf-000-md', 'sid-a')
+        assert entry['attempts'] == 3            # tried in place, counted
+
+    def test_a_cancel_that_never_gets_through_is_abandoned(self, tmp_path):
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed  = FakeFederation(tmp_path)
+        fed.cancel_errors = [ConnectionError('down')] * 10
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.queue_cancel('t1', 'fed')
+        for _ in range(2):
+            assert asyncio.run(drain_pending_cancels(
+                fed, camp, max_attempts=2)) == 0
+        assert asyncio.run(drain_pending_cancels(
+            fed, camp, max_attempts=2)) == 1
+        assert len(fed.cancel_calls) == 2       # the third pass gave up
+        assert camp.pending_cancels == []
+        assert 'cancel of task t1 abandoned (2 tries)' in camp.detail
+
+    def test_a_cancel_failing_for_too_long_is_abandoned(self, tmp_path):
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed  = FakeFederation(tmp_path)
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.detail = 'earlier'
+        camp.queue_cancel('t1', 'fed')
+        camp.queue_cancel('t2', 'fed')
+        camp.note_cancel_failure('t1', 1000.0)
+        assert asyncio.run(drain_pending_cancels(
+            fed, camp, clock=lambda: 1000.0 + 3600)) == 2
+        assert fed.cancel_calls == [('fed', 't2')]
+        assert camp.pending_cancels == []
+        assert camp.detail.startswith('earlier; cancel of task t1 abandoned')
+
+    def test_the_age_counts_from_the_first_failure(self, tmp_path):
+        # a cancel queued by a shutdown is for the next start, however
+        # late that is: never tried, it is not old
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed  = FakeFederation(tmp_path)
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.queue_cancel('t1', 'fed')
+        assert asyncio.run(drain_pending_cancels(
+            fed, camp, clock=lambda: 10.0 ** 12)) == 1
+        assert fed.cancels == [('fed', 't1')]
+        assert camp.detail is None
+
+    def test_a_stuck_entry_does_not_block_the_ones_behind_it(self, tmp_path):
+        from atomic_wm.campaign.runner import drain_pending_cancels
+        fed  = FakeFederation(tmp_path)
+        fed.cancel_errors = [ConnectionError('down')]
+        camp = _campaign(tmp_path, stages=_md_only())
+        camp.queue_cancel('t1', 'fed')
+        camp.queue_cancel('t2', 'fed')
+        assert asyncio.run(drain_pending_cancels(fed, camp)) == 0
+        assert asyncio.run(drain_pending_cancels(fed, camp)) == 2
+        assert fed.cancel_calls == [('fed', 't1'), ('fed', 't2'),
+                                    ('fed', 't1')]
 
     def test_pending_cancels_survive_a_reload_and_drain(self, tmp_path):
         from atomic_wm.campaign.runner import drain_pending_cancels

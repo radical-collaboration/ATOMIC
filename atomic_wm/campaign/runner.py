@@ -65,6 +65,12 @@ RETRY_MAX_INTERVAL = 10.0
 # persisted pending-cancel list (drained after the federation is back)
 CANCEL_ATTEMPTS = 3
 
+# when a pending cancel is given up: the federation has refused it with
+# transient errors for this long, or this many times.  Without a bound an
+# entry that never settles keeps its campaign from being pruned forever.
+CANCEL_MAX_AGE      = 3600.0
+CANCEL_MAX_ATTEMPTS = 360
+
 
 # Every ``reason`` below is shown on screen verbatim, so the set is small,
 # fixed and written in the demo's vocabulary.  Whatever ORBIT said goes to
@@ -227,11 +233,13 @@ async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
     try:
         ok = await fed.cancel_task(dispatcher_sid, task_id)
     except FederationUnavailable:
+        campaign.note_cancel_failure(task_id, time.time())
         return False
     except Exception as exc:                                  # noqa: BLE001
         if is_transient(exc):
             log.info('[atomic_campaign] cancel of %s deferred: %s',
                      task_id, describe(exc))
+            campaign.note_cancel_failure(task_id, time.time())
             return False
         log.info('[atomic_campaign] cancel of %s refused: %s', task_id, exc)
         ok = False
@@ -243,12 +251,38 @@ async def try_cancel(fed: 'FederationAPI', campaign: Campaign,
 
 
 # --------------------------------------------------------------------------
-async def drain_pending_cancels(fed: 'FederationAPI',
-                                campaign: Campaign) -> int:
-    """Try every pending cancel of *campaign* once; return how many settled.
+def cancel_expired(entry: Dict[str, Any], now: float, *,
+                   max_age: float = CANCEL_MAX_AGE,
+                   max_attempts: int = CANCEL_MAX_ATTEMPTS) -> Optional[str]:
+    """Why a pending cancel is given up, or ``None`` while it is not.
+
+    The age counts from the first failed try, not from the queueing: the
+    cancels a shutdown queued are for the next start, however late.
+    """
+
+    attempts = int(entry.get('attempts') or 0)
+    if attempts >= max_attempts:
+        return '%d tries' % attempts
+    since = entry.get('failing_since')
+    if since is not None and now - float(since) >= max_age:
+        return 'unreachable for %.0f s' % (now - float(since))
+    return None
+
+
+# --------------------------------------------------------------------------
+async def drain_pending_cancels(fed: 'FederationAPI', campaign: Campaign, *,
+                                clock: Callable[[], float] = time.time,
+                                max_age: float = CANCEL_MAX_AGE,
+                                max_attempts: int = CANCEL_MAX_ATTEMPTS
+                                ) -> int:
+    """Try the pending cancels of *campaign* once; return how many settled
+    (an abandoned one included).
 
     Stops at the first entry the federation could not take -- it is down
-    again, the rest would only fail the same way.
+    again, the rest would only fail the same way -- and moves that entry
+    to the end, so the next pass starts with the ones behind it.  An entry
+    past :func:`cancel_expired` is dropped, loudly, and recorded in the
+    campaign's ``detail``: its task may still run.
     """
 
     settled = 0
@@ -257,9 +291,18 @@ async def drain_pending_cancels(fed: 'FederationAPI',
         if not task_id:
             campaign.unqueue_cancel(task_id)
             continue
+        why = cancel_expired(entry, clock(), max_age=max_age,
+                             max_attempts=max_attempts)
+        if why:
+            log.warning('[atomic_campaign] cancel of %s ABANDONED after %s '
+                        '-- the task may still run', task_id, why)
+            campaign.abandon_cancel(task_id, why)
+            settled += 1
+            continue
         if not await try_cancel(fed, campaign, task_id,
                                 str(entry.get('dispatcher_sid')
                                     or FED_DISPATCHER_SID)):
+            campaign.requeue_cancel_last(task_id)
             break
         settled += 1
     return settled
