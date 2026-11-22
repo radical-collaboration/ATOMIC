@@ -582,7 +582,7 @@ class StageRunner:
             self._changed()
 
         # collect FIRST -- the pilot may vanish moments after the task ends
-        collected = await self._collect(campaign, wf, stage)
+        collected = await self._collect(campaign, wf, stage, cancel)
         extra: Optional[Dict[str, Any]] = None
         if inputs:
             extra = {'inputs_staged':
@@ -594,8 +594,7 @@ class StageRunner:
         # the outcome is final BEFORE the manifest records it
         missing = [c['name'] for c in collected if c['via'] is None]
         if stage.state == DONE and missing:
-            stage.state  = FAILED
-            stage.reason = 'output(s) not collected: %s' % ', '.join(missing)
+            self._incomplete(stage, missing, cancel)
 
         try:
             self._store.write_manifest(
@@ -1017,7 +1016,9 @@ class StageRunner:
 
     # ----------------------------------------------------------------------
     async def _collect(self, campaign: Campaign, wf: WorkflowInstance,
-                       stage: StageRun) -> List[Dict[str, Any]]:
+                       stage: StageRun,
+                       cancel: Optional[asyncio.Event] = None
+                       ) -> List[Dict[str, Any]]:
         """Collect the declared outputs, immediately, in the documented order.
 
         1. the pilot's own ``staging`` plugin (works without a shared FS),
@@ -1027,8 +1028,13 @@ class StageRunner:
         An output that no source delivered while one of them failed with a
         transient error (:func:`is_transient` -- the broker went away right
         after the task ended) is tried again within the unreachable budget,
-        like a poll; any round that collects something resets it.
+        like a poll; any round that collects something resets it.  A
+        stopped campaign ends that wait: the task is over, there is nothing
+        to cancel, and the campaign must not stay RUNNING for the budget.
         """
+
+        def _stopped() -> bool:
+            return cancel is not None and cancel.is_set()
 
         entries: Dict[str, Dict[str, Any]] = {}
         names    = list(stage.declared_outputs)
@@ -1041,7 +1047,7 @@ class StageRunner:
                     self._sources(stage, transient)):
                 entries[entry['name']] = entry
             missing = [n for n in names if entries[n]['via'] is None]
-            if not missing or not transient:
+            if not missing or not transient or _stopped():
                 break
             now = self._clock()
             if down_since is None or len(missing) < len(names):
@@ -1053,11 +1059,28 @@ class StageRunner:
             await self._sleep(interval)
             interval = min(interval * 2, RETRY_MAX_INTERVAL)
             names = missing
+            if _stopped():
+                break
 
         stage.outputs = [entries[n] for n in stage.declared_outputs
                          if n in entries]
         self._changed()
         return stage.outputs
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _incomplete(stage: StageRun, missing: List[str],
+                    cancel: Optional[asyncio.Event]) -> None:
+        """A DONE task whose outputs were not all collected: the stage
+        failed -- or was stopped, when the campaign stopped meanwhile."""
+
+        if cancel is not None and cancel.is_set():
+            stage.state  = CANCELED
+            stage.reason = REASON_STOPPED
+            stage.detail = 'output(s) not collected: %s' % ', '.join(missing)
+            return
+        stage.state  = FAILED
+        stage.reason = 'output(s) not collected: %s' % ', '.join(missing)
 
     # ----------------------------------------------------------------------
     def _sources(self, stage: StageRun,

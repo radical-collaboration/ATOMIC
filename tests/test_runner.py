@@ -1182,6 +1182,34 @@ class TestBrokerOutageWhilePolling:
         assert 'ConnectionError' in \
                stage.outputs[0]['errors']['dispatcher_stage_out']
 
+    def test_a_stop_ends_the_collection_wait(self, tmp_path):
+        # the broker is away after the task ended and the campaign is
+        # stopped: the stage ends CANCELED now, not after the budget
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'stage_out_errors': [ConnectionError('down')] * 1000}})
+        camp   = _campaign(tmp_path, stages=_md_only())
+        runner = CampaignRunner(fed, _store(tmp_path), poll_interval=0,
+                                poll_max_interval=0,
+                                unreachable_budget=10 ** 6,
+                                sleep=lambda _s: asyncio.sleep(0))
+        errors = fed.plans['md']['stage_out_errors']
+        real   = fed.stage_out
+
+        async def _stage_out(*args):
+            if len(errors) == 997:
+                runner.cancel()
+            return await real(*args)
+
+        fed.stage_out = _stage_out
+        asyncio.run(runner.run(camp))
+        stage = camp.workflows[0].stages[0]
+        assert stage.state == 'CANCELED', (stage.state, stage.reason)
+        assert stage.reason == 'the campaign was stopped'
+        assert len(errors) >= 990
+        assert camp.state == 'CANCELED'
+        assert fed.cancel_calls == []           # the task was over
+
     def test_a_missing_output_is_not_waited_for(self, tmp_path):
         # no source failed transiently: the file is simply not there
         fed = FakeFederation(tmp_path, plans={'md': {'outputs': {}}})

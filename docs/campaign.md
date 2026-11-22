@@ -250,7 +250,8 @@ Submit, poll, output collection and cancel classify errors the same way:
   failed transiently (the broker went away right after the task ended) is
   fetched again within the same budget. Only after that does the stage
   fail with "output(s) not collected". A file that is simply not there is
-  not waited for.
+  not waited for, and a stopped campaign ends the wait: the stage is then
+  `CANCELED` ("the campaign was stopped").
 - **Submit retry.** A transient submit error is retried within the same
   budget with the **same task id**: a known task id answers with its
   existing record, so a submit whose answer got lost does not run twice.
