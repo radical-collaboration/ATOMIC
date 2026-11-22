@@ -288,11 +288,21 @@ Submit, poll, output collection and cancel classify errors the same way:
   `detail` ("cancel of task … abandoned"), and dropped; its task may
   still run.
 - **Shutdown does not cancel.** An orderly stop (`shutdown`, or
-  `on_host_stop` on `ep_cm`) marks running campaigns `INTERRUPTED` and
-  leaves their tasks running; a broker restart therefore never kills HPC
-  work. Their task ids are queued in `pending_cancels`, as are those of a
-  campaign found running in the state file after a crash, and the next
-  start cancels them: there is no resume, so nobody would collect them.
+  `on_host_stop` on `ep_cm`) makes no federation call at all: it neither
+  cancels an ORBIT task nor starts one, so a broker or CM restart never
+  kills HPC work. It stamps every running campaign `INTERRUPTED` before
+  it cancels the drivers, stops the drainer, and answers a submit that
+  arrives meanwhile with `503`. One gate in the runner holds the line:
+  no stage of an `INTERRUPTED` campaign is submitted -- checked before
+  every submit, retries included, so neither the next stage of a
+  workflow whose stage just ended nor a frame AuCaM launched just before
+  the stop reaches ORBIT. A stage the stamp caught keeps `INTERRUPTED`
+  through a later poll or task end, and a cancelled runner leaves its
+  task alone. The task ids of the interrupted stages are queued in
+  `pending_cancels`, as are those of a campaign found running in the
+  state file after a crash, and the drainer cancels them once the
+  federation answers after the next start: there is no resume, so
+  nobody would collect them.
 
 ### Output collection order
 

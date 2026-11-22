@@ -121,7 +121,7 @@ change.
 
 ### 3.3 Surviving a broker restart
 
-What the code does today, and what changes:
+What the branch does (`feature/cm-demo`), and what is left to ORBIT:
 
 - The runner pulls state: it polls every task it owns (`runner.py`
   `_poll_task`). Notifications are not needed for correctness: cancel is
@@ -130,22 +130,27 @@ What the code does today, and what changes:
   awaits `_replay_attachments` (`plugin_federation.py:1938-1940`). Polls during
   that await reach the dispatcher before the `fed` session is re-registered
   and get `404 unknown session: fed` (`plugin_task_dispatcher.py:3755-3759`).
-  The runner turns that into `TaskNotFound` and fails the stage
-  (`runner.py:578-582`). A failed `_register_fed` is never retried
+  The runner now waits that answer out as transient instead of failing the
+  stage. A failed `_register_fed` is never retried
   (`plugin_federation.py:2024-2030`). This is ORBIT demo item 3 (§4).
-- **Transient vs fatal.** A time-based unreachable budget (about 5 min)
-  replaces `MAX_POLL_FAILURES = 10` (`runner.py:52`, ~20 s) for these
-  transient errors:
+- **Transient vs fatal.** A time-based unreachable budget (default 300 s,
+  `unreachable_budget_sec`) replaced `MAX_POLL_FAILURES = 10` (~20 s).
+  Submit, poll, output collection and cancel all classify by it. Transient
+  errors:
   - transport errors: ConnectionError, TimeoutError;
-  - a 503 with Retry-After (radical.orbit #166);
+  - a 503, with or without Retry-After (radical.orbit #166), and any
+    other 5xx;
   - a 410 "shutting down" (radical.orbit #165, `plugin_base.py:432-434`);
   - a 404 whose detail reads "unknown session".
 
   Any other 404 still fails fast.
-- **Submit retry.** Today submit has no retry (`runner.py:345`). It gets one,
-  safe together with ORBIT demo item 2 (a known task_id goes to its recorded
-  pool; the ledger is persisted in the federation's `state.json` and saved on
-  every submit).
+- **Submit retry.** A transient submit error is retried within the
+  unreachable budget with the same task id (`runner.py` `_submit`). That is
+  safe only together with ORBIT demo item 2 (a known task_id goes to its
+  recorded pool; the ledger is persisted in the federation's `state.json`
+  and saved on every submit): on ORBIT devel without it, a retry after a
+  5xx that came back once the task had landed may land in another pool and
+  duplicate the task.
 - **Lost pilot events (to be measured).** The dispatcher's `task` route answers
   from its own record (`plugin_task_dispatcher.py:2337-2341`), which advances
   only on pilot events. Events emitted during an outage wait in the pilot
@@ -158,11 +163,18 @@ What the code does today, and what changes:
   A task hit by either stays RUNNING until the stage timeout (900 s). The
   rehearsal decides whether ORBIT adds the #149 slice "re-query RUNNING tasks
   when a pilot reconnects".
-- **CM crash.** `load_campaigns` marks running campaigns INTERRUPTED without
-  cancelling anything (`state.py:366`), which orphans HPC jobs. Fix: a
-  best-effort cancel of the recorded task ids. Plugin `shutdown()` (cancelling
-  the drivers, `campaign.py:660-664`) must decide explicitly whether it
-  cancels the ORBIT tasks.
+- **CM crash.** `load_campaigns` marks running campaigns INTERRUPTED and
+  queues the task ids of their unfinished stages on the persisted
+  `pending_cancels` list (`state.py` `mark_interrupted`). The plugin's
+  drainer cancels them once the federation answers; an entry that never
+  gets through is abandoned after 1 h or 360 tries, and named in the
+  campaign's `detail`.
+- **Shutdown does not cancel.** Plugin `shutdown()` / `on_host_stop()`
+  stamp running campaigns INTERRUPTED the same way and make no federation
+  call: no ORBIT task is cancelled, none is started. The runner's gate
+  refuses to submit any stage of an INTERRUPTED campaign (before every
+  submit, retries included), and the submit route answers 503 while the
+  service stops. The queued cancels are sent after the next start.
 
 ### 3.4 Scale and data (after the demo)
 
