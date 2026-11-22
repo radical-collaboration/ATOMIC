@@ -704,6 +704,23 @@ class TestKnobsAndPruning:
         assert 'cmp-59' in ids            # newest finished kept
         assert 'cmp-00' not in ids        # oldest dropped
 
+    def test_a_campaign_with_pending_cancels_is_not_pruned(self, tmp_path):
+        # the oldest finished campaign still owes ORBIT a cancel: it stays
+        # until the drainer settled it, then it may go
+        from atomic_wm.campaign.state import Campaign, prune_campaigns
+        camps = []
+        for idx in range(60):
+            camp = Campaign(campaign_id='cmp-%02d' % idx, state='DONE')
+            camp.finished_at = float(idx)
+            camps.append(camp)
+        camps[0].queue_cancel('t-old', 'fed')
+        ids = {c.campaign_id for c in prune_campaigns(camps, 50)}
+        assert 'cmp-00' in ids
+        assert len(ids) == 51
+        camps[0].unqueue_cancel('t-old')
+        assert 'cmp-00' not in {c.campaign_id
+                                for c in prune_campaigns(camps, 50)}
+
 
 # ---------------------------------------------------------------------------
 class TestCancelRoute:

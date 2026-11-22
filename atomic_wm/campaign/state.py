@@ -382,11 +382,16 @@ def prune_campaigns(campaigns: List[Campaign],
     """Keep every unfinished campaign and the newest *keep_terminal* others.
 
     A demo broker that is up for a day must not grow an unbounded state file
-    (or an unbounded ``GET campaigns`` listing).
+    (or an unbounded ``GET campaigns`` listing).  A finished campaign with
+    unsettled ``pending_cancels`` counts as unfinished: dropping it would
+    drop the only record of tasks still to be cancelled.
     """
 
-    live = [c for c in campaigns if not c.is_terminal()]
-    done = sorted((c for c in campaigns if c.is_terminal()),
+    def _live(c: Campaign) -> bool:
+        return not c.is_terminal() or bool(c.pending_cancels)
+
+    live = [c for c in campaigns if _live(c)]
+    done = sorted((c for c in campaigns if not _live(c)),
                   key=lambda c: (c.created_at if c.finished_at is None
                                  else c.finished_at), reverse=True)
     keep = set(id(c) for c in live) | set(id(c) for c in done[:keep_terminal])
