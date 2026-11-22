@@ -1030,6 +1030,18 @@ class TestErrorClasses:
         from atomic_wm.campaign.runner import is_transient
         assert is_transient(_transients()[name])
 
+    @pytest.mark.parametrize('module', ['asyncio', 'concurrent.futures'])
+    def test_a_timeout_is_transient_on_python_3_10(self, monkeypatch,
+                                                   module):
+        # before 3.11 these are not the builtin TimeoutError: give the
+        # module its own class, as 3.10 has it
+        import importlib
+        from atomic_wm.campaign.runner import is_transient
+        own = type('TimeoutError', (Exception,), {})
+        monkeypatch.setattr(importlib.import_module(module), 'TimeoutError',
+                            own)
+        assert is_transient(own('timed out'))
+
     @pytest.mark.parametrize('status, detail, cls', [
         (409, 'class gpu has no members', FederationCallError),
         (404, 'unknown task: t1',         TaskNotFound),

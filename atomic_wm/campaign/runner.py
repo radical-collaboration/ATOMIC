@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures as futures
 import logging
 import os
 import time
@@ -200,10 +201,16 @@ def describe(exc: BaseException) -> str:
 
 # --------------------------------------------------------------------------
 def is_transient(exc: BaseException) -> bool:
-    """Transport errors and the transient HTTP answers above."""
+    """Transport errors and the transient HTTP answers above.
+
+    A timeout is one whichever module raised it: before Python 3.11
+    ``asyncio.TimeoutError`` and ``concurrent.futures.TimeoutError`` are
+    not the builtin ``TimeoutError``, so all three are named.
+    """
 
     return isinstance(exc, (FederationTransient, ConnectionError,
-                            TimeoutError))
+                            TimeoutError, asyncio.TimeoutError,
+                            futures.TimeoutError))
 
 
 # --------------------------------------------------------------------------
