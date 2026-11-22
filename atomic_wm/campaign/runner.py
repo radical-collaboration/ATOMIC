@@ -859,6 +859,11 @@ class StageRunner:
         chosen at dispatch, so the poll -- not the submit -- says where the
         stage runs.  A poll that names no resource leaves the last known
         placement alone: an unplaced task is not a failed one.
+
+        A stage with a final state keeps it: a shutdown stamps INTERRUPTED
+        while the runner may still poll, and a stage turned RUNNING again
+        would have its ORBIT task cancelled when the runner is cancelled
+        (RULE A).
         """
 
         state = str(task_dict.get('state') or '')
@@ -881,7 +886,8 @@ class StageRunner:
             self._changed()
         if task_dict.get('cwd'):
             stage.cwd = task_dict['cwd']
-        if state == 'RUNNING' and stage.state != RUNNING:
+        if state == 'RUNNING' and stage.state != RUNNING \
+                and stage.state not in TERMINAL_STATES:
             stage.state = RUNNING
             if stage.started_at is None:
                 stage.started_at = self._clock()

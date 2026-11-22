@@ -127,6 +127,40 @@ class TimedFederation(FederationAPI):
         return True
 
 
+class StubbornFederation(TimedFederation):
+    """Polls of a ``stuck`` task hang and swallow every cancel until
+    ``release`` is set (a call that does not honour cancellation)."""
+
+    def __init__(self, root, *, stuck, **kwargs):
+        super().__init__(root, **kwargs)
+        self.stuck     = stuck
+        self.stuck_now = False
+        self.release   = None
+
+    async def task(self, task_id):
+        if self.stuck(task_id):
+            self.stuck_now = True
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    pass
+            raise asyncio.CancelledError()
+        return await super().task(task_id)
+
+
+class DoneOnStop(TimedFederation):
+    """Every task finishes the moment ``stopped()`` says so."""
+
+    stopped = staticmethod(lambda: False)
+
+    async def task(self, task_id):
+        out = await super().task(task_id)
+        if self.stopped():
+            out.update(state='DONE', exit_code=0)
+        return out
+
+
 def _execute(cmd, cwd):
     """Run one synthetic tool in-process, unpadded; return its duration."""
 
@@ -440,6 +474,61 @@ class TestCampaign:
         _assert_interrupted(camp, fed)
         assert took['s'] < 3.0
 
+    def test_without_interrupt_the_driver_still_cancels_nothing(
+            self, tmp_path, store):
+        # the stop sequence minus interrupt(), with back-to-back polls: the
+        # runners keep polling until AuCaM's shutdown reaches their frame.
+        # The runner must not turn an INTERRUPTED stage RUNNING again, and
+        # the frame's stop must not set the runner's stop event -- either
+        # one cancels every ORBIT task
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
+        body = _body(4, 0, cancel_wait_s=10.0, node_hour_scale=1.0)
+        plan = parse_aucam_request(body)
+        camp = _campaign()
+        driver = AucamCampaignDriver(fed, store, plan, poll_interval=0.0,
+                                     poll_max_interval=0.0)
+
+        async def main():
+            task = asyncio.ensure_future(driver.run(camp))
+            while len(fed.submits) < 4:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
+            mark_interrupted(camp)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(main())
+        _assert_interrupted(camp, fed)
+
+    def test_a_runner_that_does_not_unwind_does_not_hold_the_stop(
+            self, tmp_path, store):
+        # one frame's poll ignores cancellation until released: the stop
+        # waits SHUTDOWN_WAIT_S for it, not cancel_wait_s
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = StubbornFederation(tmp_path, slow=lambda t, n: 50.0,
+                                  stuck=lambda t: '-f000-' in t)
+        body = _body(4, 0, cancel_wait_s=10.0, node_hour_scale=1.0)
+        driver, camp = _drive(fed, store, body)
+        took = {}
+
+        async def main():
+            fed.release = asyncio.Event()
+            task = asyncio.ensure_future(driver.run(camp))
+            while len(fed.submits) < 4 or not fed.stuck_now:
+                await asyncio.sleep(0.01)
+            mark_interrupted(camp)
+            driver.interrupt()
+            t0 = time.monotonic()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            took['s'] = time.monotonic() - t0
+            fed.release.set()
+
+        asyncio.run(main())
+        assert fed.cancels == []
+        assert took['s'] < 4.0, took
+
     def test_federation_unavailable_fails_the_campaign(self, tmp_path,
                                                        store):
         fed = TimedFederation(tmp_path, unavailable=True)
@@ -578,6 +667,32 @@ class TestPluginRoute:
         assert camp.outcome['frames'] == 4
         # ... and the shared backend is shut down
         assert plugin._aucam_backend is None
+
+    def test_a_plugin_stop_starts_no_further_stage(self, tmp_path,
+                                                   plugin_clients):
+        # stages that end between the INTERRUPTED stamp and AuCaM's
+        # shutdown reaching their frame: only the plugin's interrupt()
+        # right after the stamp keeps the runner from starting the next
+        # stage (a new ORBIT task during a shutdown, cancelled at once)
+        NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
+        fed = DoneOnStop(tmp_path, slow=lambda t, n: 50.0)
+        _, plugin = _make_plugin(tmp_path, fed=fed, poll_interval_sec=0.0,
+                                 poll_max_interval_sec=0.0)
+        client = plugin_clients._request(plugin)
+        cid = client.post('%s/campaigns/default' % NS,
+                          json=_body(4, 0, cancel_wait_s=10.0,
+                                     node_hour_scale=1.0)
+                          ).json()['campaign_id']
+        fed.stopped = lambda: plugin._campaigns[cid].state == 'INTERRUPTED'
+        deadline = time.time() + 10
+        while len(fed.submits) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.1)
+        submits = list(fed.submits)
+
+        client.portal.call(plugin.shutdown)
+        assert fed.submits == submits
+        _assert_interrupted(plugin._campaigns[cid], fed)
 
     def test_one_backend_for_concurrent_first_submits(
             self, tmp_path, plugin_clients, monkeypatch):

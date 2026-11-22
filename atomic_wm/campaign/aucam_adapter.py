@@ -106,11 +106,20 @@ Shutdown never cancels an ORBIT task: a broker or CM restart must not kill
 HPC work.  The plugin stamps the campaign INTERRUPTED, calls
 :meth:`AucamCampaignDriver.interrupt` (every frame's runner task is
 cancelled at once), then cancels the task that awaits ``run()``, and AuCaM
-stops.  It does not set the stop event and does not wait
-``cancel_wait_s``, so shutdown stays within ORBIT's host-stop bounds.  The
-runner sees the INTERRUPTED stamp and leaves the ORBIT task alone.  Only
-:meth:`AucamCampaignDriver.cancel`, a stage timeout or a definitive stage
-failure cancels ORBIT tasks.
+stops.  Three things keep that stop away from ORBIT, each pinned by a test:
+
+- the runner never moves a stage with a final state (INTERRUPTED) on a
+  poll, and its cancellation leaves such a stage's task alone;
+- ``interrupt()`` right after the stamp: a runner whose stage ends in the
+  window before AuCaM's shutdown reaches its frame would otherwise start
+  the next stage -- a new ORBIT task during a shutdown;
+- a frame stopped on an INTERRUPTED campaign does not set the runner's
+  stop event (the runner would cancel at its next poll) and waits only
+  ``SHUTDOWN_WAIT_S`` for it, as does the final drain of the runners, so
+  a shutdown stays within ORBIT's host-stop bounds.
+
+Only :meth:`AucamCampaignDriver.cancel`, a stage timeout or a definitive
+stage failure cancels ORBIT tasks.
 
 This module imports without AuCaM; :data:`AUCAM_ERROR` says why it is not
 usable, and :func:`parse_aucam_request` / the driver raise
@@ -686,10 +695,11 @@ class AucamCampaignDriver:
 
         The runners are tasks of their own, outside the task that awaits
         :meth:`run`.  Left alone until AuCaM's shutdown reaches their frame
-        they keep polling, and a poll would turn an INTERRUPTED stage back
-        to RUNNING (and then cancel its ORBIT task), or a finished stage
-        would start the next one.  Cancelled here, synchronously right
-        after the stamp, they see the stamp and leave ORBIT alone.
+        they keep polling, and a stage that ends meanwhile starts the next
+        one -- a new ORBIT task during a shutdown.  Cancelled here,
+        synchronously right after the stamp, they see the stamp and leave
+        ORBIT alone.  The owner calls this; :meth:`run` does not, since by
+        the time it sees its cancellation AuCaM has stopped every frame.
         """
 
         for task in self._inner:
@@ -746,8 +756,6 @@ class AucamCampaignDriver:
         try:
             out = await self.manager.run(spec)
         except asyncio.CancelledError:
-            if campaign.state == INTERRUPTED:
-                self.interrupt()        # a shutdown: no frame stops a task
             await self._drain(campaign)
             self._finish(campaign, None, interrupted=True)
             raise

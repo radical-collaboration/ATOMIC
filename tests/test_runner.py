@@ -1469,6 +1469,37 @@ class TestCancelReachesTheFederation:
         assert [e['task_id'] for e in camp.pending_cancels] == \
                ['cmp-test-wf-000-md']
 
+    def test_a_poll_after_the_stamp_does_not_revive_the_stage(
+            self, tmp_path):
+        # back-to-back polls between the INTERRUPTED stamp and the
+        # runner's cancellation: a RUNNING answer must not turn the stage
+        # RUNNING again, or the cancellation cancels its ORBIT task
+        from atomic_wm.campaign.state import mark_interrupted
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        camp   = _campaign(tmp_path, stages=_md_only())
+        wf     = camp.workflows[0]
+        runner = StageRunner(fed, _store(tmp_path), poll_interval=0,
+                             poll_max_interval=0)
+        tid    = 'cmp-test-wf-000-md'
+
+        async def _scenario():
+            task = asyncio.ensure_future(runner.run_workflow(camp, wf))
+            while wf.stages[0].state != RUNNING:
+                await asyncio.sleep(0)
+            mark_interrupted(camp)
+            seen = fed.polls[tid]
+            while fed.polls[tid] < seen + 5:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_scenario())
+        assert wf.stages[0].state == 'INTERRUPTED'
+        assert fed.cancel_calls == []
+
 
 class TestRestartQueuesOrphans:
 
