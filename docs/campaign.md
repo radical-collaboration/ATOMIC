@@ -266,8 +266,11 @@ Submit, poll, output collection and cancel classify errors the same way:
   task may still run queues a cancel without trying it. That covers an
   unreachable budget that runs out during the submit (the submit may have
   landed) or the poll, a fatal poll answer, and a crash. An entry the
-  federation could not take stays. One plugin
-  drainer settles the list; runners never retry an entry themselves.
+  federation could not take stays. Only the runner that issued a cancel
+  tries it in place; it never works through the list. Everything left on
+  the list (entries their runner could not settle, and the cancels queued
+  without a try) is settled by one plugin drainer. A drainer try that
+  overlaps a runner's try of the same entry is a harmless duplicate.
   The drainer retries every `drain_interval_sec`, and wakes at once when
   a runner sees the federation answer after a failure, on any route, on
   a reconnect and when a campaign finishes. A refused or unknown task

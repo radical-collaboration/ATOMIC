@@ -663,7 +663,7 @@ class PluginAtomicCampaign(Plugin):
 
     def _wake_drainer(self) -> None:
         """A runner saw the federation answer again (or left a cancel
-        pending): try the pending cancels now."""
+        pending), or a route came in: try the pending cancels now."""
 
         self._ensure_drainer()
         self._drain_wake.set()
@@ -724,7 +724,7 @@ class PluginAtomicCampaign(Plugin):
         """Resolve the route's ``{sid}`` (always ``default`` in practice)."""
 
         sid = request.path_params['sid']
-        self._ensure_drainer()
+        self._wake_drainer()            # a route is a chance to try now
         await self._ensure_default_session()
         if sid not in self._sessions:
             raise HTTPException(status_code=404,

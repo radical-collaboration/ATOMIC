@@ -118,8 +118,10 @@ stops.  Three things keep that stop away from ORBIT, each pinned by a test:
   ``SHUTDOWN_WAIT_S`` for it, as does the final drain of the runners, so
   a shutdown stays within ORBIT's host-stop bounds.
 
-Only :meth:`AucamCampaignDriver.cancel`, a stage timeout or a definitive
-stage failure cancels ORBIT tasks.
+ORBIT tasks are cancelled by :meth:`AucamCampaignDriver.cancel`, by
+AuCaM's own cancels of a frame (a poor score, the frame's node-hour limit,
+a wall-time or stale-report limit), by a stage timeout and by a definitive
+stage failure -- never by a shutdown.
 
 This module imports without AuCaM; :data:`AUCAM_ERROR` says why it is not
 usable, and :func:`parse_aucam_request` / the driver raise
