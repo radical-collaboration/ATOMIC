@@ -699,6 +699,9 @@ class PluginAtomicCampaign(Plugin):
 
         await super().on_topology_change(participants)
         self._ensure_drainer()
+        # a (re)connect is rare and is exactly when the federation may answer
+        # again: wake a sleeping drainer now, not after DRAIN_INTERVAL
+        self._wake_drainer()
 
     def _persist(self) -> None:
         """Write the campaign set out (small, atomic, after every change).

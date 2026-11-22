@@ -1455,12 +1455,12 @@ class TestCancelReachesTheFederation:
         fed.cancel_errors = [ConnectionError('down')] * 10
         camp = _campaign(tmp_path, stages=_md_only())
         camp.queue_cancel('t1', 'fed')
-        for _ in range(2):
-            assert asyncio.run(drain_pending_cancels(
-                fed, camp, max_attempts=2)) == 0
+        assert asyncio.run(drain_pending_cancels(
+            fed, camp, max_attempts=2)) == 0
+        # the second failed try reaches the bound: abandoned after it
         assert asyncio.run(drain_pending_cancels(
             fed, camp, max_attempts=2)) == 1
-        assert len(fed.cancel_calls) == 2       # the third pass gave up
+        assert len(fed.cancel_calls) == 2
         assert camp.pending_cancels == []
         assert 'cancel of task t1 abandoned (2 tries)' in camp.detail
 
@@ -1472,9 +1472,11 @@ class TestCancelReachesTheFederation:
         camp.queue_cancel('t1', 'fed')
         camp.queue_cancel('t2', 'fed')
         camp.note_cancel_failure('t1', 1000.0)
+        fed.cancel_errors = [ConnectionError('down')]  # t1's try fails
         assert asyncio.run(drain_pending_cancels(
             fed, camp, clock=lambda: 1000.0 + 3600)) == 2
-        assert fed.cancel_calls == [('fed', 't2')]
+        # t1 was tried once more, failed, and was then abandoned by age
+        assert fed.cancel_calls == [('fed', 't1'), ('fed', 't2')]
         assert camp.pending_cancels == []
         assert camp.detail.startswith('earlier; cancel of task t1 abandoned')
 
@@ -1613,16 +1615,19 @@ class TestCancelReachesTheFederation:
             while wf.stages[0].state != RUNNING:
                 await asyncio.sleep(0)
             mark_interrupted(camp)
-            seen = fed.polls[tid]
-            while fed.polls[tid] < seen + 5:
+            # the runner stops at its next poll (the poll-loop gate); give
+            # it plenty of loop ticks either way, then cancel what is left
+            for _ in range(200):
+                if task.done():
+                    break
                 await asyncio.sleep(0)
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            await asyncio.gather(task, return_exceptions=True)
 
         asyncio.run(_scenario())
         assert wf.stages[0].state == 'INTERRUPTED'
         assert fed.cancel_calls == []
+        assert fed.polls[tid] >= 1
 
 
 class TestShutdownGate:
@@ -1721,3 +1726,63 @@ class TestRestartQueuesOrphans:
         path = tmp_path / 'state.json'
         save_campaigns(path, [camp])
         assert load_campaigns(path)[0].pending_cancels == []
+
+
+# ---------------------------------------------------------------------------
+class TestDeadlinesAfterTheStamp:
+    """RULE A: a stage deadline that passes after the INTERRUPTED stamp
+    neither cancels the ORBIT task nor overwrites the stamp."""
+
+    def _run(self, tmp_path, poll_state, **timeouts):
+        from atomic_wm.campaign.state import INTERRUPTED, mark_interrupted
+
+        fed  = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': poll_state}]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        wf   = camp.workflows[0]
+        box  = {'t': 1000.0}
+        runner = StageRunner(fed, _store(tmp_path), poll_interval=0,
+                             poll_max_interval=0, clock=lambda: box['t'],
+                             **timeouts)
+
+        async def scen():
+            task = asyncio.ensure_future(runner.run_workflow(camp, wf))
+            while fed.polls.get('cmp-test-wf-000-md', 0) < 2:
+                await asyncio.sleep(0)
+            mark_interrupted(camp)
+            box['t'] += 120                      # past every deadline
+            for _ in range(20):
+                await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scen())
+        return fed, wf, INTERRUPTED
+
+    def test_a_stage_timeout_after_the_stamp_cancels_nothing(self, tmp_path):
+        fed, wf, interrupted = self._run(tmp_path, 'RUNNING',
+                                         stage_timeout=60)
+        assert fed.cancel_calls == []
+        assert wf.stages[0].state == interrupted
+
+    def test_a_queue_timeout_after_the_stamp_cancels_nothing(self, tmp_path):
+        fed, wf, interrupted = self._run(tmp_path, 'QUEUED',
+                                         queue_timeout=60)
+        assert fed.cancel_calls == []
+        assert wf.stages[0].state == interrupted
+
+
+def test_a_cancel_is_never_abandoned_untried(tmp_path):
+    # one failure before a long shutdown, then the federation answers: the
+    # first pass after the restart must try the cancel, not drop it
+    from atomic_wm.campaign import runner as R
+
+    fed  = FakeFederation(tmp_path)
+    camp = _campaign(tmp_path)
+    camp.queue_cancel('t1', 'sid-a')
+    camp.note_cancel_failure('t1', 1000.0)
+    asyncio.run(R.drain_pending_cancels(fed, camp,
+                                        clock=lambda: 1000.0 + 4000))
+    assert fed.cancels == [('sid-a', 't1')]
+    assert camp.pending_cancels == []

@@ -291,6 +291,15 @@ async def drain_pending_cancels(fed: 'FederationAPI', campaign: Campaign, *,
         if not task_id:
             campaign.unqueue_cancel(task_id)
             continue
+        if await try_cancel(fed, campaign, task_id,
+                            str(entry.get('dispatcher_sid')
+                                or FED_DISPATCHER_SID)):
+            settled += 1
+            continue
+        # judged only after a failed try: an entry is never dropped untried,
+        # e.g. at the first pass after a long shutdown
+        entry = next((e for e in campaign.pending_cancels
+                      if e.get('task_id') == task_id), entry)
         why = cancel_expired(entry, clock(), max_age=max_age,
                              max_attempts=max_attempts)
         if why:
@@ -299,12 +308,8 @@ async def drain_pending_cancels(fed: 'FederationAPI', campaign: Campaign, *,
             campaign.abandon_cancel(task_id, why)
             settled += 1
             continue
-        if not await try_cancel(fed, campaign, task_id,
-                                str(entry.get('dispatcher_sid')
-                                    or FED_DISPATCHER_SID)):
-            campaign.requeue_cancel_last(task_id)
-            break
-        settled += 1
+        campaign.requeue_cancel_last(task_id)
+        break
     return settled
 
 
@@ -834,6 +839,11 @@ class StageRunner:
                 self._live.discard(str(stage.task_id))
                 return task_dict
 
+            # RULE A: once the campaign is INTERRUPTED no deadline below may
+            # fire -- a timeout would cancel the ORBIT task and overwrite
+            # the stamp with FAILED.  Stop polling and leave the task alone.
+            self._gate(campaign, stage)
+
             if self._clock() > hard_deadline:
                 await self._cancel_task(campaign, stage)
                 stage.state  = FAILED
@@ -1057,6 +1067,11 @@ class StageRunner:
         """
 
         if not stage.task_id:
+            return
+        # RULE A, cancel side: a stopping service never cancels ORBIT work.
+        # `mark_interrupted` has recorded the task already; the next start
+        # decides what happens to it.
+        if campaign.state == INTERRUPTED:
             return
         task_id = stage.task_id
         sid     = stage.dispatcher_sid or FED_DISPATCHER_SID

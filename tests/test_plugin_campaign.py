@@ -1112,6 +1112,26 @@ class TestPendingCancelsInThePlugin:
         # passes at ~0, 0.4 and 0.8 s
         assert 2 <= len(fed.cancel_calls) <= 3, len(fed.cancel_calls)
 
+    def test_a_reconnect_wakes_a_sleeping_drainer(self, tmp_path):
+        # the drainer's first try fails and it would sleep for 100 s; a
+        # topology change (an endpoint reconnects) wakes it at once
+        self._orphaned_state(tmp_path)
+        fed = FakeFederation(tmp_path)
+        fed.cancel_errors = [ConnectionError('down')]
+        _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=100)
+        client = _request(plugin)
+        client.get('%s/campaigns/default' % NS)       # starts the drainer
+        deadline = time.time() + 5
+        while not fed.cancel_calls and time.time() < deadline:
+            time.sleep(0.02)
+        assert fed.cancel_calls and not fed.cancels
+
+        client.portal.call(plugin.on_topology_change, {})
+        deadline = time.time() + 5
+        while not fed.cancels and time.time() < deadline:
+            time.sleep(0.02)
+        assert fed.cancels == [('fed', 't-old')]
+
     def test_host_stop_interrupts_without_cancelling(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
             'md': {'outputs': {'md.json': b'{}'},
