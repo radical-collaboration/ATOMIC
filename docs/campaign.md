@@ -273,9 +273,11 @@ Submit, poll, output collection and cancel classify errors the same way:
   without a try) is settled by one plugin drainer. A drainer try that
   overlaps a runner's try of the same entry is a harmless duplicate.
   The drainer retries every `drain_interval_sec`, and wakes at once when
-  a runner sees the federation answer after a failure, on any route, on
-  a reconnect and when a campaign finishes. A refused or unknown task
-  settles the entry.
+  a runner sees the federation answer after a failure or leaves a cancel
+  pending. A route, a reconnect and a finished campaign start a drainer
+  that is not running, but a route never wakes a sleeping one: with the
+  federation down, UI polls would otherwise set the drain rate, each
+  pass a failed cancel. A refused or unknown task settles the entry.
 - **Shutdown does not cancel.** An orderly stop (`shutdown`, or
   `on_host_stop` on `ep_cm`) marks running campaigns `INTERRUPTED` and
   leaves their tasks running; a broker restart therefore never kills HPC

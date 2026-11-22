@@ -1070,9 +1070,9 @@ class TestPendingCancelsInThePlugin:
             'md': {'outputs': {'md.json': _envelope('simulation', 1)},
                    'polls': [{'raise_exc': ConnectionError('down')},
                              {'state': 'DONE', 'exit_code': 0}]}})
-        # every route wakes the drainer too: the first two tries (the GET,
-        # the POST) fail, and no route is called after the POST
-        fed.cancel_errors = [ConnectionError('down')] * 2
+        # a route only starts the drainer, it does not wake it: the GET's
+        # try fails, and only the runner wakes it again
+        fed.cancel_errors = [ConnectionError('down')]
         _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=100)
         client = _request(plugin)
         client.get('%s/campaigns/default' % NS)       # starts the drainer
@@ -1094,28 +1094,23 @@ class TestPendingCancelsInThePlugin:
         while not fed.cancels and time.time() < deadline:
             time.sleep(0.02)
         assert fed.cancels == [('fed', 't-old')]
-        assert len(fed.cancel_calls) == 3
+        assert len(fed.cancel_calls) == 2
         assert plugin._campaigns['cmp-old'].pending_cancels == []
 
-    def test_a_route_wakes_a_sleeping_drainer(self, tmp_path):
-        # the drainer's first try fails and it would sleep for 100 s; the
-        # next route wakes it at once
+    def test_routes_do_not_outpace_the_drain_interval(self, tmp_path):
+        # the federation stays down and the UI polls every few ms: the
+        # drainer still tries once per interval, not once per route
         self._orphaned_state(tmp_path)
         fed = FakeFederation(tmp_path)
-        fed.cancel_errors = [ConnectionError('down')]
-        _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=100)
+        fed.cancel_errors = [ConnectionError('down')] * 1000
+        _, plugin = _make_plugin(tmp_path, fed=fed, drain_interval_sec=0.4)
         client = _request(plugin)
-        client.get('%s/campaigns/default' % NS)       # starts the drainer
-        deadline = time.time() + 5
-        while not fed.cancel_calls and time.time() < deadline:
+        t0 = time.time()
+        while time.time() < t0 + 1.0:
+            client.get('%s/campaigns/default' % NS)
             time.sleep(0.02)
-        assert fed.cancel_calls and not fed.cancels
-
-        client.get('%s/campaigns/default' % NS)
-        deadline = time.time() + 2
-        while not fed.cancels and time.time() < deadline:
-            time.sleep(0.02)
-        assert fed.cancels == [('fed', 't-old')]
+        # passes at ~0, 0.4 and 0.8 s
+        assert 2 <= len(fed.cancel_calls) <= 3, len(fed.cancel_calls)
 
     def test_host_stop_interrupts_without_cancelling(self, tmp_path):
         fed = FakeFederation(tmp_path, plans={
