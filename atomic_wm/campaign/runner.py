@@ -614,9 +614,14 @@ class StageRunner:
                       cancel: Optional[asyncio.Event]) -> Dict[str, Any]:
         """Submit, retrying transient errors within the unreachable budget.
 
-        Every retry sends the same task id.  That is safe by the ORBIT
-        contract (plans/11 §4): a known task id answers with the existing
-        record, so a submit whose answer got lost is not run twice.
+        Every retry sends the same task id.  By the ORBIT contract (plans/11
+        §4) a known task id answers with the existing record, so a submit
+        whose answer got lost is not run twice -- but only once ORBIT's
+        ``fix/federation-submit-ledger`` is merged.  On ORBIT devel without
+        it, ``plugin_federation._route_submit`` picks a class pool again
+        without consulting its ledger: a retry after a 5xx that came back
+        once the task had landed may land in another pool and create a
+        second task with the same id.
         """
 
         down_since: Optional[float] = None

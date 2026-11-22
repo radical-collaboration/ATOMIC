@@ -254,7 +254,11 @@ Submit, poll, output collection and cancel classify errors the same way:
 - **Submit retry.** A transient submit error is retried within the same
   budget with the **same task id**: a known task id answers with its
   existing record, so a submit whose answer got lost does not run twice.
-  Fatal submit errors fail the stage at once.
+  That holds once ORBIT branch `fix/federation-submit-ledger` is merged.
+  Until then, ORBIT devel's `plugin_federation._route_submit` picks a
+  class pool again without consulting its ledger, so a retry after a
+  `5xx` that arrived after the task had landed may land in another pool
+  and duplicate the task. Fatal submit errors fail the stage at once.
 - **Cancels reach ORBIT.** Every cancel -- a stopped campaign, a stage
   timeout, a cancelled `run_workflow` -- is first put on the campaign's
   persisted `pending_cancels` list, then tried (shielded) up to three
