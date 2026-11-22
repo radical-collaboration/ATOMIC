@@ -1541,6 +1541,80 @@ class TestCancelReachesTheFederation:
         assert fed.cancel_calls == []
 
 
+class TestShutdownGate:
+    """RULE A in the runner: once the campaign is INTERRUPTED no stage is
+    submitted, and a stage the stop stamped keeps its stamp."""
+
+    def test_no_stage_starts_on_an_interrupted_campaign(self, tmp_path):
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = FakeFederation(tmp_path)
+        camp = _campaign(tmp_path)
+        wf   = camp.workflows[0]
+        mark_interrupted(camp)
+        runner = StageRunner(fed, _store(tmp_path), poll_interval=0,
+                             poll_max_interval=0)
+        asyncio.run(runner.run_workflow(camp, wf))
+        assert getattr(fed, 'submit_attempts', []) == []
+        assert [st.state for st in wf.stages] == ['INTERRUPTED'] * 2
+        # the record claims no task that was never submitted
+        assert [st.task_id for st in wf.stages] == [None, None]
+        assert wf.state == 'INTERRUPTED'
+        assert camp.pending_cancels == []
+
+    def test_a_submit_retry_after_the_stamp_is_not_sent(self, tmp_path):
+        # the first submit failed in transit (it may have landed), the
+        # stop lands during the back-off: the retry is not sent
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'submit_errors': [ConnectionError('down')]}})
+        camp = _campaign(tmp_path, stages=_md_only())
+        wf   = camp.workflows[0]
+
+        async def _sleep(_s):
+            mark_interrupted(camp)
+            await asyncio.sleep(0)
+
+        runner = StageRunner(fed, _store(tmp_path), poll_interval=0,
+                             poll_max_interval=0, sleep=_sleep)
+        asyncio.run(runner.run_workflow(camp, wf))
+        assert fed.submit_attempts == ['cmp-test-wf-000-md']
+        assert wf.stages[0].state == 'INTERRUPTED'
+        assert wf.state == 'INTERRUPTED'
+        assert fed.cancel_calls == []
+        # the first try may have landed: queued for the next start
+        assert [e['task_id'] for e in camp.pending_cancels] == \
+               ['cmp-test-wf-000-md']
+
+    def test_a_stage_that_ends_after_the_stamp_stays_interrupted(
+            self, tmp_path):
+        # the task finishes between the stamp and the runner's
+        # cancellation: the stage is not turned DONE, its workflow reads
+        # INTERRUPTED, and no next stage starts
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': _envelope('simulation', 1)},
+                   'polls': [{'state': 'RUNNING'}]}})
+        camp   = _campaign(tmp_path)
+        wf     = camp.workflows[0]
+        runner = StageRunner(fed, _store(tmp_path), poll_interval=0,
+                             poll_max_interval=0)
+
+        async def _scenario():
+            task = asyncio.ensure_future(runner.run_workflow(camp, wf))
+            while wf.stages[0].state != RUNNING:
+                await asyncio.sleep(0)
+            mark_interrupted(camp)
+            fed.plans['md']['polls'] = [{'state': 'DONE', 'exit_code': 0}]
+            await task
+
+        asyncio.run(_scenario())
+        assert [st.state for st in wf.stages] == ['INTERRUPTED'] * 2
+        assert wf.state == 'INTERRUPTED'
+        assert len(fed.submits) == 1
+        assert fed.cancel_calls == []
+
+
 class TestRestartQueuesOrphans:
 
     def test_a_running_stage_found_on_load_is_queued_for_cancel(

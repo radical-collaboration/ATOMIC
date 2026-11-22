@@ -447,9 +447,9 @@ class TestCampaign:
         assert set(fed.cancels) == set(fed.submits)
 
     def test_a_shutdown_leaves_the_orbit_tasks_alone(self, tmp_path, store):
-        # the plugin's _stop_drivers: stamp INTERRUPTED, interrupt the
-        # runners, then cancel the driver task.  A restart must not kill
-        # HPC work, and the stop must not wait cancel_wait_s per frame
+        # the plugin's _stop_drivers: stamp INTERRUPTED, then cancel the
+        # driver task.  A restart must not kill HPC work, and the stop must
+        # not wait cancel_wait_s per frame
         from atomic_wm.campaign.state import mark_interrupted
         fed  = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
         # node_hour_scale 1: no frame reaches its node-hour limit (an
@@ -464,7 +464,6 @@ class TestCampaign:
                 await asyncio.sleep(0.01)
             await asyncio.sleep(0.1)
             mark_interrupted(camp)
-            driver.interrupt()
             t0 = time.monotonic()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -474,13 +473,58 @@ class TestCampaign:
         _assert_interrupted(camp, fed)
         assert took['s'] < 3.0
 
-    def test_without_interrupt_the_driver_still_cancels_nothing(
+    @pytest.mark.parametrize('k', range(6))
+    def test_a_frame_launched_just_before_a_stop_submits_nothing(
+            self, tmp_path, store, monkeypatch, k):
+        # AuCaM launches a frame, the stop lands k loop iterations later,
+        # before the block's first stage: the runner's gate must keep the
+        # stage from being submitted (and then cancelled by the shutdown)
+        from src.aucam import campaign as acmp
+        from atomic_wm.campaign.state import mark_interrupted
+        fed  = TimedFederation(tmp_path)
+        fed.slow = lambda t, n: 0.01 if '-f000-' in t else 50.0
+        body = _body(4, 0, cancel_wait_s=10.0, node_hour_scale=1.0,
+                     max_concurrent=1)
+        driver, camp = _drive(fed, store, body)
+        orig  = acmp._CampaignInstance._launch
+        state = {'n': 0, 'task': None, 'before': None}
+
+        def _stop():
+            state['before'] = list(fed.submits)
+            mark_interrupted(camp)
+            state['task'].cancel()
+
+        def _later(i):
+            if i == 0:
+                _stop()
+            else:
+                asyncio.get_running_loop().call_soon(_later, i - 1)
+
+        def _launch(self, *args, **kwargs):
+            orig(self, *args, **kwargs)
+            state['n'] += 1
+            if state['n'] == 2:                  # frame 1, frame 0 is done
+                _later(k)
+
+        monkeypatch.setattr(acmp._CampaignInstance, '_launch', _launch)
+
+        async def main():
+            state['task'] = asyncio.ensure_future(driver.run(camp))
+            await asyncio.gather(state['task'], return_exceptions=True)
+            await asyncio.sleep(0.3)
+
+        asyncio.run(main())
+        assert state['before'] is not None
+        assert fed.submits == state['before']
+        assert fed.cancels == []
+        assert camp.state == 'INTERRUPTED'
+
+    def test_back_to_back_polls_during_a_shutdown_cancel_nothing(
             self, tmp_path, store):
-        # the stop sequence minus interrupt(), with back-to-back polls: the
-        # runners keep polling until AuCaM's shutdown reaches their frame.
-        # The runner must not turn an INTERRUPTED stage RUNNING again, and
-        # the frame's stop must not set the runner's stop event -- either
-        # one cancels every ORBIT task
+        # the runners keep polling until AuCaM's shutdown reaches their
+        # frame.  The runner must not turn an INTERRUPTED stage RUNNING
+        # again, and the frame's stop must not set the runner's stop
+        # event -- either one cancels every ORBIT task
         from atomic_wm.campaign.state import mark_interrupted
         fed  = TimedFederation(tmp_path, slow=lambda t, n: 50.0)
         body = _body(4, 0, cancel_wait_s=10.0, node_hour_scale=1.0)
@@ -518,7 +562,6 @@ class TestCampaign:
             while len(fed.submits) < 4 or not fed.stuck_now:
                 await asyncio.sleep(0.01)
             mark_interrupted(camp)
-            driver.interrupt()
             t0 = time.monotonic()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -671,9 +714,9 @@ class TestPluginRoute:
     def test_a_plugin_stop_starts_no_further_stage(self, tmp_path,
                                                    plugin_clients):
         # stages that end between the INTERRUPTED stamp and AuCaM's
-        # shutdown reaching their frame: only the plugin's interrupt()
-        # right after the stamp keeps the runner from starting the next
-        # stage (a new ORBIT task during a shutdown, cancelled at once)
+        # shutdown reaching their frame: the runner's gate keeps them from
+        # starting the next stage (a new ORBIT task during a shutdown,
+        # cancelled at once)
         NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin
         fed = DoneOnStop(tmp_path, slow=lambda t, n: 50.0)
         _, plugin = _make_plugin(tmp_path, fed=fed, poll_interval_sec=0.0,

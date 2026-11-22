@@ -34,8 +34,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, \
                    Tuple
 
 from .state import Campaign, StageRun, WorkflowInstance
-from .state import (CANCELED, DONE, FAILED, PENDING, RUNNING, SKIPPED,
-                    STAGING, SUBMITTED, TERMINAL_STATES, FED_DISPATCHER_SID)
+from .state import (CANCELED, DONE, FAILED, INTERRUPTED, PENDING, RUNNING,
+                    SKIPPED, STAGING, SUBMITTED, TERMINAL_STATES,
+                    FED_DISPATCHER_SID, REASON_INTERRUPTED)
 from .store import ResultStore, Source, stage_manifest
 
 log = logging.getLogger('radical.orbit')
@@ -419,8 +420,9 @@ class StageRunner:
 
         for stage in wf.stages:
             if failure is not None:
-                stage.state  = SKIPPED
-                stage.reason = 'stage %r did not succeed' % failure.name
+                if not stage.is_terminal():           # INTERRUPTED stays
+                    stage.state  = SKIPPED
+                    stage.reason = 'stage %r did not succeed' % failure.name
                 continue
             if cancel is not None and cancel.is_set():
                 stage.state  = CANCELED
@@ -455,7 +457,7 @@ class StageRunner:
             self._changed()
             raise
         except StageFailed as exc:
-            if stage.state != CANCELED:
+            if stage.state not in (CANCELED, INTERRUPTED):
                 stage.state = FAILED
             stage.reason = stage.reason or str(exc)
         except FederationCallError as exc:
@@ -530,8 +532,8 @@ class StageRunner:
 
         if failure is None:
             wf.state, wf.reason = DONE, None
-        elif failure.state == CANCELED:
-            wf.state  = CANCELED
+        elif failure.state in (CANCELED, INTERRUPTED):
+            wf.state  = failure.state
             wf.reason = failure.reason
         else:
             wf.state  = FAILED
@@ -552,6 +554,8 @@ class StageRunner:
         it, so there is no directory to stage into beforehand.  Raises on
         failure.
         """
+
+        self._gate(campaign, stage)
 
         cid          = campaign.campaign_id
         stage.task_id = '%s-%s-%s' % (cid, wf.id, stage.name)
@@ -634,6 +638,9 @@ class StageRunner:
         interval = RETRY_MIN_INTERVAL
         self._live.add(str(stage.task_id))
         while True:
+            # a retry included: the first try may have landed, and
+            # mark_interrupted has queued it for the next start
+            self._gate(campaign, stage)
             try:
                 resp = await self._fed.submit(task, dict(stage.requirements))
             except Exception as exc:                          # noqa: BLE001
@@ -660,6 +667,24 @@ class StageRunner:
             if down_since is not None:
                 self._drain_cancels()             # it answers again
             return resp
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _gate(campaign: Campaign, stage: StageRun) -> None:
+        """RULE A: no stage is ever submitted for an INTERRUPTED campaign.
+
+        The service is stopping (or stopped): a new ORBIT task now would
+        be one nobody collects, and cancelling it would be the shutdown
+        cancelling ORBIT work.  Checked before every submit, retries
+        included, so it holds whoever drives the runner and however late
+        the stop lands.
+        """
+
+        if campaign.state != INTERRUPTED:
+            return
+        stage.state  = INTERRUPTED
+        stage.reason = stage.reason or REASON_INTERRUPTED
+        raise StageFailed(stage.reason)
 
     # ----------------------------------------------------------------------
     async def _stop_if_canceled(self, campaign: Campaign, stage: StageRun,
@@ -946,11 +971,17 @@ class StageRunner:
     # ----------------------------------------------------------------------
     def _finish_stage(self, stage: StageRun,
                       task_dict: Dict[str, Any]) -> None:
-        """Map the terminal task dict onto the stage's outcome."""
+        """Map the terminal task dict onto the stage's outcome.
+
+        An INTERRUPTED stage keeps that state (RULE A): the stop stamped it
+        while the task ran, and its workflow must read INTERRUPTED too.
+        """
 
         state = str(task_dict.get('state') or '')
         stage.exit_code   = task_dict.get('exit_code')
         stage.finished_at = task_dict.get('finished_at') or self._clock()
+        if stage.state == INTERRUPTED:
+            return
         # success == DONE with a zero (or absent) exit code -- 00-overview
         if state == 'DONE' and stage.exit_code in (0, None):
             stage.state  = DONE

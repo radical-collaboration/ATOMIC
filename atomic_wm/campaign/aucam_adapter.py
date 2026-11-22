@@ -102,26 +102,30 @@ The plugin calls, in this order::
 :class:`~atomic_wm.campaign.runner.CampaignRunner`, so the plugin's
 ``_drive`` / ``_route_cancel`` work unchanged.
 
-Shutdown never cancels an ORBIT task: a broker or CM restart must not kill
-HPC work.  The plugin stamps the campaign INTERRUPTED, calls
-:meth:`AucamCampaignDriver.interrupt` (every frame's runner task is
-cancelled at once), then cancels the task that awaits ``run()``, and AuCaM
-stops.  Three things keep that stop away from ORBIT, each pinned by a test:
+A shutdown never calls the federation: a broker or CM restart must not
+kill HPC work, and must not start any either.  The plugin stamps the
+campaign INTERRUPTED (``mark_interrupted`` queues the tasks of its
+unfinished stages on ``pending_cancels``), then cancels the task that
+awaits ``run()``, and AuCaM stops its frames.  What keeps that stop away
+from ORBIT, each pinned by a test:
 
-- the runner never moves a stage with a final state (INTERRUPTED) on a
-  poll, and its cancellation leaves such a stage's task alone;
-- ``interrupt()`` right after the stamp: a runner whose stage ends in the
-  window before AuCaM's shutdown reaches its frame would otherwise start
-  the next stage -- a new ORBIT task during a shutdown;
+- the runner's gate (:class:`~atomic_wm.campaign.runner.StageRunner`):
+  no stage of an INTERRUPTED campaign is submitted -- not a frame AuCaM
+  launched just before the stop, not the next stage of a frame whose
+  stage ended in the window, not a submit retry; a stamped stage keeps
+  INTERRUPTED through a poll or a task end, and a cancelled runner leaves
+  such a stage's task alone;
 - a frame stopped on an INTERRUPTED campaign does not set the runner's
   stop event (the runner would cancel at its next poll) and waits only
   ``SHUTDOWN_WAIT_S`` for it, as does the final drain of the runners, so
   a shutdown stays within ORBIT's host-stop bounds.
 
-ORBIT tasks are cancelled by :meth:`AucamCampaignDriver.cancel`, by
-AuCaM's own cancels of a frame (a poor score, the frame's node-hour limit,
-a wall-time or stale-report limit), by a stage timeout and by a definitive
-stage failure -- never by a shutdown.
+The queued tasks are cancelled by the plugin's drainer once the federation
+answers after the next start: there is no resume, so nobody would collect
+them.  Everything else that cancels an ORBIT task does so at once:
+:meth:`AucamCampaignDriver.cancel`, AuCaM's own cancels of a frame (a poor
+score, the frame's node-hour limit, a wall-time or stale-report limit), a
+stage timeout and a definitive stage failure.
 
 This module imports without AuCaM; :data:`AUCAM_ERROR` says why it is not
 usable, and :func:`parse_aucam_request` / the driver raise
@@ -691,23 +695,6 @@ class AucamCampaignDriver:
         self.manager.stop()
 
     # ----------------------------------------------------------------------
-    def interrupt(self) -> None:
-        """The service stops (the campaign is stamped INTERRUPTED): cancel
-        every frame's runner task NOW.
-
-        The runners are tasks of their own, outside the task that awaits
-        :meth:`run`.  Left alone until AuCaM's shutdown reaches their frame
-        they keep polling, and a stage that ends meanwhile starts the next
-        one -- a new ORBIT task during a shutdown.  Cancelled here,
-        synchronously right after the stamp, they see the stamp and leave
-        ORBIT alone.  The owner calls this; :meth:`run` does not, since by
-        the time it sees its cancellation AuCaM has stopped every frame.
-        """
-
-        for task in self._inner:
-            task.cancel()
-
-    # ----------------------------------------------------------------------
     def _changed(self) -> None:
         if self._on_change is None:
             return
@@ -850,7 +837,8 @@ class AucamCampaignDriver:
 
         Not on a shutdown (the campaign is INTERRUPTED already): then the
         runner task is cancelled at once, sees the stamp and leaves the
-        ORBIT task running -- nothing is cancelled, nothing is waited for.
+        ORBIT task running -- nothing is cancelled, and the wait is
+        ``SHUTDOWN_WAIT_S``, not ``cancel_wait_s``.
         """
 
         if campaign.state == INTERRUPTED:

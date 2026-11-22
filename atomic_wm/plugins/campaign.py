@@ -1000,12 +1000,6 @@ class PluginAtomicCampaign(Plugin):
                 mark_interrupted(camp)
                 log.info('[%s] campaign %s interrupted by shutdown',
                          self.instance_name, cid)
-                # an AuCaM driver's runners are tasks of their own: stop
-                # them right after the stamp, before they poll again
-                interrupt = getattr(self._runners.get(cid), 'interrupt',
-                                    None)
-                if interrupt is not None:
-                    interrupt()
 
         # cancel every driver before awaiting any: awaiting one at a time
         # let the others keep polling and submit new stages meanwhile
