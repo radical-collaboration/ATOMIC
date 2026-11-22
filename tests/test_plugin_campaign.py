@@ -659,6 +659,44 @@ class TestShutdown:
         _, plugin2 = _make_plugin(tmp_path, fed=_fed(tmp_path))
         assert plugin2._campaigns[cid].state == 'INTERRUPTED'
 
+    def test_a_submit_after_a_stop_is_refused(self, tmp_path):
+        # nobody would stop a driver started now (RULE A)
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'polls': [{'state': 'RUNNING'}]}})
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        client.portal.call(plugin.on_host_stop)
+        r = client.post('%s/campaigns/default' % NS,
+                        json={'workflow': _spec([_spec()['stages'][0]]),
+                              'sweep': {'temperature': [300]}})
+        assert r.status_code == 503, r.text
+        time.sleep(0.2)
+        assert fed.submits == []
+        assert plugin._drivers == {} and plugin._campaigns == {}
+
+    def test_a_stop_during_the_submit_route_is_refused(self, tmp_path):
+        # the stop lands while the route awaits (here: its body): the
+        # check comes after the route's last await
+        fed = FakeFederation(tmp_path)
+        _, plugin = _make_plugin(tmp_path, fed=fed)
+        client = _request(plugin)
+        real = plugin._body
+
+        async def _body(request):
+            body = await real(request)
+            await plugin.on_host_stop()
+            return body
+
+        plugin._body = _body
+        r = client.post('%s/campaigns/default' % NS,
+                        json={'workflow': _spec([_spec()['stages'][0]]),
+                              'sweep': {'temperature': [300]}})
+        assert r.status_code == 503, r.text
+        time.sleep(0.2)
+        assert fed.submits == []
+        assert plugin._drivers == {} and plugin._campaigns == {}
+
     def test_shutdown_of_a_finished_campaign_keeps_its_state(self, tmp_path):
         _, plugin = _make_plugin(tmp_path, fed=_fed(tmp_path))
         client = _request(plugin)

@@ -767,6 +767,34 @@ class TestPluginRoute:
         assert stopped == made
         assert plugin._aucam_backend is None
 
+    def test_a_backend_built_after_a_stop_is_shut_down(
+            self, tmp_path, plugin_clients, monkeypatch):
+        # the stop lands while the first AuCaM submit builds the shared
+        # backend: the submit is refused and the late backend shut down
+        from atomic_wm.campaign import aucam_adapter
+        made, stopped = [], []
+
+        class _Backend:
+            async def shutdown(self):
+                stopped.append(self)
+
+        _, plugin = plugin_clients._make_plugin(
+            tmp_path, fed=TimedFederation(tmp_path))
+
+        async def _make():
+            await plugin.on_host_stop()
+            made.append(_Backend())
+            return made[-1]
+
+        monkeypatch.setattr(aucam_adapter, 'make_backend', _make)
+        client = plugin_clients._request(plugin)
+        r = client.post('%s/campaigns/default' % plugin_clients.NS,
+                        json=_body(2, 0))
+        assert r.status_code == 503, r.text
+        assert stopped == made and len(made) == 1
+        assert plugin._aucam_backend is None
+        assert plugin._drivers == {} and plugin._campaigns == {}
+
     def test_cancel_route_reaches_orbit(self, tmp_path, plugin_clients):
         # an explicit cancel is what DOES stop the ORBIT tasks
         NS, _make_plugin = plugin_clients.NS, plugin_clients._make_plugin

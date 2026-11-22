@@ -757,7 +757,7 @@ class PluginAtomicCampaign(Plugin):
         "planner"?: "sweep"|"aucam", "aucam"?: {...}}``.  With
         ``planner: aucam`` the Campaign Manager launches the frames itself
         (see :mod:`atomic_wm.campaign.aucam_adapter` for the ``aucam`` keys);
-        503 when AuCaM is not installed.
+        503 when AuCaM is not installed, and while the service stops.
 
         The spec is validated synchronously (400 on a bad one); everything
         that can only fail later -- no federation, no resource, a failing
@@ -808,6 +808,9 @@ class PluginAtomicCampaign(Plugin):
                 max_concurrent_workflows=int(max_wf),
                 on_change=self._persist, **stage_kwargs)
 
+        # after the route's last await: a stop that landed meanwhile has
+        # already stopped every driver, and nobody would stop this one
+        self._refuse_when_stopping()
         self._campaigns[camp.campaign_id] = camp
         self._persist()
         self._runners[camp.campaign_id] = runner
@@ -818,6 +821,13 @@ class PluginAtomicCampaign(Plugin):
                  self.instance_name, camp.campaign_id, len(camp.workflows),
                  camp.sweep)
         return camp.brief()
+
+    def _refuse_when_stopping(self) -> None:
+        """503 for a submit while the service stops (RULE A)."""
+
+        if self._stopping:
+            raise HTTPException(status_code=503,
+                                detail='the campaign service is stopping')
 
     async def _aucam_campaign(self, body: Dict[str, Any], name: str,
                               stage_kwargs: Dict[str, Any]
@@ -834,6 +844,9 @@ class PluginAtomicCampaign(Plugin):
         async with self._aucam_lock:
             if self._aucam_backend is None:
                 self._aucam_backend = await aucam_adapter.make_backend()
+                if self._stopping:
+                    # built after the stop shut the shared one down
+                    await self._stop_aucam_backend()
         camp = Campaign(campaign_id=new_campaign_id(), name=name,
                         sweep=dict(body.get('sweep') or {}),
                         planner='aucam', workflows=[])
