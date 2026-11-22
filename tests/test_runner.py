@@ -1210,6 +1210,35 @@ class TestBrokerOutageWhilePolling:
         assert camp.state == 'CANCELED'
         assert fed.cancel_calls == []           # the task was over
 
+    def test_a_stop_during_the_collection_back_off_is_seen_at_once(
+            self, tmp_path):
+        # real back-off (1 s, then 2 s): the stop lands 0.1 s into it and
+        # the stage ends now, not when the back-off is over
+        import time
+        fed = FakeFederation(tmp_path, plans={
+            'md': {'outputs': {'md.json': b'{}'},
+                   'stage_out_errors': [ConnectionError('down')] * 1000}})
+        camp   = _campaign(tmp_path, stages=_md_only())
+        runner = CampaignRunner(fed, _store(tmp_path), poll_interval=0,
+                                poll_max_interval=0,
+                                unreachable_budget=10 ** 6)
+        took   = {}
+
+        async def _scenario():
+            job = asyncio.ensure_future(runner.run(camp))
+            errors = fed.plans['md']['stage_out_errors']
+            while len(errors) == 1000:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
+            t0 = time.monotonic()
+            runner.cancel()
+            await job
+            took['s'] = time.monotonic() - t0
+
+        asyncio.run(_scenario())
+        assert camp.workflows[0].stages[0].state == 'CANCELED'
+        assert took['s'] < 0.5, took
+
     def test_a_missing_output_is_not_waited_for(self, tmp_path):
         # no source failed transiently: the file is simply not there
         fed = FakeFederation(tmp_path, plans={'md': {'outputs': {}}})

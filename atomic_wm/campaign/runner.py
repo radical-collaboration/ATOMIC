@@ -1087,7 +1087,7 @@ class StageRunner:
                 break
             log.info('[atomic_campaign] outputs of %s deferred: %s',
                      stage.task_id, describe(transient[-1]))
-            await self._sleep(interval)
+            await self._pause(interval, cancel)
             interval = min(interval * 2, RETRY_MAX_INTERVAL)
             names = missing
             if _stopped():
@@ -1097,6 +1097,28 @@ class StageRunner:
                          if n in entries]
         self._changed()
         return stage.outputs
+
+    # ----------------------------------------------------------------------
+    async def _pause(self, seconds: float,
+                     cancel: Optional[asyncio.Event]) -> None:
+        """Back off for *seconds* -- or until the campaign is stopped.
+
+        A stop must be seen at once: a frame AuCaM cancels waits only
+        ``cancel_wait_s`` (as long as the longest back-off) before it
+        falls back to cancelling the runner task.
+        """
+
+        if cancel is None:
+            await self._sleep(seconds)
+            return
+        sleeper = asyncio.ensure_future(self._sleep(seconds))
+        stopper = asyncio.ensure_future(cancel.wait())
+        try:
+            await asyncio.wait({sleeper, stopper},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sleeper.cancel()
+            stopper.cancel()
 
     # ----------------------------------------------------------------------
     @staticmethod
