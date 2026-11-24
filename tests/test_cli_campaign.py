@@ -122,6 +122,31 @@ class TestSubmit:
         out = capsys.readouterr().out
         assert 'cmp-1234' in out and '3 workflow' in out
 
+    def test_submit_passes_planner_and_aucam(self, client, tmp_path):
+        path = tmp_path / 'req.json'
+        path.write_text(json.dumps({
+            'workflow': {'name': 'demo', 'stages': []},
+            'planner' : 'aucam',
+            'aucam'   : {'frames': [{'seed': 1}]}}))
+        client.campaign_submit.return_value = {'campaign_id': 'c',
+                                               'workflows': []}
+        assert cli.main(['--broker', 'https://x', 'submit', str(path)]) == 0
+        assert client.campaign_submit.call_args[1] == {
+            'planner': 'aucam', 'aucam': {'frames': [{'seed': 1}]}}
+
+    def test_the_submit_body_carries_them(self, monkeypatch):
+        from atomic_wm.client import Client
+        sent = []
+        monkeypatch.setattr(Client, '__init__', lambda self: None)
+        monkeypatch.setattr(Client, '_cmp', lambda self, route: route)
+        monkeypatch.setattr(Client, 'request',
+                            lambda self, *a, **kw: sent.append(kw['json']))
+        Client().campaign_submit({}, {})
+        Client().campaign_submit({}, {}, planner='aucam', aucam={'a': 1})
+        assert sent == [{'workflow': {}, 'sweep': {}},
+                        {'workflow': {}, 'sweep': {}, 'planner': 'aucam',
+                         'aucam': {'a': 1}}]
+
     def test_sweep_from_the_file_is_used_when_no_flag(self, client, tmp_path):
         path = tmp_path / 'req.json'
         path.write_text(json.dumps({

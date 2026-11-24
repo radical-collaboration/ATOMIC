@@ -347,11 +347,18 @@ class Client:
 
     # ------------------------------------------------------------ campaign
     def campaign_submit(self, workflow: Dict[str, Any],
-                        sweep: Dict[str, List[Any]]) -> Dict[str, Any]:
+                        sweep: Dict[str, List[Any]],
+                        planner: Any = None,
+                        aucam: Any = None) -> Dict[str, Any]:
         """``POST /<campaign endpoint>/atomic_campaign/campaigns/default``."""
 
+        body: Dict[str, Any] = {'workflow': workflow, 'sweep': sweep}
+        if planner is not None:
+            body['planner'] = planner
+        if aucam is not None:
+            body['aucam'] = aucam
         return self.request('POST', self._cmp('campaigns/%s' % DEFAULT_SID),
-                            json={'workflow': workflow, 'sweep': sweep})
+                            json=body)
 
     def campaigns(self) -> List[Dict[str, Any]]:
 

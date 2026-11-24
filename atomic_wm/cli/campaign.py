@@ -80,8 +80,11 @@ def load_spec(path: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError('%s: expected a JSON object' % path)
     if isinstance(data.get('workflow'), dict):
-        return {'workflow': data['workflow'],
+        spec = {'workflow': data['workflow'],
                 'sweep'   : data.get('sweep') or {}}
+        spec.update({key: data[key] for key in ('planner', 'aucam')
+                     if key in data})
+        return spec
     return {'workflow': data, 'sweep': {}}
 
 
@@ -230,7 +233,9 @@ def cmd_submit(client: Any, args: argparse.Namespace) -> int:
         sweep = spec.get('sweep') or {}
 
     try:
-        camp = client.campaign_submit(spec['workflow'], sweep)
+        camp = client.campaign_submit(
+            spec['workflow'], sweep,
+            **{key: spec[key] for key in ('planner', 'aucam') if key in spec})
     except ClientError as exc:
         return _err(str(exc))
 
