@@ -27,6 +27,8 @@ test = ["pytest", "flake8"]
 atomic-fake-md          = "atomic_wm.workload.fake_md:main"
 atomic-fake-train       = "atomic_wm.workload.fake_train:main"
 atomic-fake-descriptors = "atomic_wm.workload.fake_descriptors:main"
+# real science workload: one grain-boundary frame (docs/gb_frames.md)
+atomic-gb-frame         = "atomic_wm.workload.gb_frame:main"
 # federation / campaign CLI (P2, P4) -- placeholders until then
 atomic-join             = "atomic_wm.cli.join:main"
 atomic-leave            = "atomic_wm.cli.leave:main"

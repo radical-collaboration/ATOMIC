@@ -66,6 +66,8 @@ points.  ``aucam`` keys (all optional except where noted):
 ``direction``          ``maximize`` (default) or ``minimize``
 ``good_score``         a completed frame at least this good is *good*
                        (required when ``goal_good_frames`` is set)
+``good_band``          ``[low, high]``: a completed frame whose score lies in
+                       the band is *good* (instead of ``good_score``)
 ``poor_score``         a running frame worse than this is cancelled
 ``goal_good_frames``   end the campaign after this many good frames
 ``budget_node_hours``  campaign spending limit (AuCaM ``spending``)
@@ -226,6 +228,7 @@ class AucamPlan:
     score_key:         str             = 'summary.score'
     direction:         str             = 'maximize'
     good_score:        Optional[float] = None
+    good_band:         Optional[Tuple[float, float]] = None
     poor_score:        Optional[float] = None
     goal_good_frames:  Optional[int]   = None
     budget_node_hours: Optional[float] = None
@@ -250,7 +253,19 @@ class AucamPlan:
 
         return a >= b if self.direction == 'maximize' else a <= b
 
+    def ranks(self, a: float, b: float) -> bool:
+        """``a`` at least as good as ``b`` for the best frame: closest to
+        the middle of the band, else in this plan's direction."""
+
+        if self.good_band is not None:
+            mid = sum(self.good_band) / 2.0
+            return abs(a - mid) <= abs(b - mid)
+        return self.better(a, b)
+
     def is_good(self, score: Any) -> bool:
+        if self.good_band is not None:
+            return _is_num(score) and \
+                self.good_band[0] <= float(score) <= self.good_band[1]
         return _is_num(score) and self.good_score is not None \
             and self.better(float(score), self.good_score)
 
@@ -305,6 +320,15 @@ def _number(raw: Dict[str, Any], key: str, default: Any, *,
         raise PlannerError('aucam.%s must be %s %g'
                            % (key, '>' if strict else '>=', minimum))
     return int(value) if integer else float(value)
+
+
+def _band(raw: Any) -> Optional[Tuple[float, float]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2 \
+            or not all(_is_num(v) for v in raw) or not raw[0] < raw[1]:
+        raise PlannerError('aucam.good_band must be [low, high], low < high')
+    return float(raw[0]), float(raw[1])
 
 
 def _resources(raw: Any, what: str) -> Dict[str, float]:
@@ -379,6 +403,7 @@ def parse_aucam_request(body: Dict[str, Any]) -> AucamPlan:
         score_key         = s_key,
         direction         = direction,
         good_score        = _score('good_score'),
+        good_band         = _band(raw.get('good_band')),
         poor_score        = _score('poor_score'),
         goal_good_frames  = _number(raw, 'goal_good_frames', None,
                                     minimum=1, strict=False, integer=True),
@@ -401,8 +426,13 @@ def parse_aucam_request(body: Dict[str, Any]) -> AucamPlan:
                             else _number(raw, 'idle_exit_s', 'auto',
                                          strict=False))
 
-    if plan.goal_good_frames is not None and plan.good_score is None:
-        raise PlannerError('aucam.goal_good_frames needs aucam.good_score')
+    if plan.good_score is not None and plan.good_band is not None:
+        raise PlannerError('aucam.good_score and aucam.good_band exclude '
+                           'each other')
+    if plan.goal_good_frames is not None and plan.good_score is None \
+            and plan.good_band is None:
+        raise PlannerError('aucam.goal_good_frames needs aucam.good_score '
+                           'or aucam.good_band')
 
     # every frame must expand -- a missing parameter is a 400 now, not a
     # failed frame later
@@ -527,7 +557,7 @@ class BigsimController(CampaignController):               # type: ignore
                  if _is_num(r['score'])] + list(scores.values())
         best  = None
         for s in known:
-            if best is None or self._plan.better(s, best):
+            if best is None or self._plan.ranks(s, best):
                 best = s
         # top-level keys: AuCaM's goals read obs[goal.metric]
         obs['good_frames']  = len(self.good_frames())
@@ -619,7 +649,7 @@ class BigsimController(CampaignController):               # type: ignore
         for rec in self.frames.values():
             if _is_num(rec['score']) and rec['state'] in ('GOOD', 'DONE') \
                     and (best is None
-                         or self._plan.better(rec['score'], best['score'])):
+                         or self._plan.ranks(rec['score'], best['score'])):
                 best = {'frame': rec['frame'], 'score': rec['score'],
                         'workflow': rec['launches'][-1]
                         if rec['launches'] else None}
