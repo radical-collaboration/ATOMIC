@@ -125,6 +125,7 @@ class TestSubmit:
     def test_submit_passes_planner_and_aucam(self, client, tmp_path):
         path = tmp_path / 'req.json'
         path.write_text(json.dumps({
+            'name'    : 'gb-frames',
             'workflow': {'name': 'demo', 'stages': []},
             'planner' : 'aucam',
             'aucam'   : {'frames': [{'seed': 1}]}}))
@@ -132,7 +133,8 @@ class TestSubmit:
                                                'workflows': []}
         assert cli.main(['--broker', 'https://x', 'submit', str(path)]) == 0
         assert client.campaign_submit.call_args[1] == {
-            'planner': 'aucam', 'aucam': {'frames': [{'seed': 1}]}}
+            'name': 'gb-frames', 'planner': 'aucam',
+            'aucam': {'frames': [{'seed': 1}]}}
 
     def test_the_submit_body_carries_them(self, monkeypatch):
         from atomic_wm.client import Client

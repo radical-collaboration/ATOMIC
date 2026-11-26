@@ -856,7 +856,7 @@ class PluginAtomicCampaign(Plugin):
                     await self._stop_aucam_backend()
         camp = Campaign(campaign_id=new_campaign_id(), name=name,
                         sweep=dict(body.get('sweep') or {}),
-                        planner='aucam', workflows=[])
+                        planner='aucam', workflows=[], aucam=plan.view())
         driver = aucam_adapter.AucamCampaignDriver(
             self._fed, self._store, plan, on_change=self._persist,
             backend=self._aucam_backend, **stage_kwargs)

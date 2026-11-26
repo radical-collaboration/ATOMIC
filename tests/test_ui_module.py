@@ -668,6 +668,77 @@ console.log('OK (' + calls.length + ' api calls)');
 """
 
 
+# an AuCaM campaign card: scores, verdicts, the outcome, the score chart
+AUCAM_JS = r"""
+const m = await import(process.argv[2]);
+const I = m._internals;
+const fail = [];
+const check = (c, msg) => { if (!c) fail.push(msg); };
+const NOW = Date.now() / 1000;
+const stage = (name, state) => ({name, state, resource: 'perlmutter',
+                                 member: 'default', task_id: 't.' + name});
+const wf = (id, step, state, reason) => ({
+  id, name: 'gb-frame', params: {frame: 0, step, attempt: 1}, state,
+  reason: reason || null,
+  stages: [stage('denoise', 'DONE'), stage('classify', state)]});
+const PLAN = {score: {stage: 'classify', file: 'gb.json',
+                      key: 'summary.fraction_phase_b'},
+              direction: 'maximize', good_score: null,
+              good_band: [0.15, 0.85], poor_score: null,
+              goal_good_frames: 1, budget_node_hours: 6, frames: 3};
+const W = [wf('f000-aa', 63000, 'DONE'), wf('f001-bb', 96000, 'DONE'),
+           wf('f002-cc', 108000, 'CANCELED',
+              'the campaign reached its goal')];
+const metrics = v => ({classify: {summary: {fraction_phase_b: v}}});
+const RESULTS = {workflows: [{id: 'f000-aa', metrics: metrics(0.005)},
+                             {id: 'f001-bb', metrics: metrics(0.6564)},
+                             {id: 'f002-cc', metrics: {}}]};
+const DETAIL = {campaign_id: 'cmp-1', name: 'gb-frames', state: 'DONE',
+                planner: 'aucam', created_at: NOW - 90, finished_at: NOW,
+                workflows: W, aucam: PLAN,
+                outcome: {exit_reason: 'goals_satisfied',
+                          spent: {node_hours: 0.034},
+                          per_frame: []}};
+const item = {summary: {campaign_id: 'cmp-1', name: 'gb-frames',
+                        state: 'DONE'},
+              detail: DETAIL, results: RESULTS};
+
+const sc = I.frameScores(item, PLAN);
+check(sc['f000-aa'] === 0.005 && sc['f001-bb'] === 0.6564
+      && !('f002-cc' in sc), 'frameScores: ' + JSON.stringify(sc));
+check(I.verdictOf(W[1], 0.6564, PLAN) === 'good', 'in band is not good');
+check(I.verdictOf(W[0], 0.005, PLAN) === 'done', 'outside band is not done');
+check(I.verdictOf(W[2], undefined, PLAN) === null, 'no score has a verdict');
+const SYN = {...PLAN, good_band: null, good_score: 0.9, poor_score: 0.8};
+check(I.verdictOf(W[0], 0.95, SYN) === 'good', 'good_score');
+check(I.verdictOf(W[0], 0.7, SYN) === 'poor', 'poor_score');
+check(I.verdictOf(wf('x', 1, 'CANCELED', 'cancelled by the campaign '
+                        + 'manager: score 0.734 is worse than 0.8'),
+                  undefined, SYN) === 'poor', 'a poor cancel is not poor');
+
+const html = I.renderCampaign(item, {termSeen: {}, openResults: {}});
+check(html.includes('gb-frames'), 'the campaign name is missing');
+check(html.includes('0.656 · in band'), 'no in-band badge');
+check(html.includes('0.005 · scored'), 'no scored badge');
+check(html.includes('goal reached') && html.includes('1 in band (goal 1)')
+      && html.includes('0.03 of 6 node-hours'),
+      'outcome line: ' + (html.match(/ac-outcome[^]*?<\/div>/) || [''])[0]);
+check(html.includes('fraction_phase_b per frame'), 'no score chart');
+check(html.includes('class="ac-band"'), 'the band is not drawn');
+check(!html.includes('no md data'), 'an empty md chart is still shown');
+
+// a sweep campaign keeps its old charts
+const sweep = {summary: {campaign_id: 'c2', state: 'DONE'},
+               detail: {campaign_id: 'c2', state: 'DONE', workflows: []},
+               results: {workflows: []}};
+check(!I.renderCampaign(sweep, {termSeen: {}, openResults: {}})
+        .includes('Campaign'), 'a sweep card grew an AuCaM line');
+
+if (fail.length) { console.error('FAIL:\n  ' + fail.join('\n  ')); process.exit(1); }
+console.log('OK');
+"""
+
+
 # dumps the module's first bundled example spec as JSON on stdout
 DUMP_SPEC_JS = r"""
 const m = await import(process.argv[2]);
@@ -736,6 +807,16 @@ def test_bundled_example_equals_the_shipped_spec(tmp_path):
 def test_ui_module_drives_a_fake_explorer(tmp_path):
 
     out = _run_node(HARNESS_JS, tmp_path, 'harness.mjs')
+
+    assert out.returncode == 0, (out.stdout + '\n' + out.stderr)
+    assert 'OK' in out.stdout
+
+
+# ---------------------------------------------------------------------------
+@needs_node
+def test_aucam_campaign_card(tmp_path):
+
+    out = _run_node(AUCAM_JS, tmp_path, 'aucam.mjs')
 
     assert out.returncode == 0, (out.stdout + '\n' + out.stderr)
     assert 'OK' in out.stdout

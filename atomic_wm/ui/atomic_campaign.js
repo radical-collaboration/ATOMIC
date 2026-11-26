@@ -345,6 +345,47 @@ export function css() {
       font-size: .82rem;
       color: #fb7185;
     }
+    /* ---- the Campaign Manager's view (AuCaM campaigns) ---- */
+    .ac-outcome {
+      margin: 0 0 10px;
+      font-size: .84rem;
+      color: var(--text);
+    }
+    .ac-outcome-tag {
+      display: inline-block;
+      margin-right: 8px;
+      padding: 1px 8px;
+      border-radius: 9px;
+      font-size: .72rem;
+      font-weight: 600;
+      background: rgba(124, 131, 255, .16);
+      color: #a5abff;
+      border: 1px solid rgba(124, 131, 255, .4);
+    }
+    .ac-score {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .8rem;
+      padding: 2px 9px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .ac-score.v-good { color: #00d4aa; border-color: rgba(0, 212, 170, .5);
+                       background: rgba(0, 212, 170, .12); }
+    .ac-score.v-poor { color: #fb7185; border-color: rgba(251, 113, 133, .5);
+                       background: rgba(251, 113, 133, .12); }
+    .ac-score.v-done { color: var(--text); }
+    .ac-band       { fill: rgba(0, 212, 170, .12); }
+    .ac-thr-poor   { stroke: #fb7185; stroke-width: 2; stroke-dasharray: 6 5; }
+    .ac-thr-good   { stroke: #00d4aa; stroke-width: 2; stroke-dasharray: 6 5; }
+    .ac-bar.v-good { stroke: #00d4aa; stroke-width: 2.4; }
+    .ac-bar.v-poor { stroke: #fb7185; stroke-width: 2.4; }
+    .ac-bar-label  { fill: var(--muted); font-size: 16px;
+                     font-family: 'JetBrains Mono', monospace; }
+    .ac-bar-value  { fill: var(--text); font-size: 16px; font-weight: 600;
+                     font-family: 'JetBrains Mono', monospace; }
+
     /* the technical half of the story, under the phrase: what the
        federation actually said, which member failed on what */
     .ac-detail {
@@ -1416,11 +1457,20 @@ function renderCampaign(item, st) {
 
   const colours = seriesColours(wfs);
 
+  // an AuCaM campaign carries its steering rules: show what it decides
+  const plan   = aucamPlan(item);
+  const scores = plan ? frameScores(item, plan) : {};
   const rows = wfs.length
-    ? wfs.map((w, i) => renderWorkflowRow(w, colours[i])).join('')
+    ? wfs.map((w, i) => renderWorkflowRow(
+        w, colours[i],
+        plan ? renderScore(w, scores[String(firstOf(w, ['id', 'wf_id']))],
+                           plan) : '')).join('')
     : '<div class="ac-note">No workflows in this campaign.</div>';
 
-  const plots   = renderPlots(item, colours, isTerminal(state));
+  const plots   = renderPlots(item, colours, isTerminal(state),
+                              plan ? renderScoreChart(plan, wfs, scores,
+                                                      colours) : undefined);
+  const outcome = plan ? renderOutcome(item, plan, scores, wfs) : '';
   const results = renderResults(item, st, cid);
 
   const cancel = (state === 'RUNNING')
@@ -1457,6 +1507,7 @@ function renderCampaign(item, st) {
         · ${nwf} workflow${nwf === 1 ? '' : 's'}</span>` : ''}
       <span class="ac-camp-actions">${cancel}</span>
     </div>
+    ${outcome}
     ${reason ? `<div class="ac-reason">${esc(reason)}</div>` : ''}
     ${extra ? `<div class="ac-detail">${esc(extra)}</div>` : ''}
     ${rows}
@@ -1489,7 +1540,7 @@ function placementOf(s) {
   return mem ? `${res}/${mem}` : res;
 }
 
-function renderWorkflowRow(w, colour) {
+function renderWorkflowRow(w, colour, score) {
   w = w || {};
   const stages = isArr(w.stages) ? w.stages : [];
   const label  = paramsLabel(w.params) || shortId(firstOf(w, ['id', 'wf_id']));
@@ -1540,6 +1591,213 @@ function renderWorkflowRow(w, colour) {
     </span>
     <span class="ac-chips">${chips
       || '<span style="color:var(--muted)">no stages</span>'}</span>
+    ${score || ''}
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// the Campaign Manager's view: scores, verdicts, outcome (AuCaM campaigns)
+// ---------------------------------------------------------------------------
+
+function aucamPlan(item) {
+  const p = item && item.detail && item.detail.aucam;
+  return (p && typeof p === 'object') ? p : null;
+}
+
+function outcomeOf(item) {
+  const o = item && item.detail && item.detail.outcome;
+  return (o && typeof o === 'object') ? o : null;
+}
+
+function given(v) {
+  return v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
+}
+
+// `summary.fraction_phase_b` read out of a metric document
+function dotted(doc, key) {
+  let v = doc;
+  for (const k of String(key || '').split('.')) {
+    if (v && typeof v === 'object' && k in v) v = v[k];
+    else return null;
+  }
+  return given(v) ? Number(v) : null;
+}
+
+// workflow id -> score: from the collected score stage while the campaign
+// runs, from AuCaM's outcome for whatever the results do not hold
+function frameScores(item, plan) {
+  const out   = {};
+  const loc   = plan.score || {};
+  const res   = item && item.results;
+  for (const w of (isArr(res && res.workflows) ? res.workflows : [])) {
+    const doc = w && w.metrics && w.metrics[loc.stage];
+    const v   = doc ? dotted(doc, loc.key) : null;
+    if (v !== null) out[String(w.id)] = v;
+  }
+  const o = outcomeOf(item);
+  for (const f of (isArr(o && o.per_frame) ? o.per_frame : [])) {
+    const ls   = isArr(f && f.launches) ? f.launches : [];
+    const last = ls.length ? String(ls[ls.length - 1]) : null;
+    if (last && given(f.score) && !(last in out)) out[last] = Number(f.score);
+  }
+  return out;
+}
+
+function bandOf(plan) {
+  const b = plan && plan.good_band;
+  return (isArr(b) && b.length === 2 && given(b[0]) && given(b[1]))
+    ? [Number(b[0]), Number(b[1])] : null;
+}
+
+// 'good' | 'poor' | 'done' (scored, neither) | null (no score yet)
+function verdictOf(w, score, plan) {
+  if (/cancelled by the campaign manager: score/.test(String((w && w.reason) || ''))) {
+    return 'poor';
+  }
+  if (!given(score)) return null;
+  score = Number(score);
+  const better = (a, b) => plan.direction === 'minimize' ? a <= b : a >= b;
+  const band   = bandOf(plan);
+  if (band) {
+    if (score >= band[0] && score <= band[1]) return 'good';
+  } else if (given(plan.good_score) && better(score, Number(plan.good_score))) {
+    return 'good';
+  }
+  if (given(plan.poor_score) && !better(score, Number(plan.poor_score))) {
+    return 'poor';
+  }
+  return 'done';
+}
+
+function verdictWord(v, plan) {
+  if (v === 'good') return bandOf(plan) ? 'in band' : 'good';
+  return {poor: 'poor', done: 'scored'}[v] || '';
+}
+
+function renderScore(w, score, plan) {
+  const v = verdictOf(w, score, plan);
+  if (!v) return '';
+  const band = bandOf(plan);
+  const txt  = (given(score) ? fmtNum(Number(score), 3) : '–')
+             + ' · ' + verdictWord(v, plan);
+  const tip  = (w && w.reason) ? String(w.reason)
+             : v === 'good' && band
+               ? `in the band ${fmtNum(band[0], 3)} … ${fmtNum(band[1], 3)}`
+             : v === 'good' ? `at least ${fmtNum(Number(plan.good_score), 3)}`
+             : '';
+  return `<span class="ac-score v-${v}" title="${esc(tip)}">${esc(txt)}</span>`;
+}
+
+// AuCaM's exit reasons, as the page says them
+const EXIT_WORDS = {
+  goals_satisfied     : 'goal reached',
+  spending_limit      : 'budget used up',
+  controller_terminate: 'every frame has run',
+  campaign_idle       : 'every frame has run',
+  signal              : 'stopped',
+  failed              : 'failed'
+};
+
+function renderOutcome(item, plan, scores, wfs) {
+  const o     = outcomeOf(item);
+  const state = campaignState(item);
+  let good = 0, poor = 0;
+  for (const w of wfs) {
+    const v = verdictOf(w, scores[String(firstOf(w, ['id', 'wf_id']))], plan);
+    if (v === 'good') good++;
+    if (v === 'poor') poor++;
+  }
+  const parts = [];
+  if (o) parts.push(EXIT_WORDS[o.exit_reason] || 'finished');
+  else if (!isTerminal(state)) parts.push('steering');
+  parts.push(`${good} ${bandOf(plan) ? 'in band' : 'good'}`
+             + (given(plan.goal_good_frames)
+                ? ` (goal ${Number(plan.goal_good_frames)})` : ''));
+  if (poor) parts.push(`${poor} poor, cancelled`);
+  const total = given(plan.frames) ? Number(plan.frames) : wfs.length;
+  parts.push(`${wfs.length} of ${total} frames launched`);
+  const spent  = o && o.spent && given(o.spent.node_hours)
+               ? Number(o.spent.node_hours) : null;
+  const budget = given(plan.budget_node_hours)
+               ? Number(plan.budget_node_hours) : null;
+  if (spent !== null) {
+    parts.push(`${fmtNum(spent, 2)}${budget !== null
+                 ? ' of ' + fmtNum(budget, 2) : ''} node-hours`);
+  } else if (budget !== null) {
+    parts.push(`budget ${fmtNum(budget, 2)} node-hours`);
+  }
+  return `<div class="ac-outcome"><span class="ac-outcome-tag">Campaign
+    Manager</span>${esc(parts.join(' · '))}</div>`;
+}
+
+// one horizontal bar per scored frame, the band or thresholds drawn in
+function renderScoreChart(plan, wfs, scores, colours) {
+  const rows = [];
+  wfs.forEach((w, i) => {
+    const s = scores[String(firstOf(w, ['id', 'wf_id']))];
+    if (given(s)) rows.push({w: w, i: i, s: Number(s)});
+  });
+  if (!rows.length) return '';
+
+  const band = bandOf(plan);
+  const vals = rows.map(r => r.s).concat(band || [])
+    .concat([plan.good_score, plan.poor_score].filter(given).map(Number));
+  const lo = Math.min(0, ...vals), hi = Math.max(1, ...vals);
+  const W = 660, RH = 34, L = 170, R = 28, T = 14, B = 40;
+  const ih = rows.length * RH;
+  const sx = x => L + (x - lo) / (hi - lo) * (W - L - R);
+
+  const keys = varyingKeys(wfs).filter(k => k !== 'attempt');
+  let g = '';
+  if (band) {
+    g += `<rect class="ac-band" x="${sx(band[0]).toFixed(1)}" y="${T}"
+               width="${(sx(band[1]) - sx(band[0])).toFixed(1)}"
+               height="${ih}"/>`;
+  }
+  for (const t of niceTicks(lo, hi, 5)) {
+    const x = sx(t).toFixed(1);
+    g += `<line class="ac-grid" x1="${x}" y1="${T}" x2="${x}" y2="${T + ih}"/>`
+       + `<text class="ac-tick-text" x="${x}" y="${T + ih + 24}"`
+       + ` text-anchor="middle">${esc(fmtNum(t, 3))}</text>`;
+  }
+  const thr = (v, cls) => {
+    if (!given(v)) return '';
+    const x = sx(Number(v)).toFixed(1);
+    return `<line class="${cls}" x1="${x}" y1="${T - 4}"
+                  x2="${x}" y2="${T + ih + 4}"/>`;
+  };
+  g += thr(plan.poor_score, 'ac-thr-poor');
+  if (!band) g += thr(plan.good_score, 'ac-thr-good');
+
+  rows.forEach((r, k) => {
+    const y  = T + k * RH;
+    const v  = verdictOf(r.w, r.s, plan);
+    const x0 = sx(Math.max(lo, 0)), x1 = sx(r.s);
+    const lab = legendLabel(r.w, keys, r.i);
+    const inside = x1 > W - R - 64;
+    g += `<text class="ac-bar-label" x="${L - 12}" y="${y + RH / 2}"`
+       + ` text-anchor="end" dominant-baseline="middle">${esc(lab)}</text>`
+       + `<rect class="ac-bar v-${v || 'none'}"`
+       + ` x="${Math.min(x0, x1).toFixed(1)}" y="${y + 7}"`
+       + ` width="${Math.max(3, Math.abs(x1 - x0)).toFixed(1)}"`
+       + ` height="${RH - 14}" rx="3" style="fill:${colours[r.i]}"/>`
+       + `<text class="ac-bar-value" x="${(inside ? x1 - 8 : x1 + 8).toFixed(1)}"`
+       + ` y="${y + RH / 2}" text-anchor="${inside ? 'end' : 'start'}"`
+       + ` dominant-baseline="middle">${esc(fmtNum(r.s, 3))}</text>`;
+  });
+
+  const key   = String((plan.score && plan.score.key) || 'score').split('.').pop();
+  const title = `${key} per frame`;
+  const note  = band
+    ? `band ${fmtNum(band[0], 3)} … ${fmtNum(band[1], 3)}: in transition`
+    : [given(plan.good_score) ? `good ≥ ${fmtNum(Number(plan.good_score), 3)}` : '',
+       given(plan.poor_score) ? `poor < ${fmtNum(Number(plan.poor_score), 3)}, cancelled` : '']
+      .filter(Boolean).join(' · ');
+  return `<div class="ac-plot">
+    <div class="ac-plot-title">${esc(title)}</div>
+    <svg viewBox="0 0 ${W} ${T + ih + B}" role="img"
+         aria-label="${esc(title)}">${g}</svg>
+    <div class="ac-legend">${esc(note)}</div>
   </div>`;
 }
 
@@ -1611,7 +1869,7 @@ const CHARTS = [
    xlabel: 'epoch', ylabel: 'accuracy'}
 ];
 
-function renderPlots(item, colours, terminal) {
+function renderPlots(item, colours, terminal, extra) {
   const res = item.results;
   const wfs = isArr(res && res.workflows) ? res.workflows : [];
   const declared = workflowsOf(item);
@@ -1647,8 +1905,11 @@ function renderPlots(item, colours, terminal) {
         points: pts
       });
     });
+    // a Campaign Manager card shows its score chart instead of empty ones
+    if (extra !== undefined && !series.length) return '';
     return renderPlot(cfg, series, terminal);
   }).filter(Boolean);
+  if (extra) panels.unshift(extra);
 
   if (!panels.length) return '';
   return `<div class="ac-plots">${panels.join('')}</div>`;
@@ -1904,5 +2165,6 @@ export const _internals = {
   renderPlot, renderFiles, renderResourceRow, renderPilotRow, pilotsOf,
   worstState, hoursCell, placementOf, countCell, pickMetrics,
   FAILED_HIDE_MS, isHidden, hideDueInMs, visibleCampaigns,
+  renderCampaign, frameScores, verdictOf, renderScoreChart, renderOutcome,
   PLOT_GEOMETRY: {PW, PH, PAD}
 };

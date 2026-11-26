@@ -233,6 +233,9 @@ class Campaign:
     # lands in `outcome` when the campaign ends
     planner:     str                    = 'sweep'
     outcome:     Optional[Dict[str, Any]] = None
+    # an AuCaM campaign's steering rules (score location, good / poor
+    # thresholds, budget), so the UI can read scores and verdicts live
+    aucam:       Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

@@ -274,6 +274,22 @@ class AucamPlan:
             and not self.better(float(score), self.poor_score)
 
     # ----------------------------------------------------------------------
+    def view(self) -> Dict[str, Any]:
+        """The steering rules as the campaign record keeps them (for the UI)."""
+
+        return {'score'            : {'stage': self.score_stage,
+                                      'file' : self.score_file,
+                                      'key'  : self.score_key},
+                'direction'        : self.direction,
+                'good_score'       : self.good_score,
+                'good_band'        : list(self.good_band)
+                                     if self.good_band else None,
+                'poor_score'       : self.poor_score,
+                'goal_good_frames' : self.goal_good_frames,
+                'budget_node_hours': self.budget_node_hours,
+                'frames'           : len(self.frames)}
+
+    # ----------------------------------------------------------------------
     def instance(self, frame: Dict[str, Any], wf_id: str,
                  attempt: int = 1) -> WorkflowInstance:
         """The ATOMIC instance of one AuCaM launch of *frame*."""

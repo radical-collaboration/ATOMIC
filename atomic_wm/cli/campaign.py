@@ -82,7 +82,7 @@ def load_spec(path: str) -> Dict[str, Any]:
     if isinstance(data.get('workflow'), dict):
         spec = {'workflow': data['workflow'],
                 'sweep'   : data.get('sweep') or {}}
-        spec.update({key: data[key] for key in ('planner', 'aucam')
+        spec.update({key: data[key] for key in ('name', 'planner', 'aucam')
                      if key in data})
         return spec
     return {'workflow': data, 'sweep': {}}
@@ -235,7 +235,8 @@ def cmd_submit(client: Any, args: argparse.Namespace) -> int:
     try:
         camp = client.campaign_submit(
             spec['workflow'], sweep,
-            **{key: spec[key] for key in ('planner', 'aucam') if key in spec})
+            **{key: spec[key] for key in ('name', 'planner', 'aucam')
+               if key in spec})
     except ClientError as exc:
         return _err(str(exc))
 

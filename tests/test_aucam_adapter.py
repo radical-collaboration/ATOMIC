@@ -17,6 +17,7 @@ import asyncio
 import base64
 import contextlib
 import io
+import json
 import time
 
 from pathlib import Path
@@ -245,6 +246,19 @@ class TestRequest:
         assert (plan.score_stage, plan.score_file) == \
                ('analysis', 'descriptors.json')
         assert plan.max_wall_time_s is None and plan.stale_timeout_s is None
+
+    def test_the_view_holds_the_steering_rules(self):
+        plan = parse_aucam_request(_body(3, good_score=0.9, poor_score=0.8,
+                                         goal_good_frames=2,
+                                         budget_node_hours=6.0))
+        view = plan.view()
+        assert view['score'] == {'stage': plan.score_stage,
+                                 'file': plan.score_file,
+                                 'key': plan.score_key}
+        assert (view['good_score'], view['poor_score'], view['good_band'],
+                view['goal_good_frames'], view['budget_node_hours'],
+                view['frames']) == (0.9, 0.8, None, 2, 6.0, 3)
+        json.dumps(view)                                # it is JSON
 
     def test_frames_from_the_sweep(self):
         wf = {'name': 'w', 'stages': [
