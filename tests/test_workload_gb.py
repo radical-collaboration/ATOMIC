@@ -72,7 +72,8 @@ class TestTool:
             gb_frame.main(['denoise', '--frame', 'f.7.cfg', '--step', '7',
                            '--out', 'den.dump'])
         assert exc.value.code == 1
-        assert os.listdir('.') == []
+        kept = os.listdir('.')
+        assert len(kept) == 1 and kept[0].startswith('gb-work-')
 
     @pytest.mark.parametrize('frame', ['missing.cfg'])
     def test_a_missing_frame_is_a_clean_error(self, root, frame):

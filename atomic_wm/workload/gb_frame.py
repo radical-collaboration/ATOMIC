@@ -224,12 +224,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sys.stdout.write('\n')
         return 0
 
+    # kept when the step fails: it holds the LAMMPS log and the inputs
     work = tempfile.mkdtemp(prefix='gb-work-', dir=os.getcwd())
     try:
         msg = {'denoise': denoise, 'train': train,
                'classify': classify}[args.cmd](args, work)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    except BaseException:
+        sys.stderr.write('%s: work directory kept: %s\n' % (TOOL, work))
+        raise
+    shutil.rmtree(work, ignore_errors=True)
     sys.stdout.write('%s: %s -> %s\n' % (TOOL, msg, args.out))
     return 0
 
