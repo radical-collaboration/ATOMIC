@@ -572,7 +572,7 @@ export function css() {
     /* ---- charts ---- */
     .ac-plots {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
       gap: 18px;
       margin-top: 14px;
     }
