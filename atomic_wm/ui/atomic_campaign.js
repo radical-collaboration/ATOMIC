@@ -376,6 +376,8 @@ export function css() {
     .ac-score.v-poor { color: #fb7185; border-color: rgba(251, 113, 133, .5);
                        background: rgba(251, 113, 133, .12); }
     .ac-score.v-done { color: var(--text); }
+    /* a lone score chart must not stretch over the whole card */
+    .ac-plot.ac-scorechart svg { max-width: 660px; }
     .ac-band       { fill: rgba(0, 212, 170, .12); }
     .ac-thr-poor   { stroke: #fb7185; stroke-width: 2; stroke-dasharray: 6 5; }
     .ac-thr-good   { stroke: #00d4aa; stroke-width: 2; stroke-dasharray: 6 5; }
@@ -1589,9 +1591,9 @@ function renderWorkflowRow(w, colour, score) {
     <span class="ac-wf-params">
       <i class="ac-wf-swatch" style="background:${colour}"></i>${esc(label)}
     </span>
+    ${score || ''}
     <span class="ac-chips">${chips
       || '<span style="color:var(--muted)">no stages</span>'}</span>
-    ${score || ''}
   </div>`;
 }
 
@@ -1747,7 +1749,14 @@ function renderScoreChart(plan, wfs, scores, colours) {
   const ih = rows.length * RH;
   const sx = x => L + (x - lo) / (hi - lo) * (W - L - R);
 
-  const keys = varyingKeys(wfs).filter(k => k !== 'attempt');
+  // "frame 1 · 96000": the frame and the one parameter that names it
+  const NAMES = ['step', 'temperature'];
+  const barLabel = (w, i) => {
+    const p = (w && w.params) || {};
+    const f = given(p.frame) ? `frame ${p.frame}` : `#${i + 1}`;
+    const k = NAMES.find(n => p[n] !== undefined);
+    return k ? `${f} · ${scalar(p[k])}` : f;
+  };
   let g = '';
   if (band) {
     g += `<rect class="ac-band" x="${sx(band[0]).toFixed(1)}" y="${T}"
@@ -1773,7 +1782,7 @@ function renderScoreChart(plan, wfs, scores, colours) {
     const y  = T + k * RH;
     const v  = verdictOf(r.w, r.s, plan);
     const x0 = sx(Math.max(lo, 0)), x1 = sx(r.s);
-    const lab = legendLabel(r.w, keys, r.i);
+    const lab = barLabel(r.w, r.i);
     const inside = x1 > W - R - 64;
     g += `<text class="ac-bar-label" x="${L - 12}" y="${y + RH / 2}"`
        + ` text-anchor="end" dominant-baseline="middle">${esc(lab)}</text>`
@@ -1793,7 +1802,7 @@ function renderScoreChart(plan, wfs, scores, colours) {
     : [given(plan.good_score) ? `good ≥ ${fmtNum(Number(plan.good_score), 3)}` : '',
        given(plan.poor_score) ? `poor < ${fmtNum(Number(plan.poor_score), 3)}, cancelled` : '']
       .filter(Boolean).join(' · ');
-  return `<div class="ac-plot">
+  return `<div class="ac-plot ac-scorechart">
     <div class="ac-plot-title">${esc(title)}</div>
     <svg viewBox="0 0 ${W} ${T + ih + B}" role="img"
          aria-label="${esc(title)}">${g}</svg>
