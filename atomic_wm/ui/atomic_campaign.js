@@ -1466,7 +1466,8 @@ function renderCampaign(item, st) {
     ? wfs.map((w, i) => renderWorkflowRow(
         w, colours[i],
         plan ? renderScore(w, scores[String(firstOf(w, ['id', 'wf_id']))],
-                           plan) : '')).join('')
+                           plan) : '',
+        plan ? frameLabel(w, i, '=') : null)).join('')
     : '<div class="ac-note">No workflows in this campaign.</div>';
 
   const plots   = renderPlots(item, colours, isTerminal(state),
@@ -1542,10 +1543,11 @@ function placementOf(s) {
   return mem ? `${res}/${mem}` : res;
 }
 
-function renderWorkflowRow(w, colour, score) {
+function renderWorkflowRow(w, colour, score, short) {
   w = w || {};
   const stages = isArr(w.stages) ? w.stages : [];
-  const label  = paramsLabel(w.params) || shortId(firstOf(w, ['id', 'wf_id']));
+  const label  = short
+              || paramsLabel(w.params) || shortId(firstOf(w, ['id', 'wf_id']));
 
   const chips = stages.map((s, i) => {
     const state = String((s && s.state) || '').toUpperCase();
@@ -1732,6 +1734,18 @@ function renderOutcome(item, plan, scores, wfs) {
     Manager</span>${esc(parts.join(' · '))}</div>`;
 }
 
+// "frame 1 · 96000" (or, with sep '=', "frame=1 · step=96000"): the frame
+// and the one parameter that names it, for Campaign Manager cards
+const FRAME_NAMES = ['step', 'temperature'];
+function frameLabel(w, i, sep) {
+  const p = (w && w.params) || {};
+  const f = given(p.frame) ? (sep ? `frame=${p.frame}` : `frame ${p.frame}`)
+                           : `#${i + 1}`;
+  const k = FRAME_NAMES.find(n => p[n] !== undefined);
+  if (!k) return f;
+  return sep ? `${f} · ${k}=${scalar(p[k])}` : `${f} · ${scalar(p[k])}`;
+}
+
 // one horizontal bar per scored frame, the band or thresholds drawn in
 function renderScoreChart(plan, wfs, scores, colours) {
   const rows = [];
@@ -1749,14 +1763,7 @@ function renderScoreChart(plan, wfs, scores, colours) {
   const ih = rows.length * RH;
   const sx = x => L + (x - lo) / (hi - lo) * (W - L - R);
 
-  // "frame 1 · 96000": the frame and the one parameter that names it
-  const NAMES = ['step', 'temperature'];
-  const barLabel = (w, i) => {
-    const p = (w && w.params) || {};
-    const f = given(p.frame) ? `frame ${p.frame}` : `#${i + 1}`;
-    const k = NAMES.find(n => p[n] !== undefined);
-    return k ? `${f} · ${scalar(p[k])}` : f;
-  };
+  const barLabel = (w, i) => frameLabel(w, i);
   let g = '';
   if (band) {
     g += `<rect class="ac-band" x="${sx(band[0]).toFixed(1)}" y="${T}"
